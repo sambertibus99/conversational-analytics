@@ -63,7 +63,7 @@ WANN NUTZEN: Wenn der Nutzer wissen will welche Attribute es gibt.
 - axis_act_a1_deg bis axis_act_a6_deg: Aktuelle Achsposition in Grad
 
 ### Kartesische Position (TCP)
-- pos_act_x_mm, pos_act_y_mm, pos_act_z_mm: Position in mm
+
 - pos_act_a_deg, pos_act_b_deg, pos_act_c_deg: Orientierung in Grad
 
 ### Geschwindigkeiten

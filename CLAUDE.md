@@ -40,17 +40,26 @@ conversational-analytics/
 └── 04_AKTUELLER_STAND.md  # Aktueller Fortschritt
 ```
 
-## Wichtige Referenz-Dateien
-| Datei | Inhalt |
-|-------|--------|
-| `02_PROJEKT_KONTEXT.md` | MA-Kontext, Forschungsfrage, Tech-Stack |
-| `03_ARBEITSPAKETE.md` | Detaillierte AP-Beschreibungen |
-| `05_ARCHITEKTUR.md` | Technische Architektur, State-Design |
-| `06_PROMPT_PATTERNS.md` | Optimierte Prompts für Agents |
-| `07_ERROR_HANDLING.md` | Fehlerbehandlung |
-| `08_TESTFRAGEN.md` | 15 Evaluations-Queries |
-| `09_THINGSBOARD_SETUP.md` | ThingsBoard API, Keys |
-| `10_WOCHENPLAN.md` | Zeitplan |
+## Referenz-Dateien (bei Bedarf lesen)
+
+| Datei | Wann lesen? |
+|-------|-------------|
+| `02_PROJEKT_KONTEXT.md` | Bei Fragen zu MA-Kontext, Forschungsfrage, Gesamtüberblick |
+| `03_ARBEITSPAKETE.md` | **VOR jedem neuen AP** - enthält Schritte, Tests, erwartete Outputs |
+| `05_ARCHITEKTUR.md` | Bei Architektur-Entscheidungen, State-Design, Datenfluss |
+| `06_PROMPT_PATTERNS.md` | **Bei Agent-Implementierung** - enthält optimierte System Prompts |
+| `07_ERROR_HANDLING.md` | Bei Error Handling, Retry-Logik, Logging |
+| `08_TESTFRAGEN.md` | **Bei AP8 Evaluation** - enthält 15 Test-Queries mit Ground Truth |
+| `09_THINGSBOARD_SETUP.md` | Bei ThingsBoard API-Fragen, Telemetrie-Keys |
+| `10_WOCHENPLAN.md` | Bei Zeitplanung |
+
+### Regel: Vor jedem Arbeitspaket
+```
+1. read_file → 03_ARBEITSPAKETE.md (Abschnitt zum AP lesen)
+2. read_file → Relevante Referenz-Datei (siehe Tabelle oben)
+3. read_file → Bestehender Code als Referenz
+4. Dann erst implementieren
+```
 
 ## Workflow (Claude Desktop)
 1. **Code ändern:** `edit_file` oder `write_file`

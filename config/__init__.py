@@ -1,0 +1,33 @@
+"""
+Config Package.
+
+Enthält zentrale Konfiguration und Settings.
+"""
+
+from config.settings import (
+    PROJECT_ROOT,
+    OUTPUTS_DIR,
+    THINGSBOARD_URL,
+    THINGSBOARD_USERNAME,
+    THINGSBOARD_PASSWORD,
+    KRC5_DEVICE_ID,
+    ANTHROPIC_API_KEY,
+    DEFAULT_MODEL,
+    TELEMETRY_KEYS,
+    ATTRIBUTE_KEYS,
+    VALID_DEVICES,
+)
+
+__all__ = [
+    "PROJECT_ROOT",
+    "OUTPUTS_DIR",
+    "THINGSBOARD_URL",
+    "THINGSBOARD_USERNAME",
+    "THINGSBOARD_PASSWORD",
+    "KRC5_DEVICE_ID",
+    "ANTHROPIC_API_KEY",
+    "DEFAULT_MODEL",
+    "TELEMETRY_KEYS",
+    "ATTRIBUTE_KEYS",
+    "VALID_DEVICES",
+]
