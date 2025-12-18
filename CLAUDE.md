@@ -4,6 +4,7 @@
 **Conversational Analytics für IIoT** (Masterarbeit)
 - Ziel: MCP-basiertes System für natürlichsprachliche Datenanalyse
 - Abgabe: 31. März 2025
+- **Status: System funktioniert! AP8 (Evaluation) als nächstes.**
 
 ## Projektpfad
 ```
@@ -19,76 +20,105 @@
 
 ---
 
-## Referenz-Dateien
+## Aktueller Status (18.12.2025)
 
-### Wann welche Datei lesen?
+### Was funktioniert ✅
+- Daten laden für beliebige Zeiträume ("16.", "Dienstag 12 Uhr", "letzte Stunde")
+- Charts erstellen (Line, Bar, Scatter über AntV)
+- Statistiken berechnen
+- Bei fehlenden Daten: Stoppt und fragt User
+- Bei Erfolg: Weiter zum nächsten Agent
+
+### Was offen ist
+- **AP8: Evaluation** - 15 Testfragen aus `08_TESTFRAGEN.md` durchgehen
+- Integration Tests (optional)
+
+---
+
+## Referenz-Dateien
 
 | Situation | Datei |
 |-----------|-------|
-| **Vor jedem Arbeitspaket** | `03_ARBEITSPAKETE.md` (Abschnitt zum AP) |
+| **Vor jedem Arbeitspaket** | `03_ARBEITSPAKETE.md` |
 | **Agent-Implementierung** | `06_PROMPT_PATTERNS.md` + `05_ARCHITEKTUR.md` |
-| **MCP Server Arbeit** | `05_ARCHITEKTUR.md` (Datenfluss-Diagramm) |
-| **Fehler/Bug tritt auf** | `07_ERROR_HANDLING.md` ZUERST! |
+| **Fehler/Bug** | `07_ERROR_HANDLING.md` ZUERST! |
 | **Evaluation** | `08_TESTFRAGEN.md` |
-| **ThingsBoard API** | `09_THINGSBOARD_SETUP.md` |
-
-### Regel: Vor jedem Arbeitspaket
-```
-1. read_file → 03_ARBEITSPAKETE.md (Abschnitt zum AP)
-2. read_file → Relevante Referenz-Datei (siehe Tabelle)
-3. read_file → Bestehender Code als Referenz
-4. Dann erst implementieren
-```
 
 ---
 
 ## Kritische Regeln (aus Erfahrung!)
 
-### Bei MCP-Response-Parsing:
-```
-1. IMMER `status` Feld ZUERST prüfen (success/no_data/error/data_available)
-2. Bei "no_data" → STOPP, nicht automatisch anderen Zeitraum probieren!
-3. Neue Response-Formate in BEIDEN Funktionen behandeln:
-   - extract_data_from_parsed()
-   - generate_data_summary()
-```
-
-### Bei Agent-zu-Agent-Übergabe:
-```
-1. NIEMALS SystemMessages von vorherigen Agents übernehmen
-2. Nur HumanMessages filtern und weitergeben:
-   human_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
-3. Neuen SystemMessage für jeden Agent erstellen
+### 1. MCP-Response-Parsing
+```python
+# IMMER Status ZUERST prüfen!
+if parsed.get("status") == "no_data":
+    return None, {"type": "no_data", ...}, None
+if parsed.get("status") == "success":
+    # Dann Daten verarbeiten
 ```
 
-### Bei großen Datenmengen:
+### 2. Pipeline-Steuerung (NEU!)
+```python
+# In data_agent.py: detect_needs_user_input()
+# Stoppt Pipeline NUR bei echten Fehlern, NICHT bei höflichen Nachfragen
+
+# Success-Indicators → KEIN STOPP
+if "erfolgreich" in content or "geladen" in content:
+    return False, None  # Weiter zum nächsten Agent!
+
+# Hard-Stop-Patterns → STOPP
+if "keine daten für den zeitraum" in content:
+    return True, "Agent stoppt"
 ```
-1. Rohdaten in Datei speichern (outputs/data/), NICHT an LLM
-2. Nur Zusammenfassung (~500 Bytes) an LLM
-3. Max ~50KB direkt im LLM-Context
-4. Agent lädt Datei in state.data, nächster Agent liest aus State
+
+### 3. Agent-zu-Agent-Übergabe
+```python
+# NIEMALS SystemMessages übernehmen!
+human_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
+messages = [SystemMessage(content=PROMPT), *human_messages]
+```
+
+### 4. Große Datenmengen
+- Rohdaten → `outputs/data/telemetry_xxx.json`
+- Nur Summary (~500 Bytes) an LLM
+- Max ~50KB direkt im Context
+
+---
+
+## Timerange-Parser (unterstützte Formate)
+
+```python
+# Wochentage
+"Dienstag", "Dienstag 12 Uhr", "Dienstag um 13:30"
+
+# Relative
+"letzte Stunde", "letzte 10 Minuten", "heute", "gestern"
+
+# Datum (NEU!)
+"16."           → 16. des aktuellen Monats (ganzer Tag)
+"am 16."        → 16. des aktuellen Monats
+"16. Dezember"  → 16. Dezember
+"16.12."        → 16. Dezember
+"16.12.2025"    → Exaktes Datum
 ```
 
 ---
 
 ## Debugging-Workflow
 
-Wenn ein Fehler auftritt:
-
-```
-1. 07_ERROR_HANDLING.md lesen → Bekannter Fehler?
-2. 05_ARCHITEKTUR.md lesen → Wo im Datenfluss tritt er auf?
-3. DEBUG=True setzen im betroffenen Agent
-4. Logs analysieren (🔍 DEBUG: ...)
-5. Fix implementieren
-6. DEBUG=False setzen
-7. Fehler in 07_ERROR_HANDLING.md dokumentieren
-```
-
-### Debug-Modus aktivieren:
-```python
-# In agents/data_agent.py oder agents/viz_agent.py:
+```bash
+# 1. DEBUG aktivieren
+# In agents/data_agent.py oder viz_agent.py:
 DEBUG = True
+
+# 2. App starten
+chainlit run app.py
+
+# 3. Logs beobachten (🔍 DEBUG: ...)
+
+# 4. Fix implementieren
+
+# 5. DEBUG = False setzen!
 ```
 
 ---
@@ -96,61 +126,42 @@ DEBUG = True
 ## Projektstruktur
 ```
 conversational-analytics/
-├── agents/                 # LLM Agents
-│   ├── state.py           # AgentState Definition
-│   ├── data_agent.py      # Holt Daten von ThingsBoard
-│   ├── viz_agent.py       # Generiert Charts
-│   ├── stats_agent.py     # Berechnet Statistiken (TODO)
-│   └── graph.py           # LangGraph Orchestrierung
-├── mcp_servers/           # MCP Server
-│   └── thingsboard_server.py  # 9 Tools, File-Storage
+├── agents/
+│   ├── state.py           # AgentState (needs_user_input, user_input_reason)
+│   ├── data_agent.py      # Mit detect_needs_user_input()
+│   ├── viz_agent.py       # Message-Filtering
+│   ├── stats_agent.py     
+│   └── graph.py           # Router prüft needs_user_input
+├── mcp_servers/
+│   └── thingsboard_server.py  # 9 Tools, erweiterter Timerange-Parser
 ├── prompts/               # System Prompts
-├── outputs/
-│   └── data/              # Telemetrie-Dateien (JSON)
-├── config/
-│   └── settings.py        # API Keys, Konstanten
-├── docs/                  # Zusätzliche Dokumentation
-├── tests/                 # Tests
-├── app.py                 # Chainlit Frontend
-├── CLAUDE.md              # Diese Datei
-├── 02_PROJEKT_KONTEXT.md  # MA-Kontext
-├── 03_ARBEITSPAKETE.md    # Arbeitspakete
-├── 04_AKTUELLER_STAND.md  # Fortschritt
-├── 05_ARCHITEKTUR.md      # System-Architektur + Datenfluss
-├── 06_PROMPT_PATTERNS.md  # Agent Prompts
-├── 07_ERROR_HANDLING.md   # Fehlerbehandlung + Bekannte Fehler
-├── 08_TESTFRAGEN.md       # Evaluation
-├── 09_THINGSBOARD_SETUP.md
-└── 10_WOCHENPLAN.md
+├── outputs/data/          # Telemetrie-Dateien (JSON)
+├── tests/                 # 243 Unit Tests
+├── app.py                 # Chainlit (mit pending_query für Follow-ups)
+└── [Dokumentation]
 ```
 
 ---
 
-## Workflow
-1. **Code ändern:** `edit_file` oder `write_file`
-2. **Nach jeder Änderung:** User testet lokal
-3. **Session Ende:** `git add . && git commit -m "..." && git push`
+## Typische Befehle
 
-## Konventionen
-- Python 3.12, async/await
-- LangGraph für Agent-Orchestrierung
-- MCP für Tool-Integration
-- LLM: Claude Sonnet (claude-sonnet-4-20250514)
-- DEBUG = False (außer beim Debugging)
-
-## Typische Test-Befehle
 ```bash
-# Chainlit starten
+# App starten
+cd ~/ma_ws/conversational-analytics
+source venv/bin/activate
 chainlit run app.py
 
-# Data Agent direkt testen
-python agents/data_agent.py --interactive
+# Tests ausführen (umgeht ROS2-Konflikt)
+python run_tests.py
 
-# MCP Server testen
-python mcp_servers/thingsboard_server.py
+# Git
+git add -A && git commit -m "message" && git push
 ```
+
+---
 
 ## ThingsBoard
 - URL: http://localhost:8080
 - Device: KRC5 (KUKA Roboter)
-- Daten verfügbar: Dienstag 16.12.2025, 11:56 - 18:36
+- Verfügbare Daten: 11.12. - 16.12.2025 (Arbeitszeit)
+- **Keine Temperatur-Keys!** (nur Drehmomente, Position, etc.)

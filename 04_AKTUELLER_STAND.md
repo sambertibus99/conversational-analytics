@@ -1,6 +1,6 @@
 # AKTUELLER STAND
 
-> Letzte Aktualisierung: 18. Dezember 2025, 22:00 Uhr
+> Letzte Aktualisierung: 18. Dezember 2025, 23:00 Uhr
 > Diese Datei wird nach jeder Session aktualisiert.
 
 ---
@@ -11,14 +11,25 @@
 |----|------|--------|-------------|---------|
 | 0 | Projekt-Setup | ✅ Fertig | 100% | venv, deps, config |
 | 1 | ThingsBoard MCP | ✅ Fertig | 100% | 9 Tools, File-Storage für große Daten |
-| 2 | Data Agent | ✅ Fertig | 100% | MCP Client, Response-Parsing für alle Formate |
+| 2 | Data Agent | ✅ Fertig | 100% | MCP Client, Response-Parsing, Pipeline-Stopp-Logik |
 | 3 | AntV MCP | ✅ Fertig | 100% | Nutzt `@antv/mcp-server-chart` (25 Tools) |
 | 4 | Viz Agent | ✅ Fertig | 100% | Message-Filtering fix, Daten-Transformation |
 | 5 | Stats Agent | ✅ Fertig | 100% | 8 Tools (mean, std, correlation, etc.) |
-| 6 | Supervisor + Graph | ✅ Fertig | 100% | Supervisor + LangGraph Orchestrierung |
-| 7 | Frontend | ✅ Fertig | 100% | Chainlit, Chart-Anzeige, Timestamps gefixt |
-| 8 | Evaluation | ⬜ Offen | 0% | - |
-| 9 | Debugging & Testing | 🔄 In Arbeit | 80% | 243 Unit Tests ✅, Integration Tests offen |
+| 6 | Supervisor + Graph | ✅ Fertig | 100% | Supervisor + LangGraph + needs_user_input Steuerung |
+| 7 | Frontend | ✅ Fertig | 100% | Chainlit, Chart-Anzeige, Follow-up Kontext |
+| 8 | Evaluation | ⬜ Offen | 0% | Nächster Schritt! |
+| 9 | Debugging & Testing | ✅ Fertig | 95% | 243 Unit Tests ✅, Integration Tests optional |
+
+---
+
+## System funktioniert! ✅
+
+Das System ist jetzt **voll funktionsfähig**:
+- ✅ Daten laden für beliebige Zeiträume ("16. Dezember", "Dienstag 12 Uhr")
+- ✅ Charts erstellen (Line, Bar, Scatter)
+- ✅ Statistiken berechnen
+- ✅ Bei fehlenden Daten: Stoppt und fragt User
+- ✅ Bei erfolgreichen Daten: Läuft weiter zu viz_agent
 
 ---
 
@@ -28,186 +39,132 @@
 conversational-analytics/
 ├── agents/
 │   ├── __init__.py
-│   ├── state.py                  # AgentState mit data, data_meta, chart_url
-│   ├── data_agent.py             # Mit File-Loading, Response-Parsing für alle Formate
+│   ├── state.py                  # AgentState mit needs_user_input, user_input_reason
+│   ├── data_agent.py             # Mit detect_needs_user_input(), Pipeline-Steuerung
 │   ├── viz_agent.py              # Mit Message-Filtering (nur HumanMessages!)
 │   ├── stats_agent.py            # Stats Agent mit MCP
-│   └── graph.py                  # LangGraph Orchestrierung
+│   └── graph.py                  # LangGraph mit needs_user_input Prüfung im Router
 ├── mcp_servers/
 │   ├── thingsboard_client.py     # Async HTTP Client
-│   └── thingsboard_server.py     # 9 Tools, File-Storage, no_data Handling
+│   └── thingsboard_server.py     # 9 Tools, Timerange-Parser erweitert ("16.", "am 16.")
 ├── prompts/
-│   ├── data_agent_prompt.py      # Mit Fehlerbehandlungs-Regeln
+│   ├── data_agent_prompt.py      # Mit STOPP-Regeln und KONTEXT-Verarbeitung
 │   ├── viz_agent_prompt.py
 │   ├── stats_agent_prompt.py
 │   └── supervisor_prompt.py
 ├── outputs/
 │   └── data/                     # Telemetrie-Dateien (JSON) für Token-Sparung
-├── tests/                        # NEU: Systematische Tests (AP9)
+├── tests/                        # Systematische Tests (AP9)
 │   ├── conftest.py               # Pytest Fixtures & Mocks
 │   ├── pytest.ini                # Pytest Konfiguration
 │   ├── run_tests.py              # Test-Runner (umgeht ROS2-Konflikte)
-│   ├── test_mcp_server/
-│   │   ├── test_thingsboard_responses.py  # 31 Tests
-│   │   └── test_timerange_parsing.py      # 55 Tests
-│   ├── test_agents/
-│   │   ├── test_data_agent_parsing.py     # 32 Tests
-│   │   ├── test_viz_agent_messages.py     # 42 Tests
-│   │   └── test_supervisor_planning.py    # 45 Tests
-│   ├── test_integration/
-│   │   ├── test_happy_paths.py            # E2E Tests (braucht ThingsBoard)
-│   │   └── test_error_paths.py            # Fehlerfall-Tests
-│   └── test_token_budget.py               # 18 Tests
+│   ├── test_mcp_server/          # 86 Tests
+│   ├── test_agents/              # 119 Tests
+│   ├── test_integration/         # E2E Tests
+│   └── test_token_budget.py      # 18 Tests
 ├── docs/
-│   └── AP9_DEBUGGING_TESTING.md  # Testplan für systematisches Testing
-├── app.py                        # Chainlit Frontend
+│   └── AP9_DEBUGGING_TESTING.md  # Testplan
+├── app.py                        # Chainlit mit pending_query Kontext für Follow-ups
 ├── CLAUDE.md                     # Mit Debugging-Workflow & kritischen Regeln
 ├── 05_ARCHITEKTUR.md             # Mit detailliertem Datenfluss
-└── 07_ERROR_HANDLING.md          # Mit bekannten Fehlern & Fixes
+└── 07_ERROR_HANDLING.md          # Mit bekannten Fehlern & Fixes (inkl. FEHLER 4)
 ```
 
 ---
 
-## Session 18.12.2025 (Abend) - AP9 Testing
+## Session 18.12.2025 (Abend) - Komplette Zusammenfassung
 
-### Neue Test-Suite erstellt
+### 1. AP9 Test-Suite (243 Tests) ✅
 
-| Bereich | Datei | Tests | Status |
-|---------|-------|-------|--------|
-| Response-Formate | `test_thingsboard_responses.py` | 31 | ✅ |
-| Timerange-Parsing | `test_timerange_parsing.py` | 55 | ✅ |
-| Data Agent Parsing | `test_data_agent_parsing.py` | 32 | ✅ |
-| Viz Agent | `test_viz_agent_messages.py` | 42 | ✅ |
-| Supervisor | `test_supervisor_planning.py` | 45 | ✅ |
-| Token-Budget | `test_token_budget.py` | 18 | ✅ |
-| Integration (Happy) | `test_happy_paths.py` | ~10 | ⬜ (braucht TB) |
-| Integration (Error) | `test_error_paths.py` | ~10 | ⬜ (braucht TB) |
-| **Gesamt** | | **243** | **✅ Bestanden** |
-
-### Test-Befehle
+| Bereich | Tests | Status |
+|---------|-------|--------|
+| Response-Formate | 31 | ✅ |
+| Timerange-Parsing | 55 | ✅ |
+| Data Agent Parsing | 32 | ✅ |
+| Viz Agent | 42 | ✅ |
+| Supervisor | 45 | ✅ |
+| Token-Budget | 18 | ✅ |
+| Integration | ~20 | ⬜ (optional) |
 
 ```bash
-# Unit Tests ausführen (ohne ThingsBoard)
+# Tests ausführen
 python run_tests.py
-
-# Mit Integration Tests (braucht ThingsBoard)
-python run_tests.py --integration
-
-# Spezifische Tests
-python run_tests.py tests/test_agents -v
-
-# Mit Coverage
-python run_tests.py --coverage
 ```
 
-### ROS2-Konflikt gelöst
+### 2. Pipeline-Steuerung (needs_user_input) ✅
 
-Problem: ROS2-Plugins (`launch_testing_ros`) verursachten pytest-Fehler.
-Lösung: `run_tests.py` entfernt ROS-Pfade aus `sys.path` vor pytest-Import.
+**Problem:** Agent machte bei partiellen Daten automatisch weiter
+**Lösung:** `detect_needs_user_input()` unterscheidet Erfolg vs. Fehler
 
----
+```python
+# state.py - Neue Felder
+needs_user_input: bool = False
+user_input_reason: str | None = None
 
-## Session 18.12.2025 (Nachmittag) - Fixes & Improvements
+# graph.py - Router prüft ZUERST
+if state.get("needs_user_input", False):
+    return "respond"  # Pipeline stoppen!
+```
 
-### Behobene Fehler
+**Logik:**
+- "erfolgreich", "geladen", "datenpunkte" → **KEIN STOPP** → weiter
+- "keine daten für den zeitraum" → **STOPP** → User fragen
+
+### 3. Timerange-Parser erweitert ✅
+
+Neue unterstützte Formate:
+- `"16."` → 16. des aktuellen Monats (ganzer Tag)
+- `"am 16."` → 16. des aktuellen Monats
+- `"für den 16."` → 16. des aktuellen Monats
+- `"16. Dezember"` → 16. Dezember
+- `"16.12."` → 16. Dezember
+- `"16.12.2025"` → Exaktes Datum
+
+### 4. Chat-Kontext für Follow-ups ✅
+
+`app.py` speichert jetzt `pending_query` und `pending_context` wenn Pipeline stoppt.
+Bei User-Antwort wird KONTEXT-Block an Data Agent übergeben.
+
+### 5. Behobene Fehler (gesamt)
 
 | # | Problem | Fix |
 |---|---------|-----|
-| 1 | Chainlit Config-Format | `spontaneous_file_upload` → Dictionary-Format |
-| 2 | Token-Limit (400 Bad Request) | File-Storage: Rohdaten in JSON, nur Summary an LLM |
-| 3 | "no_data" nicht erkannt | `extract_data_from_parsed()` prüft Status ZUERST |
-| 4 | "data_available" nicht erkannt | Neuer Handler für `data_available` Status |
-| 5 | Multiple SystemMessages | Viz Agent filtert nur HumanMessages |
-
-### Neue Features
-
-- **File-based Data Storage**: MCP Server speichert große Datenmengen in `outputs/data/`
-- **Robustes Error Handling**: Klare "no_data" Meldungen, kein automatisches Retry
-- **get_data_availability Tool**: Zeigt verfügbaren Datenbereich
-- **Wochentag in Responses**: Timestamps zeigen jetzt auch den Wochentag
+| 1 | Token-Limit (400 Bad Request) | File-Storage für Rohdaten |
+| 2 | "no_data" nicht erkannt | Status ZUERST prüfen |
+| 3 | Multiple SystemMessages | Nur HumanMessages weitergeben |
+| 4 | Agent macht bei partiellen Daten weiter | detect_needs_user_input() |
+| 5 | "16." wird nicht erkannt | Timerange-Parser erweitert |
+| 6 | Erfolgreiche Analyse stoppt fälschlich | Success-Indicators prüfen |
 
 ---
 
-## Getestete Pipelines
+## Getestete Flows (alle funktionieren!) ✅
 
-### End-to-End: Data → Viz ✅
+### Flow 1: Daten + Chart
 ```
-User: "Zeig TCP Position von Dienstag 12 Uhr"
-    │
-    ▼
-Supervisor → Plan: ["data_agent", "viz_agent"]
-    │
-    ▼
-Data Agent
-    │ → get_telemetry(keys="pos_act_*", timerange="Dienstag 12 Uhr")
-    │ → MCP Server: Daten in outputs/data/telemetry_xxx.json gespeichert
-    │ → Response: {status: "success", statistics: {...}, data_file: "..."}
-    │ → Data Agent lädt Datei → state.data = {...627 Punkte...}
-    ▼
-Viz Agent
-    │ → Liest state.data (nicht nochmal von API!)
-    │ → generate_line_chart(data=[...], title="TCP Position X")
-    │ → Chart-URL generiert
-    ▼
-Output: Chart angezeigt in Chainlit ✅
+User: "zeig mir die drehmomente aller 6 achsen für den 16. dezember"
+→ Data Agent: Lädt Daten erfolgreich
+→ Viz Agent: Erstellt Line Chart
+→ Output: Chart-URL angezeigt ✅
 ```
 
-### Error Path: No Data ✅
+### Flow 2: Fehlende Daten
 ```
-User: "TCP Position von Dienstag 13 Uhr"
-    │
-    ▼
-Data Agent
-    │ → get_telemetry(timerange="Dienstag 13 Uhr")
-    │ → Response: {status: "no_data", message: "..."}
-    │ → Agent: STOPP, informiert User
-    ▼
-Output: "Für Dienstag, 16.12.2025 um 13 Uhr sind keine Daten verfügbar."
-        KEIN zweiter Versuch mit anderem Zeitraum! ✅
+User: "vergleiche drehmomente mit temperatur"
+→ Data Agent: Drehmomente ✓, Temperatur ✗
+→ STOPP: "Temperatur nicht verfügbar. Was möchtest du tun?"
+→ User wählt Option
+→ Weiter mit gewählter Option ✅
 ```
 
----
-
-## Test-Abdeckung (AP9)
-
-### Unit Tests (243 Tests) ✅
-
-| Kategorie | Was getestet wird | Kritisch weil |
-|-----------|-------------------|---------------|
-| **Response-Formate** | success, no_data, error haben richtige Felder | Inkonsistenz crasht Parsing |
-| **Timerange-Parsing** | "Dienstag 13 Uhr" → korrekter Timestamp | Falsche Zeit = falsche Daten |
-| **Data Agent Parsing** | `no_data` wird ZUERST erkannt | Bug führte zu "Daten geladen" ohne Daten |
-| **Viz Agent** | Nur HumanMessages weitergeben | Mehrere SystemMessages = Crash |
-| **Supervisor** | JSON aus LLM-Response parsen | Markdown-Codeblocks brechen Parsing |
-| **Token-Budget** | Rohdaten < 5KB, in Dateien speichern | Zu groß = 400 Bad Request |
-
-### Integration Tests (offen)
-
-Benötigen laufenden ThingsBoard-Server mit Daten:
-- Happy Path: Daten laden → Chart generieren
-- Error Path: Keine Daten → Klare Meldung
-
----
-
-## Offene Fragen / Blocker
-
-| # | Frage | Status | Antwort |
-|---|-------|--------|---------|
-| 1 | ThingsBoard Zugang | ✅ | localhost:8080 |
-| 2 | Anthropic API Key | ✅ | konfiguriert |
-| 3 | Node.js/npx für AntV | ✅ | npx funktioniert |
-| 4 | ROS2 pytest-Konflikt | ✅ | `run_tests.py` löst das |
-
----
-
-## Bekannte Limitierungen
-
-| # | Limitation | Workaround |
-|---|-----------|------------|
-| 1 | Roboter läuft nur während Arbeitszeit | `get_data_availability` nutzen |
-| 2 | AntV Charts extern gehostet | OK für Masterarbeit |
-| 3 | Rate Limits bei schnellen Anfragen | Automatisches Retry (4s Delay) |
-| 4 | ROS2 pytest-Plugins | `run_tests.py` statt direktem pytest |
+### Flow 3: Keine Daten im Zeitraum
+```
+User: "TCP Position jetzt"
+→ Data Agent: Keine aktuellen Daten (Roboter aus)
+→ STOPP: "Keine Daten für den Zeitraum"
+→ User: "such verfügbare zeiträume"
+→ Zeigt verfügbare Daten ✅
+```
 
 ---
 
@@ -215,31 +172,43 @@ Benötigen laufenden ThingsBoard-Server mit Daten:
 
 - **Device:** KRC5 (KUKA Roboter)
 - **Device ID:** b8121f40-d446-11f0-866d-41534d350312
-- **Verfügbare Daten:** Dienstag 16.12.2025, 11:56 - 18:36 Uhr
+- **Verfügbare Daten:** 11.12.2025 - 16.12.2025 (während Arbeitszeit)
+- **Keine Temperatur-Keys vorhanden!**
 
 ---
 
 ## Nächste Schritte
 
-1. **AP9 abschließen:** Integration Tests wenn ThingsBoard Daten hat
-2. **AP8:** Evaluation mit 15 Testfragen aus `08_TESTFRAGEN.md`
+### AP8: Evaluation (Priorität!)
+1. `08_TESTFRAGEN.md` lesen
+2. 15 Testfragen durchgehen
+3. Ergebnisse dokumentieren
+4. Für Masterarbeit aufbereiten
+
+### Optional
+- Integration Tests mit ThingsBoard
+- Weitere Chart-Typen testen
+- Edge Cases dokumentieren
 
 ---
 
-## Dokumentation aktualisiert
+## Wichtige Befehle
 
-- [x] `CLAUDE.md` - Kritische Regeln, Debugging-Workflow
-- [x] `05_ARCHITEKTUR.md` - Detaillierter Datenfluss
-- [x] `07_ERROR_HANDLING.md` - Bekannte Fehler & Fixes
-- [x] `04_AKTUELLER_STAND.md` - AP9 Fortschritt
+```bash
+# App starten
+cd ~/ma_ws/conversational-analytics
+source venv/bin/activate
+chainlit run app.py
 
----
+# Tests ausführen
+python run_tests.py
 
-## Generierte Charts (Session 18.12.2025)
-
-| Beschreibung | Status |
-|--------------|--------|
-| TCP Position X, Dienstag 12 Uhr | ✅ Erfolgreich generiert |
+# Git
+git status
+git add -A
+git commit -m "message"
+git push
+```
 
 ---
 
@@ -248,6 +217,6 @@ Benötigen laufenden ThingsBoard-Server mit Daten:
 | Datum | Änderung |
 |-------|----------|
 | 16.12.2024 | AP0-AP6 abgeschlossen |
-| 18.12.2025 | AP7 abgeschlossen, File-Storage implementiert, Error Handling verbessert |
-| 18.12.2025 | AP9: 243 Unit Tests erstellt und bestanden, Test-Suite aufgesetzt |
-| 18.12.2025 | Fix: Agent stoppt bei partiellen Daten, Timerange-Parser erweitert ("16.", "am 16.") |
+| 18.12.2025 | AP7 abgeschlossen, File-Storage, Error Handling |
+| 18.12.2025 | AP9: 243 Unit Tests erstellt und bestanden |
+| 18.12.2025 | Pipeline-Steuerung: needs_user_input, Timerange-Parser, Follow-up Kontext |
