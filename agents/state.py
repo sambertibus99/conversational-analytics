@@ -27,6 +27,7 @@ class AgentState(MessagesState):
     # === Planung (vom Supervisor) ===
     plan: list[str] | None = None
     current_step: int = 0
+    reasoning: str | None = None
     
     # === Daten (vom Data Agent) ===
     # Rohdaten - werden DIREKT befüllt, gehen nicht durch LLM
@@ -43,6 +44,12 @@ class AgentState(MessagesState):
     # === Visualisierung (vom Viz Agent) ===
     chart_url: str | None = None
     chart_type: str | None = None
+    
+    # === Pipeline-Control ===
+    # Wenn True: Pipeline STOPPEN und auf User-Input warten
+    needs_user_input: bool = False
+    # Grund warum User-Input benötigt wird
+    user_input_reason: str | None = None
     
     # === Error Handling ===
     error: str | None = None

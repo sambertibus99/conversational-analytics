@@ -385,9 +385,16 @@ async def run_viz_agent(state: AgentState) -> dict[str, Any]:
                     limited = transformed[:100]
                     system_content += f"\n\nTRANSFORMIERTE DATEN (bereit für generate_line_chart):\n{json.dumps(limited)}"
             
+            # WICHTIG: Nur HumanMessages übernehmen, keine SystemMessages!
+            # Sonst gibt es "multiple non-consecutive system messages" Fehler
+            human_messages = [
+                msg for msg in state["messages"]
+                if isinstance(msg, HumanMessage)
+            ]
+            
             messages_with_system = [
                 SystemMessage(content=system_content),
-                *state["messages"]
+                *human_messages
             ]
             
             debug_print("Starte Agent-Ausführung...")
