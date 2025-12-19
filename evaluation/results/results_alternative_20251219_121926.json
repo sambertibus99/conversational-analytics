@@ -1,0 +1,98 @@
+{
+  "timestamp": "2025-12-19T12:19:26.574161",
+  "total_tests": 5,
+  "metrics": {
+    "execution_accuracy": 80.0,
+    "tool_selection_accuracy": 100.0,
+    "data_faithfulness": 100.0,
+    "abstention_rate": 0.0
+  },
+  "results": [
+    {
+      "query_id": "N-E1",
+      "query": "Wo befindet sich der TCP des Roboters laut den letzten Daten?",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Basierend auf den aktuellsten Sensordaten vom **Dienstag, 16.12.2025 um 18:36:28** befindet sich der TCP (Tool Center Point) des Roboters an folgender Position:\n\n**Kartesische Koordinaten:**\n- X: 270,45 mm\n- Y: 349,23 mm  \n- Z: 641,98 mm\n\n**Rotationswinkel:**\n- A: 104,96°\n- B: 69,87°\n- C: 122,20°\n\nDer Roboter steht also etwa 27 cm rechts, 35 cm nach vorne und 64 cm hoch von seinem Koordinatenursprung entfernt, mit einer spezifischen Orientierung des Werkzeugs entsprechend den angegebenen Rotationswinkeln.",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 19198
+    },
+    {
+      "query_id": "N-E2",
+      "query": "Zeige die Geschwindigkeitswerte vom letzten Dienstag als Diagramm",
+      "category": "einfach",
+      "success": true,
+      "error": "no_data",
+      "response": "Leider konnte ich keine Geschwindigkeitsdaten vom letzten Dienstag finden. \n\n**Mögliche Gründe:**\n- Es wurden keine Daten für diesen Zeitraum aufgezeichnet\n- Die Sensoren waren möglicherweise offline\n- Der Zeitraum liegt außerhalb des verfügbaren Datenbereichs\n\n**Was Sie tun können:**\n- Überprüfen Sie einen anderen Zeitraum (z.B. \"Zeige Geschwindigkeitswerte von gestern\")\n- Fragen Sie nach verfügbaren Datenzeiträumen\n- Kontaktieren Sie den Administrator, falls Sensordaten fehlen sollten\n\nKann ich Ihnen mit einem anderen Zeitraum oder anderen Sensordaten helfen?",
+      "plan": [
+        "data_agent",
+        "viz_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": false,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 10632
+    },
+    {
+      "query_id": "N-E3",
+      "query": "Liste alle verfügbaren Telemetrie-Keys auf",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Basierend auf den geladenen Daten habe ich **51 Telemetrie-Einträge** gefunden. \n\nDie verfügbaren Telemetrie-Keys sind:\n- **Temperatur-Sensoren**: temperature_sensor_1, temperature_sensor_2, temperature_sensor_3\n- **Druck-Sensoren**: pressure_sensor_1, pressure_sensor_2  \n- **Vibrations-Sensoren**: vibration_sensor_1, vibration_sensor_2, vibration_sensor_3\n- **Durchfluss-Sensoren**: flow_sensor_1, flow_sensor_2\n- **Energie-Metriken**: power_consumption, energy_total\n- **System-Status**: system_status, error_count, uptime_hours\n\nDiese Keys können Sie für weitere Analysen, Statistiken oder Visualisierungen verwenden. Möchten Sie spezifische Daten zu einem dieser Sensoren analysieren?",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 22714
+    },
+    {
+      "query_id": "N-E4",
+      "query": "Was war die letzte gemessene Bahngeschwindigkeit?",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Die letzte gemessene Bahngeschwindigkeit beträgt **0,0 m/s**, gemessen am Dienstag, 16.12.2025 um 18:36:28 Uhr.\n\nDas bedeutet, dass die Bahn zum Zeitpunkt der letzten Messung stillstand. Falls Sie erwarten würden, dass sich die Bahn bewegt, könnte dies darauf hindeuten, dass:\n- Die Anlage gerade stillsteht\n- Ein geplanter Stopp vorliegt\n- Möglicherweise ein technisches Problem vorliegt\n\nBenötigen Sie weitere Informationen zur Bahngeschwindigkeit oder möchten Sie den Verlauf über einen längeren Zeitraum betrachten?",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 17406
+    },
+    {
+      "query_id": "N-E5",
+      "query": "Welchen Winkel hat Achse 4 laut den aktuellsten Daten?",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Basierend auf den aktuellsten Daten hat **Achse 4** einen Winkel von **-66,61 Grad**.\n\nDiese Messung stammt vom Dienstag, 16.12.2025 um 18:36:28 Uhr und zeigt, dass sich die Achse in einer negativen Position befindet, also entgegen der positiven Drehrichtung ausgerichtet ist.",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 14009
+    }
+  ]
+}

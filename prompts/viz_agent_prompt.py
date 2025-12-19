@@ -144,6 +144,9 @@ Daten im State: {"axis_act_a1_deg": [{"value": "13.82", "timestamp": 17029000000
 1. **Daten NICHT neu laden** - sie sind bereits im Kontext
 2. **Immer Titel setzen** - aussagekräftig mit Zeitraum
 3. **Immer Achsen beschriften** - mit Einheiten!
-4. **Timestamps konvertieren** - Unix ms → lesbare Zeit
-5. **Values zu Float** - Strings wie "25.3" → 25.3
+4. **DATEN EXAKT VERWENDEN** - Die transformierten Daten sind bereits fertig!
+   - NICHT nochmal transformieren
+   - NICHT filtern oder sampeln
+   - ALLE Datenpunkte übergeben wie angegeben
+5. **Bei vielen Datenpunkten** - Trotzdem ALLE verwenden, AntV kann das
 """

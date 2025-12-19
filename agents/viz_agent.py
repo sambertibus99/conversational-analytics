@@ -302,9 +302,15 @@ def extract_chart_url(messages: list) -> str | None:
     return None
 
 
-def prepare_viz_context(state: AgentState) -> str:
-    """Bereitet den Daten-Kontext für den Viz Agent vor."""
+def prepare_viz_context(state: AgentState) -> tuple[str, list | None]:
+    """
+    Bereitet den Daten-Kontext für den Viz Agent vor.
+    
+    Returns:
+        (context_string, transformed_data)
+    """
     context_parts = []
+    transformed_data = None
     
     # Original-Query
     for msg in state["messages"]:
@@ -321,35 +327,43 @@ def prepare_viz_context(state: AgentState) -> str:
         meta = state["data_meta"]
         if meta.get("data_points"):
             context_parts.append(f"Datenpunkte: {meta['data_points']}")
+        if meta.get("timerange"):
+            tr = meta["timerange"]
+            context_parts.append(f"Zeitraum: {tr.get('start', '?')} bis {tr.get('end', '?')}")
     
-    # Tatsächliche Daten (gekürzt für Context)
+    # Tatsächliche Daten transformieren
     if state.get("data"):
         data = state["data"]
         
-        # Zeige Struktur und erste Werte
-        if isinstance(data, dict):
+        if isinstance(data, dict) and data:
             keys = list(data.keys())
             context_parts.append(f"Verfügbare Keys: {keys}")
             
-            # Erste Werte als Beispiel
-            for key in keys[:2]:
-                values = data[key]
-                if isinstance(values, list) and values:
-                    context_parts.append(f"Beispiel {key}: {values[:3]}...")
-        
-        # Transformierte Daten für einfachen Zugriff
-        if isinstance(data, dict) and data:
-            first_key = list(data.keys())[0]
-            unit = get_unit_for_key(first_key)
+            # Prüfe ob Multi-Key oder Single-Key
+            if len(keys) > 1:
+                # Multi-Line Chart
+                transformed_data = transform_multikey_for_antv(data)
+                context_parts.append(f"\nMulti-Key Daten: {len(keys)} Serien")
+            else:
+                # Single-Line Chart
+                transformed_data = transform_timeseries_for_antv(data)
             
-            # Für Line Chart transformieren
-            transformed = transform_timeseries_for_antv(data)
-            if transformed:
-                context_parts.append(f"\nFür Line Chart transformiert ({len(transformed)} Punkte):")
-                context_parts.append(f"data={json.dumps(transformed[:5])}...")
-                context_parts.append(f"Empfohlener axisYTitle: 'Wert ({unit})'")
+            if transformed_data:
+                # Sampling für große Datenmengen (max 500 Punkte für Chart)
+                MAX_POINTS = 500
+                if len(transformed_data) > MAX_POINTS:
+                    step = len(transformed_data) // MAX_POINTS
+                    transformed_data = transformed_data[::step][:MAX_POINTS]
+                    context_parts.append(f"Daten gesampelt auf {len(transformed_data)} Punkte (von {len(transformed_data) * step})")
+                else:
+                    context_parts.append(f"Datenpunkte für Chart: {len(transformed_data)}")
+                
+                # Einheit bestimmen
+                first_key = keys[0]
+                unit = get_unit_for_key(first_key)
+                context_parts.append(f"Einheit: {unit}")
     
-    return "\n".join(context_parts)
+    return "\n".join(context_parts), transformed_data
 
 
 async def run_viz_agent(state: AgentState) -> dict[str, Any]:
@@ -370,23 +384,48 @@ async def run_viz_agent(state: AgentState) -> dict[str, Any]:
             agent = create_viz_agent(tools)
             debug_print("Agent erstellt")
             
-            # Kontext mit Daten vorbereiten
-            data_context = prepare_viz_context(state)
+            # Kontext mit Daten vorbereiten (jetzt Tuple!)
+            data_context, transformed_data = prepare_viz_context(state)
+            
+            # Einheit und Keys bestimmen
+            data = state["data"]
+            keys = list(data.keys()) if isinstance(data, dict) else []
+            first_key = keys[0] if keys else ""
+            unit = get_unit_for_key(first_key)
+            
+            # Zeitraum aus Meta
+            timerange_str = ""
+            if state.get("data_meta") and state["data_meta"].get("timerange"):
+                tr = state["data_meta"]["timerange"]
+                timerange_str = f"{tr.get('start', '')} - {tr.get('end', '')}"
             
             # System Prompt + Daten-Kontext
-            system_content = f"{VIZ_AGENT_SYSTEM_PROMPT}\n\n## AKTUELLE DATEN\n\n{data_context}"
-            
-            # Transformierte Daten direkt in den Prompt (damit LLM sie nutzen kann)
-            data = state["data"]
-            if isinstance(data, dict) and data:
-                transformed = transform_timeseries_for_antv(data)
-                if transformed:
-                    # Nur erste 100 Punkte für den Kontext
-                    limited = transformed[:100]
-                    system_content += f"\n\nTRANSFORMIERTE DATEN (bereit für generate_line_chart):\n{json.dumps(limited)}"
+            system_content = f"""{VIZ_AGENT_SYSTEM_PROMPT}
+
+## AKTUELLE DATEN
+
+{data_context}
+
+## KRITISCH: VERWENDE DIESE DATEN EXAKT!
+
+Die folgenden Daten sind bereits transformiert und bereit für das Chart-Tool.
+**NUTZE SIE EXAKT SO WIE ANGEGEBEN!**
+**NICHT nochmal transformieren, filtern oder sampeln!**
+**Alle {len(transformed_data) if transformed_data else 0} Datenpunkte verwenden!**
+
+```json
+{json.dumps(transformed_data[:500] if transformed_data else [], indent=2)}
+```
+
+## EMPFOHLENE PARAMETER
+- title: "{', '.join(keys[:3])} - {timerange_str}"
+- axisXTitle: "Zeit"
+- axisYTitle: "Wert ({unit})"
+- width: 800
+- height: 500
+"""
             
             # WICHTIG: Nur HumanMessages übernehmen, keine SystemMessages!
-            # Sonst gibt es "multiple non-consecutive system messages" Fehler
             human_messages = [
                 msg for msg in state["messages"]
                 if isinstance(msg, HumanMessage)
@@ -397,7 +436,7 @@ async def run_viz_agent(state: AgentState) -> dict[str, Any]:
                 *human_messages
             ]
             
-            debug_print("Starte Agent-Ausführung...")
+            debug_print(f"Starte Agent-Ausführung mit {len(transformed_data) if transformed_data else 0} Datenpunkten...")
             result = await agent.ainvoke({"messages": messages_with_system})
             debug_print(f"Agent fertig, {len(result.get('messages', []))} Messages")
             

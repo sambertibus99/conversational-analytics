@@ -1,0 +1,30 @@
+{
+  "timestamp": "2025-12-18T20:35:20.382781",
+  "total_tests": 1,
+  "metrics": {
+    "execution_accuracy": 100.0,
+    "tool_selection_accuracy": 100.0,
+    "data_faithfulness": 100.0,
+    "abstention_rate": 0.0
+  },
+  "results": [
+    {
+      "query_id": "E4",
+      "query": "Wie viel Energie hat der Roboter am 16. Dezember verbraucht?",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Basierend auf Ihrer Anfrage zum Energieverbrauch des Roboters am 16. Dezember habe ich **1.215 Datenpunkte** für den Energieverbrauch gefunden und geladen.\n\nLeider konnte ich keine spezifischen Statistiken für diesen Tag berechnen. Dies könnte daran liegen, dass:\n- Die Daten möglicherweise nicht exakt dem 16. Dezember entsprechen\n- Ein technisches Problem bei der Statistik-Berechnung aufgetreten ist\n\n**Was Sie tun können:**\n- Versuchen Sie eine spezifischere Zeitangabe (z.B. \"16. Dezember 2024\")\n- Fragen Sie nach einem Diagramm des Energieverbrauchs für diesen Zeitraum\n- Bitten Sie um eine Übersicht der verfügbaren Daten\n\nMöchten Sie, dass ich ein Diagramm des Energieverbrauchs erstelle oder die Anfrage anders formulieren?",
+      "plan": [
+        "data_agent",
+        "stats_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 23871
+    }
+  ]
+}

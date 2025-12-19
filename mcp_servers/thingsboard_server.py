@@ -120,6 +120,69 @@ WEEKDAY_MAP = {
 WEEKDAY_NAMES = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
 
 
+def parse_time_range_in_day(timerange_lower: str) -> tuple[int | None, int | None, int | None, int | None]:
+    """
+    Extrahiert Zeitbereich aus einem String.
+    
+    Unterstützt:
+    - "zwischen 13 und 16 Uhr"
+    - "von 13 bis 16 Uhr"
+    - "13 bis 16 Uhr"
+    - "13:00 bis 16:30"
+    - "von 14:30 bis 15:45"
+    
+    Returns:
+        (start_hour, start_minute, end_hour, end_minute) oder (None, None, None, None)
+    """
+    # Pattern für Zeitbereiche
+    time_range_patterns = [
+        # "zwischen 13 und 16 Uhr" oder "zwischen 13:00 und 16:30"
+        r'zwischen\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?\s*und\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?',
+        # "von 13 bis 16 Uhr" oder "von 13:00 bis 16:30"
+        r'von\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?\s*bis\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?',
+        # "13 bis 16 Uhr" oder "13:00 bis 16:30"
+        r'(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?\s*bis\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?',
+        # "13-16 Uhr"
+        r'(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?',
+    ]
+    
+    for pattern in time_range_patterns:
+        match = re.search(pattern, timerange_lower)
+        if match:
+            groups = match.groups()
+            start_hour = int(groups[0])
+            start_minute = int(groups[1]) if groups[1] else 0
+            end_hour = int(groups[2])
+            end_minute = int(groups[3]) if groups[3] else 0
+            return start_hour, start_minute, end_hour, end_minute
+    
+    return None, None, None, None
+
+
+def parse_single_time(timerange_lower: str) -> tuple[int | None, int | None]:
+    """
+    Extrahiert eine einzelne Uhrzeit aus einem String.
+    
+    Returns:
+        (hour, minute) oder (None, None)
+    """
+    time_patterns = [
+        r'(\d{1,2}):(\d{2})',
+        r'(\d{1,2})\s*uhr',
+        r'um\s*(\d{1,2})',
+    ]
+    
+    for pattern in time_patterns:
+        match = re.search(pattern, timerange_lower)
+        if match:
+            groups = match.groups()
+            hour = int(groups[0])
+            minute = int(groups[1]) if len(groups) > 1 and groups[1] else 0
+            return hour, minute
+    
+    return None, None
+
+
 def parse_timerange(timerange: str | None) -> tuple[int, int]:
     """
     Parst Zeitraum-Angaben zu Timestamps.
@@ -128,6 +191,7 @@ def parse_timerange(timerange: str | None) -> tuple[int, int]:
     - Relative: "letzte Stunde", "letzte 24h", "heute", "letzte 30 Minuten"
     - Wochentage: "Dienstag", "Dienstag um 13 Uhr", "letzten Montag"
     - Datum: "16.", "am 16.", "16. Dezember", "16.12.", "16.12.2025"
+    - Zeitbereiche: "Dienstag zwischen 13 und 16 Uhr", "16.12. von 14 bis 15 Uhr"
     - Spezifisch: "gestern um 14:30"
     """
     now = datetime.now()
@@ -187,9 +251,25 @@ def parse_timerange(timerange: str | None) -> tuple[int, int]:
                 if target_date > now:
                     target_date = target_date.replace(year=year - 1)
                 
-                # Ganzen Tag abfragen
-                start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
-                end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+                # Prüfe auf Zeitbereich (z.B. "zwischen 13 und 16 Uhr")
+                start_hour, start_min, end_hour, end_min = parse_time_range_in_day(timerange_lower)
+                
+                if start_hour is not None and end_hour is not None:
+                    # Zeitbereich angegeben
+                    start = target_date.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
+                    end = target_date.replace(hour=end_hour, minute=end_min, second=59, microsecond=999999)
+                else:
+                    # Prüfe auf einzelne Uhrzeit
+                    single_hour, single_min = parse_single_time(timerange_lower)
+                    if single_hour is not None:
+                        # Einzelne Uhrzeit -> 10 Minuten Fenster
+                        target_time = target_date.replace(hour=single_hour, minute=single_min, second=0, microsecond=0)
+                        start = target_time - timedelta(minutes=5)
+                        end = target_time + timedelta(minutes=5)
+                    else:
+                        # Keine Uhrzeit -> ganzen Tag abfragen
+                        start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                        end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
                 
                 start_ts = int(start.timestamp() * 1000)
                 end_ts = int(end.timestamp() * 1000)
@@ -212,27 +292,25 @@ def parse_timerange(timerange: str | None) -> tuple[int, int]:
         
         target_date = now - timedelta(days=days_ago)
         
-        hour = 12
-        minute = 0
+        # Prüfe auf Zeitbereich (z.B. "zwischen 13 und 16 Uhr")
+        start_hour, start_min, end_hour, end_min = parse_time_range_in_day(timerange_lower)
         
-        time_patterns = [
-            r'(\d{1,2}):(\d{2})',
-            r'(\d{1,2})\s*uhr',
-            r'um\s*(\d{1,2})',
-        ]
-        
-        for pattern in time_patterns:
-            match = re.search(pattern, timerange_lower)
-            if match:
-                groups = match.groups()
-                hour = int(groups[0])
-                if len(groups) > 1 and groups[1]:
-                    minute = int(groups[1])
-                break
-        
-        target_time = target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        start = target_time - timedelta(minutes=5)
-        end = target_time + timedelta(minutes=5)
+        if start_hour is not None and end_hour is not None:
+            # Zeitbereich angegeben
+            start = target_date.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
+            end = target_date.replace(hour=end_hour, minute=end_min, second=59, microsecond=999999)
+        else:
+            # Prüfe auf einzelne Uhrzeit
+            single_hour, single_min = parse_single_time(timerange_lower)
+            if single_hour is not None:
+                # Einzelne Uhrzeit -> 10 Minuten Fenster
+                target_time = target_date.replace(hour=single_hour, minute=single_min, second=0, microsecond=0)
+                start = target_time - timedelta(minutes=5)
+                end = target_time + timedelta(minutes=5)
+            else:
+                # KEINE Uhrzeit angegeben -> GANZEN TAG abfragen!
+                start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
         
         start_ts = int(start.timestamp() * 1000)
         end_ts = int(end.timestamp() * 1000)
@@ -242,16 +320,22 @@ def parse_timerange(timerange: str | None) -> tuple[int, int]:
     if "gestern" in timerange_lower or "yesterday" in timerange_lower:
         yesterday = now - timedelta(days=1)
         
-        hour_match = re.search(r'(\d{1,2}):?(\d{2})?\s*(uhr)?', timerange_lower)
-        if hour_match:
-            hour = int(hour_match.group(1))
-            minute = int(hour_match.group(2)) if hour_match.group(2) else 0
-            target_time = yesterday.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            start = target_time - timedelta(minutes=5)
-            end = target_time + timedelta(minutes=5)
+        # Prüfe auf Zeitbereich
+        start_hour, start_min, end_hour, end_min = parse_time_range_in_day(timerange_lower)
+        
+        if start_hour is not None and end_hour is not None:
+            start = yesterday.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
+            end = yesterday.replace(hour=end_hour, minute=end_min, second=59, microsecond=999999)
         else:
-            start = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
-            end = yesterday.replace(hour=23, minute=59, second=59, microsecond=999999)
+            # Prüfe auf einzelne Uhrzeit
+            single_hour, single_min = parse_single_time(timerange_lower)
+            if single_hour is not None:
+                target_time = yesterday.replace(hour=single_hour, minute=single_min, second=0, microsecond=0)
+                start = target_time - timedelta(minutes=5)
+                end = target_time + timedelta(minutes=5)
+            else:
+                start = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+                end = yesterday.replace(hour=23, minute=59, second=59, microsecond=999999)
         
         start_ts = int(start.timestamp() * 1000)
         end_ts = int(end.timestamp() * 1000)
@@ -436,7 +520,12 @@ async def get_telemetry(
     
     Args:
         keys: Komma-separierte Liste von Keys, z.B. "axis_act_a1_deg,torque_act_a1_nm"
-        timerange: Zeitraum wie "letzte Stunde", "Dienstag 13 Uhr", "gestern um 14:30"
+        timerange: Zeitraum, unterstützt viele Formate:
+            - Relativ: "letzte Stunde", "letzte 24h", "heute"
+            - Datum: "16.", "16. Dezember", "16.12.2025"
+            - Wochentag: "Dienstag", "letzten Montag"
+            - Mit Uhrzeit: "Dienstag um 13 Uhr", "16.12. um 14:30"
+            - Zeitbereich: "Dienstag zwischen 13 und 16 Uhr", "16.12. von 14 bis 15 Uhr"
         device_name: Name des Geräts
         
     Returns:

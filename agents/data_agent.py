@@ -40,6 +40,149 @@ MCP_SERVER_PATH = PROJECT_ROOT / "mcp_servers" / "thingsboard_server.py"
 DEBUG = False
 
 
+# =============================================================================
+# DATENVALIDIERUNG
+# =============================================================================
+
+def is_error_value(value: Any) -> bool:
+    """
+    Prüft ob ein Wert eine Fehlermeldung ist statt eines gültigen Messwerts.
+    
+    Erkennt verschiedene Fehlermuster:
+    - "Bad status code: ..."
+    - "Error: ..."
+    - "null", "None", "NaN"
+    - OPC-UA Fehler
+    - Leere Strings
+    """
+    if value is None:
+        return True
+    
+    if isinstance(value, (int, float)):
+        return False  # Numerisch = gültig
+    
+    if isinstance(value, str):
+        value_lower = value.lower().strip()
+        
+        if not value_lower:
+            return True  # Leerer String
+        
+        # Bekannte Fehlermuster
+        error_patterns = [
+            "bad status",
+            "error",
+            "unavailable",
+            "null",
+            "nan",
+            "invalid",
+            "failed",
+            "timeout",
+            "exception",
+            "not found",
+            "no data",
+            "bad_",  # OPC-UA Status codes
+            "nodeid",
+            "statuscode",
+        ]
+        
+        for pattern in error_patterns:
+            if pattern in value_lower:
+                return True
+        
+        # Versuche als Zahl zu parsen
+        try:
+            float(value)
+            return False  # Ist eine Zahl
+        except (ValueError, TypeError):
+            # Kein Fehlermuster, aber auch keine Zahl - verdächtig
+            if len(value) > 50:  # Lange Strings sind meist Fehlermeldungen
+                return True
+    
+    return False
+
+
+def validate_data_quality(data: dict) -> dict:
+    """
+    Validiert die Datenqualität und gibt einen Report zurück.
+    
+    Args:
+        data: Dict mit Keys und Werten im ThingsBoard-Format
+        
+    Returns:
+        {
+            "valid": bool,
+            "total_points": int,
+            "valid_points": int,
+            "error_points": int,
+            "error_keys": ["key1", ...],
+            "error_sample": "Bad status code..."
+        }
+    """
+    if not data or not isinstance(data, dict):
+        return {
+            "valid": False,
+            "total_points": 0,
+            "valid_points": 0,
+            "error_points": 0,
+            "error_keys": [],
+            "error_sample": None,
+        }
+    
+    total = 0
+    valid = 0
+    errors = 0
+    error_keys = []
+    error_sample = None
+    
+    for key, values in data.items():
+        if not isinstance(values, list):
+            # Einzelwert (latest)
+            if isinstance(values, dict) and "value" in values:
+                total += 1
+                if is_error_value(values["value"]):
+                    errors += 1
+                    if key not in error_keys:
+                        error_keys.append(key)
+                    if error_sample is None:
+                        error_sample = str(values["value"])[:100]
+                else:
+                    valid += 1
+            continue
+        
+        # Liste von Werten
+        key_errors = 0
+        for point in values:
+            total += 1
+            if isinstance(point, dict) and "value" in point:
+                if is_error_value(point["value"]):
+                    key_errors += 1
+                    if error_sample is None:
+                        error_sample = str(point["value"])[:100]
+                else:
+                    valid += 1
+            elif isinstance(point, (int, float)):
+                valid += 1
+            else:
+                key_errors += 1
+        
+        errors += key_errors
+        if key_errors > 0:
+            error_keys.append(key)
+    
+    # Daten sind gültig wenn mindestens 50% der Punkte ok sind
+    is_valid = valid > 0 and (valid / max(total, 1)) >= 0.5
+    
+    return {
+        "valid": is_valid,
+        "total_points": total,
+        "valid_points": valid,
+        "error_points": errors,
+        "error_percentage": round(100 * errors / max(total, 1), 1),
+        "error_keys": error_keys,
+        "error_sample": error_sample,
+    }
+
+
 def debug_print(msg: str):
     """Gibt Debug-Nachrichten aus wenn DEBUG=True."""
     if DEBUG:
@@ -220,8 +363,23 @@ def extract_data_from_parsed(parsed: Any) -> tuple[Any, dict | None, str | None]
     return None, None, None
 
 
-def generate_data_summary(data: Any, meta: dict | None) -> str:
-    """Generiert eine kurze Zusammenfassung der Daten."""
+def generate_data_summary(data: Any, meta: dict | None, quality: dict | None = None) -> str:
+    """Generiert eine kurze Zusammenfassung der Daten inkl. Qualitätswarnung."""
+    
+    # ZUERST: Qualitätsproblem melden!
+    if quality and not quality.get("valid", True):
+        error_pct = quality.get("error_percentage", 100)
+        error_keys = quality.get("error_keys", [])
+        valid_pts = quality.get("valid_points", 0)
+        total_pts = quality.get("total_points", 0)
+        
+        if error_pct >= 95:
+            # Fast alle Daten fehlerhaft
+            keys_str = ", ".join(error_keys[:3])
+            return f"FEHLERHAFTE DATEN: Die Messwerte für {keys_str} enthalten ungültige Werte (OPC-UA/Sensor-Fehler). {error_pct:.0f}% der {total_pts} Datenpunkte sind fehlerhaft. Der Sensor liefert möglicherweise keine gültigen Daten."
+        elif error_pct > 50:
+            # Mehr als die Hälfte fehlerhaft
+            return f"DATENQUALITÄT EINGESCHRÄNKT: {error_pct:.0f}% der Daten sind fehlerhaft. Nur {valid_pts} von {total_pts} Messwerten sind gültig."
     
     # NO_DATA - Klare Fehlermeldung!
     if meta and meta.get("type") == "no_data":
@@ -426,8 +584,18 @@ async def run_data_agent(state: AgentState) -> dict[str, Any]:
                                     data_file = extracted_file
                                     debug_print(f"Daten extrahiert: meta keys={list(meta.keys()) if meta else None}, file={data_file}")
             
-            # Summary generieren
-            summary = generate_data_summary(data, meta)
+            # Datenqualität prüfen
+            quality = None
+            if data and isinstance(data, dict):
+                quality = validate_data_quality(data)
+                debug_print(f"Datenqualität: valid={quality['valid']}, errors={quality['error_percentage']}%")
+                
+                # Qualitätsdaten in meta speichern
+                if meta:
+                    meta["quality"] = quality
+            
+            # Summary generieren (mit Qualitätsinfo)
+            summary = generate_data_summary(data, meta, quality)
             debug_print(f"Summary: {summary}")
             
             # Prüfen ob User-Input benötigt wird

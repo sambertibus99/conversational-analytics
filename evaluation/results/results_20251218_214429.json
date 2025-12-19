@@ -1,0 +1,363 @@
+{
+  "timestamp": "2025-12-18T21:44:29.188891",
+  "total_tests": 20,
+  "metrics": {
+    "execution_accuracy": 100.0,
+    "tool_selection_accuracy": 80.0,
+    "data_faithfulness": 100.0,
+    "abstention_rate": 80.0
+  },
+  "results": [
+    {
+      "query_id": "E1",
+      "query": "Wie ist die aktuelle Position von Achse 1?",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Die aktuelle Position von Achse 1 beträgt **7,33 Grad** (Stand: Dienstag, 16.12.2025 um 18:36:28).\n\nDie Achse befindet sich also in einer leicht positiven Winkelposition. Benötigen Sie weitere Informationen zu dieser Achse oder möchten Sie die Position über einen bestimmten Zeitraum verfolgen?",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 19324
+    },
+    {
+      "query_id": "E2",
+      "query": "Zeig mir den Verlauf der Bahngeschwindigkeit der letzten Stunde als Liniendiagramm",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Keine Daten für die letzte Stunde (Donnerstag, 18.12.2025 20:30 bis 21:30) gefunden.\n\nWas möchtest du tun?\n1. Verfügbare Zeiträume für Bahngeschwindigkeitsdaten prüfen\n2. Einen anderen Zeitraum angeben\n3. Die aktuellsten verfügbaren Bahngeschwindigkeitsdaten anzeigen",
+      "plan": [
+        "data_agent",
+        "viz_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 19856
+    },
+    {
+      "query_id": "E3",
+      "query": "Wie schwer ist die aktuelle Last am Roboter?",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Leider kann ich Ihnen die aktuelle Last am Roboter nicht anzeigen. \n\n**Das Problem:** Der Sensor, der die Lastdaten misst, liefert derzeit keine gültigen Werte. Alle 44 verfügbaren Datenpunkte sind fehlerhaft - das deutet auf einen OPC-UA-Verbindungsfehler oder einen defekten Sensor hin.\n\n**Was Sie tun können:**\n- Prüfen Sie die Verbindung zwischen Roboter und Datenerfassungssystem\n- Kontrollieren Sie, ob der Lastsensor am Roboter ordnungsgemäß funktioniert\n- Überprüfen Sie die OPC-UA-Konfiguration\n\nSobald der Sensor wieder korrekte Daten liefert, kann ich Ihnen gerne die aktuelle Last und deren Verlauf anzeigen.",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 23301
+    },
+    {
+      "query_id": "E4",
+      "query": "Was ist das durchschnittliche Drehmoment von Achse 1 am 16. Dezember?",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Hallo! 😊\n\nIch habe die Drehmoment-Daten von Achse 1 für den 16. Dezember analysiert:\n\n**Das durchschnittliche Drehmoment von Achse 1 betrug -0,048 Nm** (gerundet).\n\nZusätzliche Details:\n- Basiert auf 1.403 Messpunkten über den ganzen Tag\n- Wertebereich: von -0,9 Nm (Minimum) bis 0,514 Nm (Maximum)\n- Der negative Durchschnittswert deutet darauf hin, dass die Achse überwiegend in eine Richtung belastet war\n\nDie Daten zeigen eine relativ geringe durchschnittliche Belastung mit gelegentlichen stärkeren Ausschlägen in beide Richtungen.",
+      "plan": [
+        "data_agent",
+        "stats_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 25007
+    },
+    {
+      "query_id": "E5",
+      "query": "Läuft der Roboter gerade mit vollem Override?",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Nein, der Roboter läuft aktuell nicht mit vollem Override. \n\nDie aktuellen Daten zeigen, dass der Override bei **50%** steht (Stand: Dienstag, 16.12.2025 18:36:28). Das bedeutet, der Roboter arbeitet mit halber Geschwindigkeit im Vergleich zur maximalen Einstellung.\n\nEin voller Override würde bei 100% liegen. Mit 50% läuft der Roboter also deutlich gedrosselt, was auf eine bewusste Geschwindigkeitsreduzierung hindeutet - möglicherweise aus Sicherheitsgründen oder für präzisere Arbeitsschritte.",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 18965
+    },
+    {
+      "query_id": "M1",
+      "query": "Vergleiche die Drehmomente aller 6 Achsen vom 16. Dezember als Diagramm",
+      "category": "mittel",
+      "success": true,
+      "error": null,
+      "response": "Perfekt! Ich habe die Drehmomentdaten aller 6 Achsen vom 16. Dezember für Sie analysiert und visualisiert.\n\n**Hier ist Ihr Drehmoment-Vergleichsdiagramm:** https://mdn.alipayobjects.com/one_clip/afts/img/VuWnQq3AVO4AAAAAUjAAAAgAoEACAQFr/original\n\n**Wichtige Erkenntnisse:**\n- **Achse 4** zeigt die höchste Belastung mit einem Durchschnitt von 0.52 Nm und Spitzen bis 3.14 Nm\n- **Achse 3** hat die größte Schwankungsbreite (-3.29 bis 2.27 Nm) \n- **Achse 6** arbeitet am stabilsten mit geringen Schwankungen (-0.15 bis 0.18 Nm)\n- **Achsen 1 und 5** zeigen negative Durchschnittswerte, was auf entgegengesetzte Drehrichtungen hindeutet\n\nAlle Achsen haben ähnliche Datenpunktanzahlen (ca. 1400), was auf eine konsistente Datenerfassung über den Tag hinweist.",
+      "plan": [
+        "data_agent",
+        "viz_agent"
+      ],
+      "chart_url": "https://mdn.alipayobjects.com/one_clip/afts/img/VuWnQq3AVO4AAAAAUjAAAAgAoEACAQFr/original",
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 62833
+    },
+    {
+      "query_id": "M2",
+      "query": "Zeig mir die durchschnittliche Achsposition 1 pro Stunde für den 16. Dezember",
+      "category": "mittel",
+      "success": true,
+      "error": null,
+      "response": "Hier sind die Ergebnisse für die durchschnittliche Achsposition 1 am 16. Dezember:\n\n**Statistik-Übersicht:**\n- Durchschnittswert: 10,58°\n- Wertebereich: 7,33° bis 13,82°\n- Anzahl Datenpunkte: 8 (stündliche Werte)\n\n**Visualisierung:**\nHier ist der Verlauf der durchschnittlichen Achsposition 1 über den Tag: https://mdn.alipayobjects.com/one_clip/afts/img/7lIHTpRdWcIAAAAASDAAAAgAoEACAQFr/original\n\nDie Achse bewegte sich relativ stabil um den 10,6°-Bereich, mit einer Schwankung von etwa 6,5° über den Tag verteilt. Das Liniendiagramm zeigt dir den genauen zeitlichen Verlauf der Position.",
+      "plan": [
+        "data_agent",
+        "stats_agent",
+        "viz_agent"
+      ],
+      "chart_url": "https://mdn.alipayobjects.com/one_clip/afts/img/7lIHTpRdWcIAAAAASDAAAAgAoEACAQFr/original",
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 95754
+    },
+    {
+      "query_id": "M3",
+      "query": "Vergleiche das kommandierte und tatsächliche Drehmoment von Achse 3 für den 16. Dezember",
+      "category": "mittel",
+      "success": true,
+      "error": null,
+      "response": "Hier ist der Vergleich zwischen kommandiertem und tatsächlichem Drehmoment von Achse 3 für den 16. Dezember:\n\n**Analyseergebnisse:**\n- **Kommandiertes Drehmoment**: Konstant bei 0.0 Nm über den gesamten Tag (1.215 Messpunkte)\n- **Tatsächliches Drehmoment**: Durchschnitt -0.15 Nm mit Schwankungen zwischen -3.29 und +2.27 Nm (1.405 Messpunkte)\n\n**Interpretation:**\nDie Achse 3 war am 16. Dezember nicht aktiv kommandiert (Sollwert durchgehend 0), zeigte aber dennoch Drehmomentaktivität im tatsächlichen Wert. Dies könnte auf externe Kräfte, Reibung oder Störungen hindeuten.\n\n**Visualisierung:**\nHier ist das Liniendiagramm mit beiden Drehmomentwerten: https://mdn.alipayobjects.com/one_clip/afts/img/oDmSTIj7Wn0AAAAASbAAAAgAoEACAQFr/original\n\nDie Grafik zeigt deutlich den Unterschied zwischen dem konstanten Sollwert und den schwankenden Istwerten der Achse.",
+      "plan": [
+        "data_agent",
+        "viz_agent"
+      ],
+      "chart_url": "https://mdn.alipayobjects.com/one_clip/afts/img/oDmSTIj7Wn0AAAAASbAAAAgAoEACAQFr/original",
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 106220
+    },
+    {
+      "query_id": "M4",
+      "query": "Zeig mir die Bewegungsbahn des Roboters am 16. Dezember von 10 bis 11 Uhr",
+      "category": "mittel",
+      "success": true,
+      "error": null,
+      "response": "Hier ist die Bewegungsbahn des Roboters am 16. Dezember: https://mdn.alipayobjects.com/one_clip/afts/img/WVzVR5fj09QAAAAARNAAAAgAoEACAQFr/original\n\nDie Visualisierung zeigt die räumliche Bewegung des Roboters basierend auf den Positionsdaten. Aus den Daten kann ich folgendes ablesen:\n\n**Bewegungsbereich:**\n- **X-Achse:** 94,5 - 270,5 mm (Durchschnitt: 236,4 mm)\n- **Y-Achse:** 105,2 - 349,2 mm (Durchschnitt: 302,0 mm) \n- **Z-Achse:** 571,7 - 642,0 mm (Durchschnitt: 628,4 mm)\n\n**Rotationsbewegungen:**\n- Die A-, B- und C-Achsen zeigen verschiedene Rotationswinkel, wobei die A- und C-Achse den größten Bewegungsbereich aufweisen\n\nDer Roboter bewegte sich in einem definierten Arbeitsbereich mit relativ stabiler Z-Position, was auf präzise Arbeitsvorgänge hindeutet. Die 10.000 Datenpunkte zeigen eine kontinuierliche Bewegungsaufzeichnung über den gesamten Tag.",
+      "plan": [
+        "data_agent",
+        "viz_agent"
+      ],
+      "chart_url": "https://mdn.alipayobjects.com/one_clip/afts/img/WVzVR5fj09QAAAAARNAAAAgAoEACAQFr/original",
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 109787
+    },
+    {
+      "query_id": "M5",
+      "query": "Wie hat sich die Auslastung am 16. Dezember entwickelt?",
+      "category": "mittel",
+      "success": true,
+      "error": null,
+      "response": "Die Auslastung am 16. Dezember 2024 war sehr konstant bei 50% über den gesamten Tag. \n\n**Wichtigste Erkenntnisse:**\n- Durchschnittliche Auslastung: 50%\n- Keine Schwankungen (Minimum und Maximum beide bei 50%)\n- Sehr stabile Performance über 24 Stunden\n\nHier ist die Visualisierung der Auslastungsentwicklung: https://mdn.alipayobjects.com/one_clip/afts/img/ilxeTpCR3RIAAAAAS0AAAAgAoEACAQFr/original\n\nDie konstante Auslastung deutet auf einen sehr gleichmäßigen Betrieb ohne größere Lastspitzen oder -einbrüche hin.",
+      "plan": [
+        "data_agent",
+        "viz_agent"
+      ],
+      "chart_url": "https://mdn.alipayobjects.com/one_clip/afts/img/ilxeTpCR3RIAAAAAS0AAAAgAoEACAQFr/original",
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 105599
+    },
+    {
+      "query_id": "K1",
+      "query": "Gibt es einen Zusammenhang zwischen Geschwindigkeit und Drehmoment bei Achse 1?",
+      "category": "komplex",
+      "success": true,
+      "error": null,
+      "response": "Keine Daten für den Zeitraum der letzten Stunde gefunden (Donnerstag, 18.12.2025 20:40 bis 21:40).\n\nWas möchtest du tun?\n\n1. **Verfügbare Zeiträume prüfen** - Ich schaue nach, wann Geschwindigkeits- und Drehmomentdaten verfügbar sind\n2. **Anderen Zeitraum angeben** - Du gibst einen spezifischen Zeitraum vor (z.B. \"gestern\", \"letzte Woche\")\n3. **Aktuelle Werte anzeigen** - Ich hole die neuesten verfügbaren Einzelwerte\n\nBitte wähle eine Option oder gib einen anderen Zeitraum an.",
+      "plan": [
+        "data_agent",
+        "stats_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": false,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 13073
+    },
+    {
+      "query_id": "K2",
+      "query": "Gab es am 16. Dezember ungewöhnlich hohe Drehmomentspitzen bei Achse 2?",
+      "category": "komplex",
+      "success": true,
+      "error": null,
+      "response": "## Ja, es gab ungewöhnlich hohe Drehmomentspitzen bei Achse 2! 📊\n\nAm 16. Dezember wurden **95 Anomalien** bei der Drehmomentmessung von Achse 2 erkannt - das sind **6,8%** aller Messpunkte.\n\n**Die wichtigsten Befunde:**\n- **Höchste Spitze:** 1,947 Nm (deutlich über dem Normalbereich)\n- **Anomalie-Schwellwert:** Werte über 1,25 Nm oder unter -0,27 Nm\n- **Durchschnittswert:** 0,49 Nm (im normalen Bereich)\n\n**Besonders auffällig:**\n- Mehrere Spitzen erreichten das Maximum von 1,947 Nm\n- Auch negative Spitzen bis -0,55 Nm wurden registriert\n- Die Anomalien traten in Clustern auf (z.B. bei Messpunkten 535-539)\n\nDiese 6,8% Anomalierate deutet auf ein ungewöhnliches Verhalten hin, das eine nähere Untersuchung der Achse 2 rechtfertigt. Möglicherweise gab es Blockaden, ungleichmäßige Lasten oder mechanische Probleme an diesem Tag.",
+      "plan": [
+        "data_agent",
+        "stats_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 40427
+    },
+    {
+      "query_id": "K3",
+      "query": "Zeigt das Drehmoment von Achse 1 einen Trend über den 16. Dezember?",
+      "category": "komplex",
+      "success": true,
+      "error": null,
+      "response": "Basierend auf der Analyse des Drehmoments von Achse 1 am 16. Dezember kann ich Ihnen folgendes berichten:\n\n**Trend-Analyse:**\nDas Drehmoment zeigt einen **stabilen Verlauf** über den Tag. Obwohl statistisch ein sehr schwacher positiver Trend erkennbar ist (Anstieg von 0.000016 Nm pro Datenpunkt), ist dieser praktisch vernachlässigbar.\n\n**Wichtige Kennzahlen:**\n- Durchschnittswert: -0.048 Nm\n- Schwankungsbereich: -0.9 bis 0.514 Nm\n- 1.403 Messpunkte über den Tag verteilt\n\n**Fazit:**\nDas Drehmoment von Achse 1 verhält sich am 16. Dezember sehr konstant ohne signifikanten Trend nach oben oder unten. Die Werte schwanken um einen leicht negativen Durchschnittswert, was auf einen normalen Betriebszustand hindeutet.",
+      "plan": [
+        "data_agent",
+        "stats_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": false,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 23392
+    },
+    {
+      "query_id": "K4",
+      "query": "Welche Achse hatte am 16. Dezember die höchste durchschnittliche Belastung?",
+      "category": "komplex",
+      "success": true,
+      "error": null,
+      "response": "Basierend auf der Analyse der Drehmomentdaten vom 16. Dezember 2025 hatte **Achse 4 (torque_act_a4_nm)** die höchste durchschnittliche Belastung mit **0,517 Nm**.\n\nHier die Übersicht aller Achsen sortiert nach durchschnittlicher Belastung:\n\n1. **Achse 4**: 0,517 Nm (höchste Belastung)\n2. **Achse 2**: 0,494 Nm  \n3. **Achse 6**: 0,027 Nm\n4. **Achse 1**: -0,048 Nm\n5. **Achse 3**: -0,150 Nm\n6. **Achse 5**: -0,158 Nm (niedrigste Belastung)\n\nDie Analyse basiert auf über 1.400 Datenpunkten pro Achse über den gesamten Tag verteilt. Achse 4 zeigt nicht nur den höchsten Durchschnittswert, sondern auch die größte Spannweite mit Spitzenwerten bis zu 3,139 Nm.",
+      "plan": [
+        "data_agent",
+        "stats_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 26317
+    },
+    {
+      "query_id": "K5",
+      "query": "Vergleiche die Roboter-Auslastung vom 12. Dezember mit dem 16. Dezember",
+      "category": "komplex",
+      "success": true,
+      "error": null,
+      "response": "Ich habe die Daten für den 16. Dezember erfolgreich geladen und analysiert. Leider konnte ich keine Daten für den 12. Dezember finden, daher ist ein direkter Vergleich nicht möglich.\n\n**Ergebnisse für den 16. Dezember:**\n- **Roboter-Auslastung (override_pct):** Konstant bei 50% über den gesamten Tag\n- **Datenpunkte:** 10.000 Messungen\n- **Stabilität:** Sehr stabil - keine Schwankungen (Min = Max = 50%)\n\n**Was bedeutet das?**\nDie Roboter liefen am 16. Dezember mit einer gleichmäßigen Auslastung von 50%. Dies deutet auf einen sehr kontrollierten und stabilen Betrieb hin.\n\n**Für den gewünschten Vergleich** bräuchte ich Zugriff auf die Daten vom 12. Dezember. Möglicherweise sind diese Daten nicht verfügbar oder unter einem anderen Datum/Format gespeichert. Können Sie prüfen, ob Daten für den 12. Dezember existieren?",
+      "plan": [
+        "data_agent",
+        "stats_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": false,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 27774
+    },
+    {
+      "query_id": "A1",
+      "query": "Zeig mir Daten vom KRC6",
+      "category": "abstention",
+      "success": true,
+      "error": null,
+      "response": "Ich sehe, dass es kein Gerät namens \"KRC6\" gibt. Die verfügbaren Geräte sind:\n\n**Verfügbare Geräte:**\n- **KRC5** (KUKA Roboter)\n- krc\n- local_gateway\n- Test Device A1, A2, A3\n- Test Device B1, C1\n- DHT11 Demo Device\n- Raspberry Pi Demo Device\n- Thermostat T1, T2\n\nEs gibt nur ein **KRC5** Gerät, aber kein KRC6. \n\nMöchten Sie:\n1. **Daten vom KRC5** anzeigen (dem verfügbaren KUKA Roboter)\n2. **Daten vom \"krc\"** Gerät anzeigen\n3. Oder haben Sie sich bei der Gerätebezeichnung vertan?\n\nBitte lassen Sie mich wissen, welches Gerät Sie meinen, dann kann ich Ihnen die entsprechenden Daten zeigen.",
+      "plan": [
+        "data_agent",
+        "viz_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": false,
+      "execution_time_ms": 14584
+    },
+    {
+      "query_id": "A2",
+      "query": "Wie ist die Temperatur von Motor 1?",
+      "category": "abstention",
+      "success": true,
+      "error": null,
+      "response": "Leider sind auch in den Attributen keine Temperaturdaten für Motor 1 oder andere Motoren verfügbar.\n\n**Ergebnis:** Das KRC5-Gerät stellt aktuell keine Temperaturdaten für Motor 1 zur Verfügung.\n\nDie verfügbaren Daten umfassen:\n- Achspositionen und -geschwindigkeiten\n- Drehmomente (Ist- und Sollwerte)\n- TCP-Position und -orientierung\n- Energieverbrauch\n- Auslastung und Override-Werte\n- Lastdaten und Werkzeugdaten\n\nFalls Temperaturdaten benötigt werden, müssten diese möglicherweise:\n1. Erst in der Robotersteuerung konfiguriert werden\n2. Über zusätzliche Sensoren erfasst werden\n3. In ThingsBoard als neue Telemetrie-Keys hinzugefügt werden",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": true,
+      "execution_time_ms": 19274
+    },
+    {
+      "query_id": "A3",
+      "query": "Setze den Override auf 50%",
+      "category": "abstention",
+      "success": true,
+      "error": null,
+      "response": "Entschuldigung, aber ich kann Ihren Befehl \"Override auf 50% setzen\" nicht ausführen. \n\n**Warum nicht?**\nIch bin ein Assistent für **IIoT-Datenanalyse** und kann nur Daten auswerten, Statistiken berechnen oder Charts erstellen. Override-Einstellungen sind jedoch Steuerungsbefehle, die direkt in Ihre Anlagen eingreifen würden.\n\n**Was ich stattdessen kann:**\n- Aktuelle Override-Werte analysieren\n- Historische Override-Daten visualisieren  \n- Statistiken zu Override-Änderungen berechnen\n- Trends bei Override-Einstellungen aufzeigen\n\n**Für Steuerungsbefehle** wenden Sie sich bitte an:\n- Ihr Prozessleitsystem (SCADA/HMI)\n- Die entsprechende Steuerungssoftware\n- Ihren Anlagenbediener\n\nKann ich Ihnen stattdessen bei der Analyse von Override-Daten helfen?",
+      "plan": [],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": true,
+      "execution_time_ms": 11883
+    },
+    {
+      "query_id": "A4",
+      "query": "Wie wird sich das Drehmoment morgen entwickeln?",
+      "category": "abstention",
+      "success": true,
+      "error": null,
+      "response": "Entschuldigung, aber ich kann keine Vorhersagen über die zukünftige Entwicklung des Drehmoments machen. \n\n**Warum das nicht möglich ist:**\n- Ich habe nur Zugriff auf historische und aktuelle IIoT-Daten\n- Zukunftsprognosen erfordern spezielle Vorhersagemodelle, die ich nicht erstellen kann\n\n**Was ich stattdessen für Sie tun kann:**\n- Aktuelle Drehmomentwerte anzeigen\n- Historische Trends der letzten Tage/Wochen analysieren\n- Statistiken über vergangene Drehmomentwerte berechnen\n- Charts mit bisherigen Verläufen erstellen\n\nMöchten Sie stattdessen eine Analyse der bisherigen Drehmomentdaten? Zum Beispiel: \"Zeige mir den Drehmomentverlauf der letzten Woche\" oder \"Wie hat sich das Drehmoment heute entwickelt?\"",
+      "plan": [],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": true,
+      "execution_time_ms": 10363
+    },
+    {
+      "query_id": "A5",
+      "query": "Berechne die Lebensdauer des Roboters",
+      "category": "abstention",
+      "success": true,
+      "error": null,
+      "response": "Ich habe die Roboterdaten für den Zeitraum vom 11.12. bis 18.12.2025 analysiert, aber leider kann ich keine Lebensdauer-Berechnung durchführen.\n\n**Das Problem:** Die verfügbaren Daten zeigen eine Auslastung von 0% über den gesamten Zeitraum. Das bedeutet entweder:\n- Der Roboter war nicht in Betrieb\n- Die Sensoren haben keine Aktivität erfasst\n- Es liegt ein Datenproblem vor\n\n**Für eine Lebensdauer-Berechnung benötige ich:**\n- Betriebsstunden (aktuell: 0 Stunden erkannt)\n- Verschleißindikatoren oder Zyklusanzahl\n- Längere Datenhistorie mit tatsächlicher Nutzung\n\n**Mein Tipp:** Überprüfen Sie, ob der Roboter in diesem Zeitraum tatsächlich gearbeitet hat, oder wählen Sie einen anderen Zeitraum mit aktiver Nutzung aus.",
+      "plan": [
+        "data_agent",
+        "stats_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": true,
+      "execution_time_ms": 67814
+    }
+  ]
+}

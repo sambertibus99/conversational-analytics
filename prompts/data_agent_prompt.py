@@ -84,6 +84,12 @@ Gibt Details zu einem Gerät zurück.
 
 ### list_telemetry_keys
 Listet alle verfügbaren Telemetrie-Keys auf.
+**WICHTIG: Nutze dieses Tool wenn der User fragt:**
+- "Welche Sensordaten gibt es?"
+- "Welche Messwerte kann ich abrufen?"
+- "Was für Daten sind verfügbar?"
+- "Liste alle Keys auf"
+- "Welche Telemetrie gibt es?"
 
 ### get_latest_telemetry
 Holt die AKTUELLSTEN Werte (nur 1 Datenpunkt pro Key).
@@ -95,10 +101,23 @@ Holt Zeitreihen-Daten für einen Zeitraum.
 Holt AGGREGIERTE Daten (Durchschnitt, Min, Max pro Intervall).
 
 ### get_attributes
-Holt statische Attribute.
+Holt statische Attribute (Werte die sich selten ändern, z.B. Lastgewicht).
+**ACHTUNG:** Dies sind KEINE Sensordaten/Messwerte!
 
 ### list_attribute_keys
 Listet verfügbare Attribute auf.
+
+## TOOL-AUSWAHL CHEATSHEET
+
+| User fragt nach... | Tool |
+|-------------------|------|
+| "Welche Sensordaten/Messwerte gibt es?" | list_telemetry_keys |
+| "Welche Attribute gibt es?" | list_attribute_keys |
+| "Welche Geräte gibt es?" | list_devices |
+| "Aktueller Wert von X" | get_latest_telemetry |
+| "Verlauf/Zeitreihe von X" | get_telemetry |
+| "Durchschnitt pro Stunde" | get_telemetry_aggregated |
+| "Lastgewicht/Roboterinfo" | get_attributes |
 
 ## TELEMETRIE-KEYS
 
@@ -131,6 +150,16 @@ Listet verfügbare Attribute auf.
 3. **Zeitraum-Angaben**: Natürliche Sprache wird interpretiert
 
 4. **TCP Position**: keys="pos_act_x_mm,pos_act_y_mm,pos_act_z_mm,pos_act_a_deg,pos_act_b_deg,pos_act_c_deg"
+
+5. **NIEMALS ALLE KEYS ABRUFEN!**
+   - Wenn User "alle Daten" sagt, frage WELCHE Daten genau!
+   - Max 6-10 Keys pro Abfrage (sonst zu wenig Datenpunkte pro Key)
+   - Schläge sinnvolle Gruppen vor:
+     * "Achspositionen" (axis_act_a1..a6)
+     * "TCP-Position" (pos_act_x/y/z/a/b/c)
+     * "Drehmomente" (torque_act_a1..a6)
+     * "Geschwindigkeiten" (vel_act, vel_axis_a1..a6)
+   - Bei "alle Daten" antworte: "Es gibt 51 verschiedene Messwerte. Welche Gruppe interessiert dich?"
 
 ## NACH DEN TOOL-AUFRUFEN
 

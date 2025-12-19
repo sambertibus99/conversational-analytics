@@ -1,0 +1,98 @@
+{
+  "timestamp": "2025-12-19T10:32:30.747640",
+  "total_tests": 5,
+  "metrics": {
+    "execution_accuracy": 100.0,
+    "tool_selection_accuracy": 100.0,
+    "data_faithfulness": 100.0,
+    "abstention_rate": 0.0
+  },
+  "results": [
+    {
+      "query_id": "N-E1",
+      "query": "Wo befindet sich der TCP des Roboters gerade?",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Die aktuelle Position des Roboter-TCP (Tool Center Point) ist:\n\n**Kartesische Koordinaten:**\n- X: 270,45 mm\n- Y: 349,23 mm  \n- Z: 641,98 mm\n\n**Orientierung:**\n- A-Achse: 104,96°\n- B-Achse: 69,87°\n- C-Achse: 122,20°\n\nDiese Werte wurden am Dienstag, 16.12.2025 um 18:36:28 Uhr erfasst und zeigen die aktuelle Ist-Position des Roboters im Arbeitsraum.",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 16944
+    },
+    {
+      "query_id": "N-E2",
+      "query": "Zeige die Geschwindigkeitswerte vom 15. Dezember",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Für den 15. Dezember 2025 sind keine Geschwindigkeitsdaten verfügbar.\n\nWas möchten Sie tun?\n\n1. **Verfügbare Zeiträume prüfen** - Ich kann schauen, wann Geschwindigkeitsdaten verfügbar sind\n2. **Anderen Zeitraum wählen** - Sie können einen anderen Tag/Zeitraum angeben\n3. **Aktuelle Geschwindigkeit anzeigen** - Die neuesten verfügbaren Geschwindigkeitswerte\n\nBitte wählen Sie eine Option oder geben Sie einen anderen Zeitraum an.",
+      "plan": [
+        "data_agent",
+        "viz_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 12859
+    },
+    {
+      "query_id": "N-E3",
+      "query": "Welche Sensordaten kann ich abrufen?",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Leider kann ich Ihnen derzeit keine gültigen Sensordaten zeigen. \n\n**Das Problem:** Alle verfügbaren Sensordaten (44 Datenpunkte) von SERVER_SCOPE und CLIENT_SCOPE enthalten fehlerhafte Werte. Dies deutet auf ein technisches Problem hin - entweder mit den OPC-UA Verbindungen oder den Sensoren selbst.\n\n**Was Sie tun können:**\n1. Überprüfen Sie die OPC-UA Serververbindung\n2. Kontrollieren Sie, ob die Sensoren ordnungsgemäß funktionieren\n3. Prüfen Sie die Konfiguration der Datenquellen\n\nSobald die technischen Probleme behoben sind, kann ich Ihnen gerne eine Übersicht über die verfügbaren Sensordaten und deren Messwerte bereitstellen.",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 32655
+    },
+    {
+      "query_id": "N-E4",
+      "query": "Mit welcher Geschwindigkeit bewegt sich der Roboterarm momentan?",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Basierend auf den aktuellen Sensordaten bewegt sich der Roboterarm **momentan nicht** - die Geschwindigkeit beträgt 0,0 m/s.\n\nDie Messung stammt von heute, Dienstag, 16.12.2025 um 18:36:28 Uhr. Der Roboterarm steht also gerade still oder befindet sich in einer Pausenposition.\n\nFalls Sie die Geschwindigkeitsentwicklung über einen längeren Zeitraum analysieren möchten, kann ich gerne historische Daten laden und visualisieren.",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 18334
+    },
+    {
+      "query_id": "N-E5",
+      "query": "Gib mir den Winkel von Achse 4",
+      "category": "einfach",
+      "success": true,
+      "error": null,
+      "response": "Der aktuelle Winkel von Achse 4 beträgt **-66,61 Grad** (Stand: Dienstag, 16.12.2025 um 18:36:28).\n\nDie negative Angabe bedeutet, dass sich die Achse in einer Position unterhalb der Nullstellung befindet.",
+      "plan": [
+        "data_agent"
+      ],
+      "chart_url": null,
+      "execution_ok": true,
+      "tools_correct": true,
+      "data_faithful": true,
+      "abstained_correctly": null,
+      "execution_time_ms": 14834
+    }
+  ]
+}

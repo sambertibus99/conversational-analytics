@@ -1,167 +1,115 @@
-# CLAUDE.md - Kontext für Claude
+# CLAUDE.md - Projekt-Kontext
+
+> **Letzte Aktualisierung:** 19.12.2025
 
 ## Projekt
+
 **Conversational Analytics für IIoT** (Masterarbeit)
-- Ziel: MCP-basiertes System für natürlichsprachliche Datenanalyse
-- Abgabe: 31. März 2025
-- **Status: System funktioniert! AP8 (Evaluation) als nächstes.**
-
-## Projektpfad
-```
-/home/sam/ma_ws/conversational-analytics
-```
+- **Ziel:** MCP-basiertes System für natürlichsprachliche Datenanalyse
+- **Abgabe:** 31. März 2025
+- **Status:** System-Review läuft
 
 ---
 
-## Bei Session-Start
-1. Diese Datei lesen (`CLAUDE.md`)
-2. `04_AKTUELLER_STAND.md` lesen
-3. Bei Bedarf weitere Dateien laden
+## 📚 Dokumentations-Katalog
+
+**WICHTIG: Lade Dateien SELBSTSTÄNDIG wenn du sie brauchst!**
+
+| Datei | Inhalt | Lade wenn... |
+|-------|--------|--------------|
+| `docs/05_ARCHITEKTUR.md` | Systemarchitektur, Datenfluss, Komponenten | Architektur-Fragen, "wie hängt X mit Y zusammen" |
+| `docs/06_PROMPT_PATTERNS.md` | System-Prompts der Agents | Agent-Prompts bearbeiten, Prompt-Verhalten ändern |
+| `docs/07_ERROR_HANDLING.md` | Bekannte Fehler und Lösungen | Bug auftritt, Fehler analysieren |
+| `docs/03_ARBEITSPAKETE.md` | Definition aller APs, Anforderungen | Neues AP beginnen, "was soll AP X können" |
+| `docs/08_TESTFRAGEN.md` | Testfragen für Evaluation | Testen, Evaluation durchführen |
+| `docs/09_THINGSBOARD_SETUP.md` | ThingsBoard Konfiguration | ThingsBoard-Probleme, API-Fragen |
+| `docs/design/[komponente].md` | Design-Entscheidungen pro Komponente | Review einer Komponente |
+| `docs/DATENFLUSS.md` | Detaillierter Datenfluss | Debugging, "wo bleiben die Daten stecken" |
+
+**Regel:** Bei Unsicherheit → **LADE DIE DATEI!** Lieber einmal zu viel als wichtige Info verpassen.
 
 ---
 
-## Aktueller Status (18.12.2025)
+## ⚠️ Aktuelles Vorgehen: Architektur-Review
 
-### Was funktioniert ✅
-- Daten laden für beliebige Zeiträume ("16.", "Dienstag 12 Uhr", "letzte Stunde")
-- Charts erstellen (Line, Bar, Scatter über AntV)
-- Statistiken berechnen
-- Bei fehlenden Daten: Stoppt und fragt User
-- Bei Erfolg: Weiter zum nächsten Agent
+Wir überarbeiten das System Komponente für Komponente.
 
-### Was offen ist
-- **AP8: Evaluation** - 15 Testfragen aus `08_TESTFRAGEN.md` durchgehen
-- Integration Tests (optional)
+### Review-Prozess:
 
----
-
-## Referenz-Dateien
-
-| Situation | Datei |
-|-----------|-------|
-| **Vor jedem Arbeitspaket** | `03_ARBEITSPAKETE.md` |
-| **Agent-Implementierung** | `06_PROMPT_PATTERNS.md` + `05_ARCHITEKTUR.md` |
-| **Fehler/Bug** | `07_ERROR_HANDLING.md` ZUERST! |
-| **Evaluation** | `08_TESTFRAGEN.md` |
-
----
-
-## Kritische Regeln (aus Erfahrung!)
-
-### 1. MCP-Response-Parsing
-```python
-# IMMER Status ZUERST prüfen!
-if parsed.get("status") == "no_data":
-    return None, {"type": "no_data", ...}, None
-if parsed.get("status") == "success":
-    # Dann Daten verarbeiten
+```
+1. VERSTEHEN      → Was macht die Komponente? (Input/Output/Implementierung)
+2. EINORDNEN      → Wo im Gesamtsystem? Abhängigkeiten?
+3. BEWERTEN       → Was funktioniert? Was nicht? Was fehlt?
+4. ALTERNATIVEN   → Optionen mit Pro/Contra (auch: andere Funktionen, weglassen?)
+5. ENTSCHEIDEN    → User wählt, User begründet
+6. DOKUMENTIEREN  → In docs/design/[komponente].md
+7. IMPLEMENTIEREN → Nur was entschieden wurde
+8. TESTEN         → Komponenten-Test + Integrations-Test
 ```
 
-### 2. Pipeline-Steuerung (NEU!)
-```python
-# In data_agent.py: detect_needs_user_input()
-# Stoppt Pipeline NUR bei echten Fehlern, NICHT bei höflichen Nachfragen
+### Review-Status:
 
-# Success-Indicators → KEIN STOPP
-if "erfolgreich" in content or "geladen" in content:
-    return False, None  # Weiter zum nächsten Agent!
-
-# Hard-Stop-Patterns → STOPP
-if "keine daten für den zeitraum" in content:
-    return True, "Agent stoppt"
-```
-
-### 3. Agent-zu-Agent-Übergabe
-```python
-# NIEMALS SystemMessages übernehmen!
-human_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
-messages = [SystemMessage(content=PROMPT), *human_messages]
-```
-
-### 4. Große Datenmengen
-- Rohdaten → `outputs/data/telemetry_xxx.json`
-- Nur Summary (~500 Bytes) an LLM
-- Max ~50KB direkt im Context
+| Komponente | AP | Status |
+|------------|-----|--------|
+| ThingsBoard MCP Server | AP1 | ⏸️ **Nächste Session** |
+| Data Agent | AP2 | ⏸️ Ausstehend |
+| Chart MCP Server | AP3 | ⏸️ Ausstehend |
+| Viz Agent | AP4 | ⏸️ Ausstehend |
+| Stats Agent | AP5 | ⏸️ Ausstehend |
+| Supervisor | AP6 | ⏸️ Ausstehend |
 
 ---
 
-## Timerange-Parser (unterstützte Formate)
+## 🔧 Technische Kurzreferenz
 
-```python
-# Wochentage
-"Dienstag", "Dienstag 12 Uhr", "Dienstag um 13:30"
-
-# Relative
-"letzte Stunde", "letzte 10 Minuten", "heute", "gestern"
-
-# Datum (NEU!)
-"16."           → 16. des aktuellen Monats (ganzer Tag)
-"am 16."        → 16. des aktuellen Monats
-"16. Dezember"  → 16. Dezember
-"16.12."        → 16. Dezember
-"16.12.2025"    → Exaktes Datum
-```
-
----
-
-## Debugging-Workflow
-
-```bash
-# 1. DEBUG aktivieren
-# In agents/data_agent.py oder viz_agent.py:
-DEBUG = True
-
-# 2. App starten
-chainlit run app.py
-
-# 3. Logs beobachten (🔍 DEBUG: ...)
-
-# 4. Fix implementieren
-
-# 5. DEBUG = False setzen!
-```
-
----
-
-## Projektstruktur
+### Projektstruktur
 ```
 conversational-analytics/
-├── agents/
-│   ├── state.py           # AgentState (needs_user_input, user_input_reason)
-│   ├── data_agent.py      # Mit detect_needs_user_input()
-│   ├── viz_agent.py       # Message-Filtering
-│   ├── stats_agent.py     
-│   └── graph.py           # Router prüft needs_user_input
-├── mcp_servers/
-│   └── thingsboard_server.py  # 9 Tools, erweiterter Timerange-Parser
-├── prompts/               # System Prompts
-├── outputs/data/          # Telemetrie-Dateien (JSON)
-├── tests/                 # 243 Unit Tests
-├── app.py                 # Chainlit (mit pending_query für Follow-ups)
-└── [Dokumentation]
+├── CLAUDE.md             # Diese Datei (Einstiegspunkt)
+├── README.md             # Projekt-README
+├── agents/               # Data, Viz, Stats Agent + Supervisor
+├── mcp_servers/          # ThingsBoard MCP Server
+├── prompts/              # System Prompts für Agents
+├── evaluation/           # Testfragen und Ergebnisse
+├── outputs/data/         # Gespeicherte Telemetrie-Daten
+└── docs/                 # Alle Dokumentation
+    ├── 02_PROJEKT_KONTEXT.md
+    ├── 03_ARBEITSPAKETE.md
+    ├── 04_AKTUELLER_STAND.md
+    ├── 05_ARCHITEKTUR.md
+    ├── 06_PROMPT_PATTERNS.md
+    ├── 07_ERROR_HANDLING.md
+    ├── 08_TESTFRAGEN.md
+    ├── 09_THINGSBOARD_SETUP.md
+    ├── 10_WOCHENPLAN.md
+    └── design/           # Design-Entscheidungen
 ```
 
----
-
-## Typische Befehle
-
+### Wichtige Befehle
 ```bash
-# App starten
 cd ~/ma_ws/conversational-analytics
 source venv/bin/activate
-chainlit run app.py
-
-# Tests ausführen (umgeht ROS2-Konflikt)
-python run_tests.py
-
-# Git
-git add -A && git commit -m "message" && git push
+chainlit run app.py              # App starten
+python run_tests.py              # Tests ausführen
 ```
+
+### ThingsBoard
+- URL: `http://localhost:8080`
+- Device: KRC5 (KUKA Roboter)
+- Daten: 11.12. - 16.12.2025
 
 ---
 
-## ThingsBoard
-- URL: http://localhost:8080
-- Device: KRC5 (KUKA Roboter)
-- Verfügbare Daten: 11.12. - 16.12.2025 (Arbeitszeit)
-- **Keine Temperatur-Keys!** (nur Drehmomente, Position, etc.)
+## ❌ Bekannte Probleme
+
+1. **Daten-Limit:** >10 Keys gleichzeitig → wenige Datenpunkte pro Key
+2. **Viz Agent:** Sampelt Daten manchmal unnötig
+3. **"Sensordaten":** Wird manchmal als Attribute statt Telemetrie interpretiert
+
+---
+
+## 📝 Änderungshistorie
+
+| Datum | Änderung |
+|-------|----------|
+| 19.12.2025 | Dokumentation nach docs/ verschoben, Katalog mit neuen Pfaden |
