@@ -5,10 +5,11 @@
 ## 🎯 Projektziel
 
 Masterarbeit: Entwicklung eines Conversational Analytics Systems das:
-- ✅ Natürlichsprachliche Anfragen versteht ("Zeig mir die Drehmomente vom 16. Dezember")
+- ✅ Natürlichsprachliche Anfragen versteht ("Zeig mir die Drehmomente der letzten 5 Minuten")
 - ✅ Automatisch Daten von ThingsBoard (IIoT-Plattform) abruft
 - ✅ Dynamisch passende Visualisierungen generiert
 - ✅ Statistiken berechnet wenn nötig
+- ✅ Multi-Turn Konversationen unterstützt ("Was ist der Durchschnitt?")
 - ✅ Bei fehlenden Daten nachfragt statt zu raten
 
 ## 🚀 Quick Start
@@ -33,14 +34,14 @@ chainlit run app.py
 ```
 
 Dann öffne http://localhost:8000 und frag z.B.:
-- *"Zeig mir die Drehmomente aller 6 Achsen für den 16. Dezember"*
+- *"Zeig mir die Drehmomente aller 6 Achsen der letzten 5 Minuten"*
+- *"Was ist der Durchschnitt?"* (Multi-Turn!)
 - *"Wie ist die aktuelle TCP Position?"*
-- *"Vergleiche die Achspositionen als Balkendiagramm"*
 
 ## 🏗️ Architektur
 
 ```
-User Query ("Zeig Drehmomente vom 16.")
+User Query ("Zeig Drehmomente der letzten 5 Min")
     │
     ▼
 ┌─────────────────────────────────────────────────────────┐
@@ -49,21 +50,26 @@ User Query ("Zeig Drehmomente vom 16.")
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────┐
-│              LangGraph Orchestrierung                    │
+│         LangGraph Orchestrierung (graph.py)              │
 │                                                          │
 │  ┌──────────┐    ┌────────────┐    ┌──────────┐         │
 │  │Supervisor│ →  │ Data Agent │ →  │Viz Agent │         │
 │  │ (Planer) │    │  (Daten)   │    │ (Charts) │         │
 │  └──────────┘    └─────┬──────┘    └────┬─────┘         │
-│                        │                 │               │
-│         needs_user_input? ──→ STOPP & Fragen            │
-│                        │                 │               │
-└────────────────────────┼─────────────────┼──────────────┘
+│        │               │                 │               │
+│        ▼               ▼                 ▼               │
+│  ┌───────────┐  ┌────────────┐   ┌────────────┐         │
+│  │Stats Agent│  │Error Handler│   │  Respond   │         │
+│  │(Statistik)│  │ (Graceful) │   │  (Final)   │         │
+│  └───────────┘  └────────────┘   └────────────┘         │
+│                                                          │
+│  Features: Checkpointer, max_steps Guard, Error Handler  │
+└────────────────────────┬─────────────────┬──────────────┘
                          │                 │
                          ▼                 ▼
               ┌─────────────────┐  ┌─────────────────┐
               │ ThingsBoard MCP │  │ AntV MCP Server │
-              │   (9 Tools)     │  │   (25 Tools)    │
+              │   (8 Tools)     │  │   (25 Tools)    │
               └────────┬────────┘  └────────┬────────┘
                        │                    │
                        ▼                    ▼
@@ -71,6 +77,32 @@ User Query ("Zeig Drehmomente vom 16.")
               │   ThingsBoard   │  │  Chart-URLs     │
               │   (IIoT-Daten)  │  │  (AntV Cloud)   │
               └─────────────────┘  └─────────────────┘
+```
+
+## ✨ Features
+
+### Multi-Turn Konversationen (DEC-013)
+```
+User: "Zeig mir die Drehmomente der letzten 5 Minuten"
+Bot:  [Chart mit 6 Achsen]
+
+User: "Was ist der Durchschnitt?"
+Bot:  "Achse A1: -0.303 Nm, Achse A2: 0.635 Nm, ..."
+      ↑ Erkennt: Daten sind schon da, nur Stats berechnen!
+```
+
+### Production-Ready (DEC-016, DEC-017)
+- **Strukturiertes Logging** mit Timestamps und Levels
+- **Retry-Mechanismus** mit exponential Backoff
+- **Error Handler** für graceful Failure
+- **Cycle Guard** (max_steps) gegen Endlosschleifen
+- **Thread-Safe** Singleton Pattern
+
+### Intelligente Abstention
+```
+User: "Wie wird das Wetter?"
+Bot:  "Ich bin für IIoT-Datenanalyse zuständig. 
+       Für Wetterinformationen kann ich leider nicht helfen."
 ```
 
 ## ⚙️ Konfiguration
@@ -92,27 +124,31 @@ KRC5_DEVICE_ID=b8121f40-d446-11f0-866d-41534d350312
 ```
 conversational-analytics/
 ├── agents/
-│   ├── state.py           # AgentState (needs_user_input, data, chart_url, ...)
-│   ├── data_agent.py      # Holt Daten, erkennt Stopp-Situationen
-│   ├── viz_agent.py       # Generiert Charts via AntV MCP
+│   ├── state.py           # AgentState mit Reducern (DEC-013)
+│   ├── data_agent.py      # Holt Daten via MCP
+│   ├── viz_agent.py       # Generiert Charts via AntV
 │   ├── stats_agent.py     # Berechnet Statistiken
-│   └── graph.py           # LangGraph Orchestrierung + Router
+│   ├── supervisor.py      # Plant Agent-Reihenfolge
+│   ├── graph.py           # LangGraph Orchestrierung (DEC-017)
+│   └── utils.py           # Gemeinsame Hilfsfunktionen
+├── prompts/               # System Prompts (DEC-015: XML-Tags)
+│   ├── data_agent_prompt.py
+│   ├── viz_agent_prompt.py
+│   ├── stats_agent_prompt.py
+│   ├── supervisor_prompt.py
+│   └── respond_prompt.py
 ├── mcp_servers/
 │   ├── thingsboard_client.py  # Async HTTP Client
-│   └── thingsboard_server.py  # 9 Tools, Timerange-Parser
-├── prompts/                   # System Prompts für Agents
-├── tests/                     # 243 Unit Tests
-│   ├── conftest.py            # Fixtures
-│   ├── run_tests.py           # Test-Runner (ROS2-kompatibel)
-│   └── test_*/                # Test-Module
+│   └── thingsboard_server.py  # 8 Tools, Timerange-Parser
+├── tests/                     # Unit + Integration Tests
+├── docs/
+│   ├── DECISIONS.md           # 17 Pattern-Entscheidungen
+│   ├── 04_AKTUELLER_STAND.md
+│   └── ...
 ├── outputs/data/              # Telemetrie-Dateien (JSON)
-├── config/settings.py         # Konstanten
+├── config/settings.py
 ├── app.py                     # Chainlit Frontend
-├── CLAUDE.md                  # KI-Assistenten Kontext
-├── 04_AKTUELLER_STAND.md      # Projekt-Status
-├── 05_ARCHITEKTUR.md          # Detaillierte Architektur
-├── 07_ERROR_HANDLING.md       # Bekannte Fehler & Fixes
-└── 08_TESTFRAGEN.md           # Evaluation
+└── CLAUDE.md                  # KI-Assistenten Kontext
 ```
 
 ## 🔧 MCP Tools
@@ -125,7 +161,6 @@ conversational-analytics/
 | `list_telemetry_keys` | Verfügbare Messwerte |
 | `get_latest_telemetry` | Aktuellste Werte |
 | `get_telemetry` | Zeitreihen-Daten |
-| `get_telemetry_aggregated` | Aggregierte Daten |
 | `get_data_availability` | Verfügbarer Datenbereich |
 | `get_attributes` | Statische Attribute |
 | `list_attribute_keys` | Verfügbare Attribute |
@@ -140,61 +175,55 @@ npx -y @antv/mcp-server-chart
 
 Der Timerange-Parser versteht:
 ```
+# Relative Angaben
+"letzte 5 Minuten", "letzte Stunde", "heute", "gestern"
+
 # Wochentage
 "Dienstag", "Dienstag 12 Uhr", "Dienstag um 13:30"
 
-# Relative Angaben
-"letzte Stunde", "letzte 10 Minuten", "heute", "gestern"
-
 # Datum
 "16."           → 16. des aktuellen Monats
-"am 16."        → 16. des aktuellen Monats  
 "16. Dezember"  → 16. Dezember
-"16.12."        → 16. Dezember
 "16.12.2025"    → Exaktes Datum
 ```
 
 ## 🧪 Tests
 
 ```bash
-# Unit Tests ausführen (243 Tests)
-python run_tests.py
+# Unit Tests (schnell)
+python -m pytest tests/ -m "not integration" -v
 
-# Mit Verbose Output
-python run_tests.py -v
+# Integration Tests (braucht ThingsBoard)
+python -m pytest tests/ -m integration -v
 
-# Nur bestimmte Tests
-python run_tests.py tests/test_agents -v
-
-# Mit Coverage
-python run_tests.py --coverage
+# Alle Tests
+python -m pytest tests/ -v
 ```
+
+## 📊 Entscheidungs-Patterns
+
+Das Projekt dokumentiert 17 wiederverwendbare Patterns in `docs/DECISIONS.md`:
+
+| ID | Pattern | Problem → Lösung |
+|----|---------|------------------|
+| DEC-013 | Multi-Turn Persistenz | State verloren → Checkpointer + Reducer |
+| DEC-014 | SystemMessage Filter | API-Fehler → Filter + frische Message |
+| DEC-015 | XML-Tag Prompts | Unstrukturiert → `<role>`, `<task>`, etc. |
+| DEC-016 | Production Quality | print() → Logging, SRP, Retry |
+| DEC-017 | Graph Best Practices | Endlosschleifen → max_steps, Error Handler |
 
 ## 📊 Status
 
-| Komponente | Status | Beschreibung |
-|------------|--------|--------------|
-| ThingsBoard MCP | ✅ Fertig | 9 Tools, File-Storage, Timerange-Parser |
-| Data Agent | ✅ Fertig | Response-Parsing, Pipeline-Steuerung |
-| AntV Integration | ✅ Fertig | 25 Chart-Tools |
-| Viz Agent | ✅ Fertig | Message-Filtering, Daten-Transformation |
-| Stats Agent | ✅ Fertig | 8 Statistik-Tools |
-| Supervisor | ✅ Fertig | Plan-Erstellung, Abstention |
-| LangGraph | ✅ Fertig | Orchestrierung, needs_user_input Router |
-| Frontend | ✅ Fertig | Chainlit, Follow-up Kontext |
-| Tests | ✅ Fertig | 243 Unit Tests |
-| Evaluation | ⬜ Offen | 15 Testfragen |
-
-## 🐛 Bekannte Issues & Lösungen
-
-| Problem | Lösung |
-|---------|--------|
-| Token-Limit (400 Bad Request) | Rohdaten in `outputs/data/` speichern, nur Summary an LLM |
-| Multiple SystemMessages | Nur HumanMessages zwischen Agents weitergeben |
-| Agent macht bei Fehlern weiter | `detect_needs_user_input()` erkennt Stopp-Situationen |
-| ROS2 pytest-Konflikt | `run_tests.py` statt direktem `pytest` |
-
-Siehe `07_ERROR_HANDLING.md` für Details.
+| Komponente | Status | Letzte Änderung |
+|------------|--------|-----------------|
+| ThingsBoard MCP | ✅ Fertig | 8 Tools, Timerange-Parser |
+| Data Agent | ✅ Fertig | DEC-016 |
+| Viz Agent | ✅ Fertig | DEC-016 |
+| Stats Agent | ✅ Fertig | DEC-016 |
+| Supervisor | ✅ Fertig | DEC-016 |
+| Graph | ✅ Fertig | DEC-017 |
+| Multi-Turn | ✅ Fertig | DEC-013 |
+| Frontend | ✅ Fertig | Chainlit |
 
 ## 🤖 Verfügbare Telemetrie-Keys (KRC5)
 
