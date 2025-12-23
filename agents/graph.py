@@ -8,6 +8,11 @@ Ablauf:
 1. Supervisor erstellt Plan
 2. Agents werden gemäß Plan ausgeführt
 3. Respond-Node generiert finale Antwort
+
+DESIGN-ENTSCHEIDUNGEN:
+- DEC-013: Multi-Turn Support mit Checkpointer
+- DEC-016: Strukturiertes Logging
+- DEC-017: Graph Best Practices (max_steps, error_handler, validation)
 """
 
 import sys
@@ -17,59 +22,50 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import asyncio
+import logging
+import threading
 from typing import Literal, Any
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
 
 from agents.state import AgentState
 from agents.supervisor import supervisor_node
 from agents.data_agent import data_agent_node
 from agents.stats_agent import stats_agent_node
 from agents.viz_agent import viz_agent_node
+from prompts.respond_prompt import RESPOND_SYSTEM_PROMPT
 from config.settings import ANTHROPIC_API_KEY, DEFAULT_MODEL
 
 
-# Debug-Modus
-DEBUG = False
+# =============================================================================
+# LOGGING KONFIGURATION (DEC-016)
+# =============================================================================
+
+logger = logging.getLogger(__name__)
 
 
-def debug_print(msg: str):
-    """Gibt Debug-Nachrichten aus wenn DEBUG=True."""
-    if DEBUG:
-        print(f"🔍 GRAPH DEBUG: {msg}")
+# =============================================================================
+# KONSTANTEN
+# =============================================================================
+
+# Alle verfügbaren Agent-Nodes
+AGENT_NODES = ["data_agent", "stats_agent", "viz_agent"]
+
+# Routing-Map für conditional edges (DRY)
+ROUTING_MAP = {agent: agent for agent in AGENT_NODES}
+ROUTING_MAP["respond"] = "respond"
+ROUTING_MAP["error_handler"] = "error_handler"
+
+# Maximale Schritte bevor Notfall-Exit (Cycle Guard)
+DEFAULT_MAX_STEPS = 10
 
 
 # =============================================================================
 # RESPOND NODE
 # =============================================================================
-
-RESPOND_SYSTEM_PROMPT = """
-Du bist ein freundlicher Assistent für IIoT-Datenanalyse.
-Fasse die Ergebnisse für den Nutzer zusammen.
-
-## KONTEXT
-Du hast Zugriff auf:
-- Die ursprüngliche Frage des Nutzers
-- Geladene Daten (falls vorhanden)
-- Berechnete Statistiken (falls vorhanden)
-- Generiertes Chart (falls vorhanden)
-
-## REGELN
-1. Antworte auf Deutsch
-2. Sei freundlich und hilfreich
-3. Wenn ein Chart erstellt wurde, erwähne es und zeige die URL
-4. Wenn Statistiken berechnet wurden, präsentiere sie verständlich
-5. Wenn keine Daten gefunden wurden, erkläre warum
-6. Halte die Antwort kurz und prägnant
-
-## FORMAT
-- Bei Charts: "Hier ist [Beschreibung]: [URL]"
-- Bei Statistiken: Interpretiere die Zahlen, nicht nur auflisten
-- Bei Fehlern: Erkläre was schief ging und was der User tun kann
-"""
-
 
 async def respond_node(state: AgentState) -> dict[str, Any]:
     """
@@ -78,22 +74,25 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
     WICHTIG: Bei needs_user_input=True wird die Frage des vorherigen Agents
     direkt weitergegeben (keine neue Response generieren!).
     """
-    debug_print("Starte Respond Node")
+    logger.debug("Starte Respond Node")
+    
+    # State-Validierung
+    messages = state.get("messages")
+    if not messages:
+        logger.warning("Keine Messages im State!")
+        return {
+            "messages": [AIMessage(content="Es ist ein Fehler aufgetreten: Keine Anfrage gefunden.")],
+        }
     
     # SPEZIALFALL: User-Input wird benötigt
-    # Die letzte AI-Message enthält bereits die Frage an den User
     if state.get("needs_user_input", False):
-        debug_print(f"needs_user_input=True: {state.get('user_input_reason')}")
+        logger.debug(f"needs_user_input=True: {state.get('user_input_reason')}")
         
-        # Finde und gib die letzte AI-Message direkt zurück
-        for msg in reversed(state.get("messages", [])):
+        for msg in reversed(messages):
             if isinstance(msg, AIMessage) and isinstance(msg.content, str):
-                debug_print("Gebe vorherige AI-Message direkt weiter")
-                return {
-                    "messages": [msg],  # Die Frage direkt weitergeben
-                }
+                logger.debug("Gebe vorherige AI-Message direkt weiter")
+                return {"messages": [msg]}
         
-        # Fallback falls keine AI-Message gefunden
         return {
             "messages": [AIMessage(content="Es ist ein Problem aufgetreten. Bitte versuche es nochmal.")],
         }
@@ -101,21 +100,58 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
     # Sammle Kontext für normale Response
     context_parts = []
     
-    # Original-Query
+    # Aktuelle User-Query (die LETZTE HumanMessage)
     user_query = ""
-    for msg in state["messages"]:
+    for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             user_query = msg.content
             break
+    
+    if not user_query:
+        logger.warning("Keine User-Query gefunden!")
+    
     context_parts.append(f"User-Anfrage: {user_query}")
     
     # Plan
-    if state.get("plan"):
-        context_parts.append(f"Ausgeführte Agents: {state['plan']}")
+    plan = state.get("plan")
+    if plan:
+        context_parts.append(f"Ausgeführte Agents: {plan}")
     
     # Daten-Summary
-    if state.get("data_summary"):
-        context_parts.append(f"Geladene Daten: {state['data_summary']}")
+    data_summary = state.get("data_summary")
+    if data_summary:
+        context_parts.append(f"Geladene Daten: {data_summary}")
+    
+    # Datasets Info mit Datenwerten
+    datasets = state.get("datasets", {})
+    if datasets:
+        context_parts.append(f"Verfügbare Datasets: {', '.join(datasets.keys())}")
+        context_parts.append("\n## DATENWERTE")
+        
+        for ds_name, ds_content in datasets.items():
+            if not isinstance(ds_content, dict):
+                continue
+                
+            data = ds_content.get("data", {})
+            if not isinstance(data, dict):
+                continue
+                
+            context_parts.append(f"\n### Dataset: {ds_name}")
+            
+            for key, values in data.items():
+                if isinstance(values, list) and len(values) > 0:
+                    if isinstance(values[0], dict) and "value" in values[0]:
+                        first_val = values[0].get("value", "?")
+                        last_val = values[-1].get("value", "?")
+                        context_parts.append(f"- {key}: {len(values)} Punkte, von {first_val} bis {last_val}")
+                    else:
+                        context_parts.append(f"- {key}: {len(values)} Werte")
+                elif isinstance(values, dict) and "value" in values:
+                    val = values.get("value", "?")
+                    ts = values.get("timestamp", "?")
+                    context_parts.append(f"- {key}: {val} (Zeitstempel: {ts})")
+                else:
+                    context_parts.append(f"- {key}: {values}")
     
     # Statistiken
     if state.get("statistics"):
@@ -124,40 +160,74 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
         context_parts.append(f"Statistik-Zusammenfassung: {state['statistics_summary']}")
     
     # Chart
-    if state.get("chart_url"):
-        context_parts.append(f"Chart erstellt: {state['chart_url']}")
+    chart_url = state.get("chart_url")
+    if chart_url:
+        context_parts.append(f"Chart erstellt: {chart_url}")
         context_parts.append(f"Chart-Typ: {state.get('chart_type', 'unbekannt')}")
     
     # Fehler
-    if state.get("error"):
-        context_parts.append(f"Fehler aufgetreten: {state['error']}")
+    error = state.get("error")
+    if error:
+        context_parts.append(f"Fehler aufgetreten: {error}")
     
     # Leerer Plan (Abstention)
-    if state.get("plan") == []:
+    if plan == []:
         context_parts.append("HINWEIS: Die Anfrage konnte nicht bearbeitet werden (kein Plan erstellt)")
-        if state.get("reasoning"):
-            context_parts.append(f"Grund: {state['reasoning']}")
+        reasoning = state.get("reasoning")
+        if reasoning:
+            context_parts.append(f"Grund: {reasoning}")
     
     context = "\n".join(context_parts)
-    debug_print(f"Context: {context[:500]}...")
+    logger.debug(f"Context für LLM: {context[:300]}...")
     
     # LLM für Response
     llm = ChatAnthropic(
         model=DEFAULT_MODEL,
         api_key=ANTHROPIC_API_KEY,
-        temperature=0.3,  # Etwas Variation für natürlichere Antworten
+        temperature=0.3,
     )
     
-    messages = [
+    llm_messages = [
         SystemMessage(content=RESPOND_SYSTEM_PROMPT),
         HumanMessage(content=f"Erstelle eine Antwort basierend auf:\n\n{context}"),
     ]
     
-    response = await llm.ainvoke(messages)
-    debug_print(f"Response: {response.content[:200]}...")
+    response = await llm.ainvoke(llm_messages)
+    logger.debug(f"Response generiert: {response.content[:100]}...")
     
     return {
         "messages": [AIMessage(content=response.content)],
+    }
+
+
+# =============================================================================
+# ERROR HANDLER NODE
+# =============================================================================
+
+async def error_handler_node(state: AgentState) -> dict[str, Any]:
+    """
+    Behandelt Fehler von Agents.
+    
+    Strategie:
+    - Loggt den Fehler
+    - Erhöht error_count
+    - Setzt freundliche Fehlermeldung
+    """
+    error = state.get("error", "Unbekannter Fehler")
+    error_count = state.get("error_count", 0) + 1
+    
+    logger.error(f"Error Handler aufgerufen (Fehler #{error_count}): {error}")
+    
+    # Freundliche Fehlermeldung für User
+    error_message = f"Bei der Verarbeitung ist ein Fehler aufgetreten: {error}"
+    
+    if error_count >= 3:
+        error_message += "\n\nBitte versuche es später nochmal oder formuliere deine Anfrage anders."
+        logger.warning(f"Max Fehleranzahl erreicht ({error_count})")
+    
+    return {
+        "error_count": error_count,
+        "messages": [AIMessage(content=error_message)],
     }
 
 
@@ -169,70 +239,102 @@ def get_next_agent(state: AgentState) -> str:
     """
     Bestimmt den nächsten Agent basierend auf dem Plan.
     
-    WICHTIG: Prüft zuerst ob needs_user_input=True ist!
-    Wenn ja, wird die Pipeline gestoppt und zu respond geleitet.
-    
-    Returns:
-        Name des nächsten Nodes oder "respond" wenn Pipeline stoppen soll
+    Prüft:
+    1. max_steps überschritten? → respond (Notfall-Exit)
+    2. needs_user_input? → respond (Pipeline stoppen)
+    3. error vorhanden? → error_handler
+    4. Plan leer oder fertig? → respond
+    5. Sonst: nächster Agent im Plan
     """
     plan = state.get("plan", [])
     current_step = state.get("current_step", 0)
+    max_steps = state.get("max_steps", DEFAULT_MAX_STEPS)
     
-    debug_print(f"get_next_agent: plan={plan}, current_step={current_step}")
+    logger.debug(f"Router: plan={plan}, step={current_step}/{max_steps}")
     
-    # ZUERST: Prüfen ob User-Input benötigt wird
+    # 1. Cycle Guard: max_steps überschritten
+    if current_step >= max_steps:
+        logger.warning(f"max_steps erreicht ({current_step}/{max_steps}) - Notfall-Exit!")
+        return "respond"
+    
+    # 2. User-Input benötigt
     if state.get("needs_user_input", False):
-        debug_print(f"needs_user_input=True, Grund: {state.get('user_input_reason')}")
-        debug_print("Pipeline wird gestoppt → respond")
+        logger.debug(f"needs_user_input=True → respond")
         return "respond"
     
-    # Leerer Plan → direkt zu respond
+    # 3. Fehler vorhanden (aber nicht schon behandelt)
+    error = state.get("error")
+    error_count = state.get("error_count", 0)
+    if error and error_count == 0:
+        logger.debug(f"Fehler erkannt → error_handler")
+        return "error_handler"
+    
+    # 4. Leerer Plan oder Plan fertig
     if not plan:
-        debug_print("Leerer Plan → respond")
+        logger.debug("Leerer Plan → respond")
         return "respond"
     
-    # Plan abgearbeitet → respond
     if current_step >= len(plan):
-        debug_print("Plan fertig → respond")
+        logger.debug("Plan fertig → respond")
         return "respond"
     
-    # Nächster Agent im Plan
+    # 5. Nächster Agent
     next_agent = plan[current_step]
-    debug_print(f"Nächster Agent: {next_agent}")
+    logger.debug(f"Nächster Agent: {next_agent}")
     return next_agent
 
 
-def increment_step(state: AgentState) -> dict[str, Any]:
-    """Erhöht den current_step Counter."""
-    return {"current_step": state.get("current_step", 0) + 1}
+def route_after_error(state: AgentState) -> str:
+    """
+    Routing nach Error Handler.
+    
+    Bei zu vielen Fehlern: direkt zu respond.
+    Sonst: zurück zum Router (retry möglich).
+    """
+    error_count = state.get("error_count", 0)
+    
+    if error_count >= 3:
+        logger.warning("Zu viele Fehler - gehe zu respond")
+        return "respond"
+    
+    # Error wurde behandelt, gehe zu respond
+    return "respond"
 
 
 # =============================================================================
-# WRAPPER NODES (mit Step-Increment)
+# AGENT WRAPPER FACTORY (DRY)
 # =============================================================================
 
-async def data_agent_wrapper(state: AgentState) -> dict[str, Any]:
-    """Wrapper für Data Agent mit Step-Increment."""
-    debug_print("=== DATA AGENT ===")
-    result = await data_agent_node(state)
-    result["current_step"] = state.get("current_step", 0) + 1
-    return result
-
-
-async def stats_agent_wrapper(state: AgentState) -> dict[str, Any]:
-    """Wrapper für Stats Agent mit Step-Increment."""
-    debug_print("=== STATS AGENT ===")
-    result = await stats_agent_node(state)
-    result["current_step"] = state.get("current_step", 0) + 1
-    return result
-
-
-async def viz_agent_wrapper(state: AgentState) -> dict[str, Any]:
-    """Wrapper für Viz Agent mit Step-Increment."""
-    debug_print("=== VIZ AGENT ===")
-    result = await viz_agent_node(state)
-    result["current_step"] = state.get("current_step", 0) + 1
-    return result
+def make_agent_wrapper(agent_func, agent_name: str):
+    """
+    Factory für Agent-Wrapper mit Step-Increment und Error-Handling.
+    
+    Args:
+        agent_func: Die eigentliche Agent-Funktion
+        agent_name: Name für Logging
+    """
+    async def wrapper(state: AgentState) -> dict[str, Any]:
+        logger.info(f"=== {agent_name.upper()} ===")
+        
+        try:
+            result = await agent_func(state)
+            result["current_step"] = state.get("current_step", 0) + 1
+            
+            # Error-Flag zurücksetzen wenn erfolgreich
+            if "error" not in result:
+                result["error"] = None
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"{agent_name} Exception: {e}", exc_info=True)
+            return {
+                "current_step": state.get("current_step", 0) + 1,
+                "error": str(e),
+                "messages": [AIMessage(content=f"Fehler in {agent_name}: {str(e)}")],
+            }
+    
+    return wrapper
 
 
 # =============================================================================
@@ -244,67 +346,33 @@ def build_graph() -> StateGraph:
     Baut den LangGraph StateGraph.
     
     Struktur:
-    START → supervisor → router → [data_agent|stats_agent|viz_agent|respond] → ... → END
+    START → supervisor → router → [agents|error_handler|respond] → ... → END
     """
-    # Graph erstellen
     graph = StateGraph(AgentState)
     
     # Nodes hinzufügen
     graph.add_node("supervisor", supervisor_node)
-    graph.add_node("data_agent", data_agent_wrapper)
-    graph.add_node("stats_agent", stats_agent_wrapper)
-    graph.add_node("viz_agent", viz_agent_wrapper)
+    graph.add_node("data_agent", make_agent_wrapper(data_agent_node, "data_agent"))
+    graph.add_node("stats_agent", make_agent_wrapper(stats_agent_node, "stats_agent"))
+    graph.add_node("viz_agent", make_agent_wrapper(viz_agent_node, "viz_agent"))
+    graph.add_node("error_handler", error_handler_node)
     graph.add_node("respond", respond_node)
     
     # START → Supervisor
     graph.add_edge(START, "supervisor")
     
-    # Supervisor → Router (conditional)
-    graph.add_conditional_edges(
-        "supervisor",
-        get_next_agent,
-        {
-            "data_agent": "data_agent",
-            "stats_agent": "stats_agent",
-            "viz_agent": "viz_agent",
-            "respond": "respond",
-        }
-    )
+    # Supervisor → Router
+    graph.add_conditional_edges("supervisor", get_next_agent, ROUTING_MAP)
     
-    # Data Agent → Router
-    graph.add_conditional_edges(
-        "data_agent",
-        get_next_agent,
-        {
-            "data_agent": "data_agent",  # Sollte nicht passieren
-            "stats_agent": "stats_agent",
-            "viz_agent": "viz_agent",
-            "respond": "respond",
-        }
-    )
+    # Alle Agents → Router (DRY: eine Schleife statt Copy-Paste)
+    for agent in AGENT_NODES:
+        graph.add_conditional_edges(agent, get_next_agent, ROUTING_MAP)
     
-    # Stats Agent → Router
+    # Error Handler → respond oder retry
     graph.add_conditional_edges(
-        "stats_agent",
-        get_next_agent,
-        {
-            "data_agent": "data_agent",  # Sollte nicht passieren
-            "stats_agent": "stats_agent",  # Sollte nicht passieren
-            "viz_agent": "viz_agent",
-            "respond": "respond",
-        }
-    )
-    
-    # Viz Agent → Router
-    graph.add_conditional_edges(
-        "viz_agent",
-        get_next_agent,
-        {
-            "data_agent": "data_agent",  # Sollte nicht passieren
-            "stats_agent": "stats_agent",  # Sollte nicht passieren
-            "viz_agent": "viz_agent",  # Sollte nicht passieren
-            "respond": "respond",
-        }
+        "error_handler",
+        route_after_error,
+        {"respond": "respond"}
     )
     
     # Respond → END
@@ -314,20 +382,39 @@ def build_graph() -> StateGraph:
 
 
 def compile_graph():
-    """Kompiliert den Graph für die Ausführung."""
+    """
+    Kompiliert den Graph für die Ausführung.
+    
+    Nutzt InMemorySaver für State-Persistenz zwischen Turns (DEC-013).
+    Für Production: PostgresSaver oder SqliteSaver verwenden.
+    """
     graph = build_graph()
-    return graph.compile()
+    checkpointer = InMemorySaver()
+    
+    logger.info("Graph kompiliert mit InMemorySaver")
+    return graph.compile(checkpointer=checkpointer)
 
 
-# Globale Graph-Instanz (lazy initialization)
+# =============================================================================
+# SINGLETON GRAPH INSTANCE (Thread-Safe)
+# =============================================================================
+
+_graph_lock = threading.Lock()
 _compiled_graph = None
 
 
 def get_graph():
-    """Gibt die kompilierte Graph-Instanz zurück."""
+    """
+    Gibt die kompilierte Graph-Instanz zurück (Thread-Safe Singleton).
+    """
     global _compiled_graph
+    
     if _compiled_graph is None:
-        _compiled_graph = compile_graph()
+        with _graph_lock:
+            if _compiled_graph is None:  # Double-check
+                logger.info("Erstelle Graph-Instanz...")
+                _compiled_graph = compile_graph()
+    
     return _compiled_graph
 
 
@@ -335,43 +422,34 @@ def get_graph():
 # PUBLIC API
 # =============================================================================
 
-async def run_query(query: str) -> dict[str, Any]:
+async def run_query(query: str, thread_id: str = "default") -> dict[str, Any]:
     """
     Führt eine User-Query durch den gesamten Graph.
     
     Args:
         query: Die Frage des Users
+        thread_id: Eindeutige ID für die Konversation (für State-Persistenz)
         
     Returns:
-        dict mit:
-        - response: Die finale Antwort
-        - plan: Der ausgeführte Plan
-        - data_summary: Zusammenfassung der geladenen Daten
-        - statistics: Berechnete Statistiken
-        - chart_url: URL zum generierten Chart
+        dict mit response, plan, data_summary, statistics, chart_url, etc.
     """
     graph = get_graph()
     
-    initial_state = {
+    # Config mit thread_id für Checkpointer
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    # Input State mit max_steps
+    input_state = {
         "messages": [HumanMessage(content=query)],
-        "plan": None,
-        "current_step": 0,
-        "data": None,
-        "data_summary": None,
-        "data_meta": None,
-        "statistics": None,
-        "statistics_summary": None,
-        "chart_url": None,
-        "chart_type": None,
-        "error": None,
+        "max_steps": DEFAULT_MAX_STEPS,
     }
     
-    debug_print(f"Starting query: {query}")
+    logger.info(f"Query starten: '{query[:50]}...' (thread: {thread_id})")
     
     # Graph ausführen
-    result = await graph.ainvoke(initial_state)
+    result = await graph.ainvoke(input_state, config)
     
-    debug_print(f"Graph finished. Plan was: {result.get('plan')}")
+    logger.info(f"Query fertig. Plan war: {result.get('plan')}")
     
     # Finale Response extrahieren
     final_response = ""
@@ -394,16 +472,21 @@ async def run_query(query: str) -> dict[str, Any]:
 
 
 # =============================================================================
-# STANDALONE TESTS
+# TESTS
 # =============================================================================
 
 async def test_graph():
     """Test des kompletten Graphs mit verschiedenen Queries."""
     
+    # Logging für Tests
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    
     test_queries = [
         "Wie ist die aktuelle Position von Achse 1?",
-        "Zeig mir den Verlauf der Bahngeschwindigkeit der letzten 5 Minuten als Liniendiagramm",
-        "Was ist der Durchschnitt der Achsposition 1 der letzten 10 Minuten?",
+        "Zeig mir den Verlauf der Drehmomente der letzten 5 Minuten",
         "Wie wird das Wetter morgen?",  # Sollte ablehnen
     ]
     
@@ -426,9 +509,6 @@ async def test_graph():
             if result.get('data_summary'):
                 print(f"📊 Daten: {result['data_summary']}")
             
-            if result.get('statistics_summary'):
-                print(f"📈 Statistik: {result['statistics_summary']}")
-            
             if result.get('chart_url'):
                 print(f"🖼️  Chart: {result['chart_url']}")
             
@@ -445,44 +525,5 @@ async def test_graph():
         print()
 
 
-async def interactive_test():
-    """Interaktiver Test mit eigenen Queries."""
-    print("\n" + "="*60)
-    print("🤖 Conversational Analytics - Interactive Test")
-    print("="*60)
-    print("Gib eine Frage ein (oder 'quit' zum Beenden):\n")
-    
-    while True:
-        query = input("📝 Du: ").strip()
-        
-        if query.lower() in ["quit", "exit", "q"]:
-            break
-        
-        if not query:
-            continue
-        
-        print("\n⏳ Verarbeite...")
-        
-        try:
-            result = await run_query(query)
-            
-            print(f"\n📋 Plan: {result['plan']}")
-            
-            if result.get('chart_url'):
-                print(f"🖼️  Chart: {result['chart_url']}")
-            
-            print(f"\n🤖 Assistent: {result['response']}")
-            
-        except Exception as e:
-            print(f"❌ Fehler: {str(e)}")
-        
-        print("\n" + "-"*40)
-
-
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "--interactive":
-        asyncio.run(interactive_test())
-    else:
-        asyncio.run(test_graph())
+    asyncio.run(test_graph())

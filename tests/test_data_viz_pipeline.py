@@ -23,7 +23,7 @@ from agents.data_agent import run_data_agent
 from agents.viz_agent import run_viz_agent
 
 
-async def test_pipeline(query: str, viz_instruction: str = "Zeig das als Liniendiagramm"):
+async def run_pipeline_test(query: str, viz_instruction: str = "Zeig das als Liniendiagramm"):
     """
     Testet die Data → Viz Pipeline.
     
@@ -124,7 +124,7 @@ async def main():
     
     for query, viz_instruction in test_cases:
         try:
-            url = await test_pipeline(query, viz_instruction)
+            url = await run_pipeline_test(query, viz_instruction)
             results.append(("✅" if url else "❌", query[:40], url or "Fehler"))
         except Exception as e:
             print(f"\n❌ Exception: {e}")

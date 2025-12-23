@@ -1,8 +1,14 @@
 """
 Viz Agent für Chart-Generierung.
 
-Nutzt den AntV MCP Server (@antv/mcp-server-chart) um Visualisierungen zu erstellen.
-Liest Daten aus dem State (vom Data Agent) und transformiert sie für AntV.
+DESIGN:
+- LLM wählt Chart-Typ und Parameter
+- Daten kommen via InjectedState, NICHT durch LLM-Prompt
+- Best Practice nach LangGraph Dokumentation
+
+DESIGN-ENTSCHEIDUNGEN:
+- DEC-013: Multi-Turn Support mit datasets
+- DEC-016: Strukturiertes Logging, Retry-Mechanismus
 """
 
 import sys
@@ -13,99 +19,136 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import json
 import asyncio
-import traceback
+import logging
+from contextlib import AsyncExitStack
 from datetime import datetime
-from typing import Any
-from contextlib import asynccontextmanager
+from typing import Any, Annotated, Optional, Tuple
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
-from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedState
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from langchain_mcp_adapters.tools import load_mcp_tools
 
 from agents.state import AgentState
-from prompts.viz_agent_prompt import VIZ_AGENT_SYSTEM_PROMPT
+from agents.utils import extract_data_from_datasets, get_dataset_meta, get_y_label, extract_user_query
 from config.settings import ANTHROPIC_API_KEY, DEFAULT_MODEL
 
-# Debug-Modus
-DEBUG = False
+
+# =============================================================================
+# LOGGING KONFIGURATION (DEC-016)
+# =============================================================================
+
+logger = logging.getLogger(__name__)
+
+# Retry-Konfiguration
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 2
 
 
-def debug_print(msg: str):
-    """Gibt Debug-Nachrichten aus wenn DEBUG=True."""
-    if DEBUG:
-        print(f"🔍 VIZ DEBUG: {msg}")
+# =============================================================================
+# MCP SESSION PROVIDER (DEC-016)
+# =============================================================================
 
-
-@asynccontextmanager
-async def antv_mcp_client_context():
-    """Async Context Manager für AntV MCP Client."""
-    server_params = StdioServerParameters(
-        command="npx",
-        args=["-y", "@antv/mcp-server-chart"],
-        env=None,
-    )
+class AntVSessionProvider:
+    """
+    Verwaltet AntV MCP Session mit Caching.
+    Analog zu MCPToolsProvider in data_agent.py
+    """
     
-    debug_print("Starte AntV MCP Server...")
+    def __init__(self):
+        self._session: ClientSession | None = None
+        self._exit_stack: AsyncExitStack | None = None
+        self._lock = asyncio.Lock()
     
-    async with stdio_client(server_params) as (read_stream, write_stream):
-        debug_print("stdio_client gestartet")
-        async with ClientSession(read_stream, write_stream) as session:
-            debug_print("ClientSession erstellt")
-            await session.initialize()
-            debug_print("Session initialisiert")
-            tools = await load_mcp_tools(session)
-            debug_print(f"Tools geladen: {[t.name for t in tools]}")
-            yield tools
+    async def get_session(self) -> ClientSession:
+        """Holt AntV Session - startet Server nur beim ersten Aufruf."""
+        if self._session is not None:
+            logger.debug("AntV Session aus Cache")
+            return self._session
+        
+        async with self._lock:
+            if self._session is not None:
+                return self._session
+            
+            logger.info("Starte AntV MCP Server...")
+            
+            server_params = StdioServerParameters(
+                command="npx",
+                args=["-y", "@antv/mcp-server-chart"],
+                env=None,
+            )
+            
+            self._exit_stack = AsyncExitStack()
+            streams = await self._exit_stack.enter_async_context(stdio_client(server_params))
+            read_stream, write_stream = streams
+            
+            self._session = await self._exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            await self._session.initialize()
+            
+            logger.info("AntV Server gestartet")
+            return self._session
+    
+    async def cleanup(self):
+        """Räumt Session auf."""
+        if self._exit_stack:
+            await self._exit_stack.aclose()
+            self._exit_stack = None
+        self._session = None
+        logger.debug("AntV Session aufgeräumt")
+    
+    def is_initialized(self) -> bool:
+        return self._session is not None
 
 
-def create_viz_agent(tools: list):
-    """Erstellt den Viz Agent mit den gegebenen Tools."""
-    debug_print(f"Erstelle Viz Agent mit Model: {DEFAULT_MODEL}")
-    
-    llm = ChatAnthropic(
-        model=DEFAULT_MODEL,
-        api_key=ANTHROPIC_API_KEY,
-        temperature=0,
-    )
-    
-    agent = create_react_agent(llm, tools)
-    return agent
+# Globale Instanz
+_antv_provider = AntVSessionProvider()
 
+
+async def get_antv_session() -> ClientSession:
+    """Wrapper für Rückwärtskompatibilität."""
+    return await _antv_provider.get_session()
+
+
+async def get_antv_tools() -> list:
+    """Kompatibilitäts-Wrapper für Warmup."""
+    from langchain_mcp_adapters.tools import load_mcp_tools
+    session = await get_antv_session()
+    return await load_mcp_tools(session)
+
+
+# =============================================================================
+# DATEN-TRANSFORMATION
+# =============================================================================
 
 def timestamp_to_time_string(ts: int) -> str:
-    """Konvertiert Unix-Timestamp (ms) zu lesbarer Zeit."""
+    """Konvertiert Timestamp zu lesbarem Zeit-String."""
     try:
-        dt = datetime.fromtimestamp(ts / 1000)
-        return dt.strftime("%H:%M:%S")
+        return datetime.fromtimestamp(ts / 1000).strftime("%H:%M:%S")
     except:
         return str(ts)
 
 
-def transform_timeseries_for_antv(data: dict[str, list]) -> list[dict]:
-    """
-    Transformiert ThingsBoard-Zeitreihen zu AntV Line Chart Format.
-    
-    Input (ThingsBoard):
-    {
-        "axis_act_a1_deg": [
-            {"value": "25.3", "timestamp": 1702900000000},
-            {"value": "26.1", "timestamp": 1702900001000}
-        ]
-    }
-    
-    Output (AntV):
-    [
-        {"time": "10:00:00", "value": 25.3},
-        {"time": "10:00:01", "value": 26.1}
-    ]
-    """
+def shorten_key_name(key: str) -> str:
+    """Kürzt Daten-Key für Chart-Legenden."""
+    return (key
+        .replace("torque_act_", "T")
+        .replace("axis_act_", "A")
+        .replace("_deg", "°")
+        .replace("_nm", "")
+        .replace("vel_act_", "V")
+        .replace("_m_per_s", "")
+        .replace("acc_axis_", "Acc"))
+
+
+def transform_for_line_chart(data: dict[str, list], multi_key: bool = False) -> list[dict]:
+    """Transformiert Daten für Line/Area Chart."""
     result = []
     
-    # Falls mehrere Keys, nehmen wir den ersten (oder alle für Multi-Line)
     for key, values in data.items():
         if not isinstance(values, list):
             continue
@@ -113,362 +156,448 @@ def transform_timeseries_for_antv(data: dict[str, list]) -> list[dict]:
         for point in values:
             if isinstance(point, dict):
                 ts = point.get("timestamp", 0)
-                val = point.get("value", 0)
-                
-                # Value zu Float konvertieren
                 try:
-                    val = float(val)
+                    val = float(point.get("value", 0))
                 except (ValueError, TypeError):
                     continue
                 
-                result.append({
-                    "time": timestamp_to_time_string(ts),
-                    "value": val,
-                })
+                entry = {"time": timestamp_to_time_string(ts), "value": val}
+                
+                if multi_key:
+                    entry["group"] = shorten_key_name(key)
+                
+                result.append(entry)
         
-        # Nur ersten Key verarbeiten für einfache Line Charts
-        break
+        if not multi_key:
+            break
     
-    # Nach Zeit sortieren
-    result.sort(key=lambda x: x["time"])
+    result.sort(key=lambda x: (x["time"], x.get("group", "")))
     return result
 
 
-def transform_multikey_for_antv(data: dict[str, list]) -> list[dict]:
-    """
-    Transformiert mehrere Keys zu Multi-Line Chart Format.
-    
-    Output (AntV mit category):
-    [
-        {"time": "10:00:00", "value": 25.3, "category": "axis_act_a1_deg"},
-        {"time": "10:00:00", "value": 12.1, "category": "axis_act_a2_deg"},
-    ]
-    """
-    result = []
-    
-    for key, values in data.items():
-        if not isinstance(values, list):
-            continue
-            
-        for point in values:
-            if isinstance(point, dict):
-                ts = point.get("timestamp", 0)
-                val = point.get("value", 0)
-                
-                try:
-                    val = float(val)
-                except (ValueError, TypeError):
-                    continue
-                
-                # Key-Namen kürzen für Lesbarkeit
-                short_key = key.replace("axis_act_", "A").replace("_deg", "°")
-                
-                result.append({
-                    "time": timestamp_to_time_string(ts),
-                    "value": val,
-                    "category": short_key,
-                })
-    
-    result.sort(key=lambda x: (x["time"], x.get("category", "")))
-    return result
-
-
-def transform_for_scatter(data: dict[str, list]) -> list[dict]:
-    """
-    Transformiert zwei Keys zu Scatter Chart Format.
-    
-    Output (AntV):
-    [{"x": 25.3, "y": 12.1}, ...]
-    """
-    keys = list(data.keys())
-    if len(keys) < 2:
-        return []
-    
-    x_key, y_key = keys[0], keys[1]
-    x_values = {p["timestamp"]: float(p["value"]) for p in data[x_key] if isinstance(p, dict)}
-    y_values = {p["timestamp"]: float(p["value"]) for p in data[y_key] if isinstance(p, dict)}
-    
-    result = []
-    for ts in x_values:
-        if ts in y_values:
-            result.append({"x": x_values[ts], "y": y_values[ts]})
-    
-    return result
-
-
-def transform_for_comparison(data: dict[str, list]) -> list[dict]:
-    """
-    Transformiert Daten für Balken/Säulendiagramm (Vergleich).
-    Berechnet Durchschnitt pro Key.
-    
-    Output (AntV):
-    [{"category": "Achse 1", "value": 25.3}, ...]
-    """
+def transform_for_column_chart(data: dict[str, list]) -> list[dict]:
+    """Transformiert Daten für Column/Bar Chart."""
     result = []
     
     for key, values in data.items():
         if not isinstance(values, list) or not values:
             continue
         
-        # Durchschnitt berechnen
-        nums = []
-        for p in values:
-            if isinstance(p, dict):
-                try:
-                    nums.append(float(p.get("value", 0)))
-                except:
-                    pass
-        
+        nums = [float(p.get("value", 0)) for p in values if isinstance(p, dict)]
         if nums:
             avg = sum(nums) / len(nums)
-            # Key-Namen aufhübschen
-            nice_name = key.replace("axis_act_", "Achse ").replace("_deg", "").replace("a", "")
-            result.append({"category": nice_name, "value": round(avg, 2)})
+            result.append({"category": shorten_key_name(key), "value": round(avg, 2)})
     
     return result
 
 
-def transform_latest_values(data: dict[str, Any]) -> list[dict]:
-    """
-    Transformiert get_latest_telemetry Daten für Column Chart.
+def transform_for_scatter_chart(data: dict[str, list]) -> list[dict]:
+    """Transformiert Daten für Scatter Chart (Korrelation)."""
+    keys = list(data.keys())
+    if len(keys) < 2:
+        return []
     
-    Input:
-    {"axis_act_a1_deg": {"value": "25.3", "timestamp": 123}}
+    x_key, y_key = keys[0], keys[1]
+    x_vals = {}
+    y_vals = {}
     
-    Output:
-    [{"category": "Achse 1", "value": 25.3}]
-    """
-    result = []
-    
-    for key, val in data.items():
-        if isinstance(val, dict) and "value" in val:
+    for p in data.get(x_key, []):
+        if isinstance(p, dict) and "timestamp" in p:
             try:
-                value = float(val["value"])
-                nice_name = key.replace("axis_act_", "Achse ").replace("_deg", "").replace("a", "")
-                result.append({"category": nice_name, "value": round(value, 2)})
-            except:
+                x_vals[p["timestamp"]] = float(p["value"])
+            except (ValueError, TypeError):
                 pass
     
-    return result
-
-
-def get_unit_for_key(key: str) -> str:
-    """Gibt die Einheit für einen Key zurück."""
-    if "_deg" in key:
-        return "°"
-    elif "_mm" in key:
-        return "mm"
-    elif "_nm" in key:
-        return "Nm"
-    elif "_pct" in key:
-        return "%"
-    elif "_m_per_s" in key:
-        return "m/s"
-    elif "_kwh" in key:
-        return "kWh"
-    else:
-        return ""
-
-
-def extract_chart_url(messages: list) -> str | None:
-    """Extrahiert die Chart-URL aus den Agent-Messages."""
-    for msg in reversed(messages):
-        if isinstance(msg, ToolMessage):
-            content = msg.content
-            
-            # Content kann String oder Liste sein
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        content = block.get("text", "")
-                        break
-                    elif isinstance(block, str):
-                        content = block
-                        break
-            
-            if isinstance(content, str):
-                # URL extrahieren (beginnt mit http)
-                if content.startswith("http"):
-                    return content.strip()
-                
-                # Oder aus JSON
-                try:
-                    parsed = json.loads(content)
-                    if isinstance(parsed, dict):
-                        return parsed.get("url") or parsed.get("chart_url")
-                except:
-                    pass
+    for p in data.get(y_key, []):
+        if isinstance(p, dict) and "timestamp" in p:
+            try:
+                y_vals[p["timestamp"]] = float(p["value"])
+            except (ValueError, TypeError):
+                pass
     
-    return None
+    return [{"x": x_vals[ts], "y": y_vals[ts]} for ts in x_vals if ts in y_vals]
 
 
-def prepare_viz_context(state: AgentState) -> tuple[str, list | None]:
+# =============================================================================
+# CHART-TOOLS MIT INJECTEDSTATE
+# =============================================================================
+
+@tool
+async def generate_line_chart_tool(
+    title: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
     """
-    Bereitet den Daten-Kontext für den Viz Agent vor.
+    Erstellt ein Liniendiagramm für Zeitreihen-Daten.
+    Nutze dieses Tool für: Verlauf, Trend, Historie, Zeitreihen.
+    
+    Args:
+        title: Titel des Charts, z.B. "Drehmomente - Dienstag 16.12."
+    """
+    logger.debug(f"generate_line_chart_tool: title={title}")
+    
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    
+    if not data:
+        return "Fehler: Keine Daten im State"
+    
+    keys = list(data.keys())
+    multi_key = len(keys) > 1
+    transformed = transform_for_line_chart(data, multi_key)
+    
+    if not transformed:
+        return "Fehler: Keine gültigen Datenpunkte"
+    
+    # Sampling bei zu vielen Punkten
+    if len(transformed) > 500:
+        step = len(transformed) // 500
+        transformed = transformed[::step][:500]
+    
+    logger.debug(f"Daten transformiert: {len(transformed)} Punkte")
+    
+    session = await get_antv_session()
+    result = await session.call_tool(
+        "generate_line_chart",
+        arguments={
+            "data": transformed,
+            "title": title,
+            "axisXTitle": "Zeit",
+            "axisYTitle": get_y_label(keys),
+            "width": 800,
+            "height": 500,
+        }
+    )
+    
+    return extract_chart_url(result)
+
+
+@tool
+async def generate_column_chart_tool(
+    title: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Erstellt ein Säulendiagramm zum Vergleich von Durchschnittswerten.
+    Nutze dieses Tool für: Vergleich, vs, gegenüberstellen.
+    
+    Args:
+        title: Titel des Charts, z.B. "Vergleich der Achsen-Drehmomente"
+    """
+    logger.debug(f"generate_column_chart_tool: title={title}")
+    
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    
+    if not data:
+        return "Fehler: Keine Daten im State"
+    
+    transformed = transform_for_column_chart(data)
+    
+    if not transformed:
+        return "Fehler: Keine gültigen Datenpunkte"
+    
+    session = await get_antv_session()
+    result = await session.call_tool(
+        "generate_column_chart",
+        arguments={
+            "data": transformed,
+            "title": title,
+            "axisXTitle": "Kategorie",
+            "axisYTitle": get_y_label(list(data.keys())),
+            "width": 800,
+            "height": 500,
+        }
+    )
+    
+    return extract_chart_url(result)
+
+
+@tool
+async def generate_scatter_chart_tool(
+    title: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Erstellt ein Streudiagramm für Korrelationen zwischen zwei Variablen.
+    Nutze dieses Tool für: Korrelation, Zusammenhang, Beziehung.
+    
+    Args:
+        title: Titel des Charts, z.B. "Korrelation Achse 1 vs Achse 2"
+    """
+    logger.debug(f"generate_scatter_chart_tool: title={title}")
+    
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    
+    if not data or len(data) < 2:
+        return "Fehler: Für Scatter brauche ich mindestens 2 Keys"
+    
+    transformed = transform_for_scatter_chart(data)
+    
+    if not transformed:
+        return "Fehler: Keine überlappenden Zeitpunkte"
+    
+    keys = list(data.keys())
+    session = await get_antv_session()
+    result = await session.call_tool(
+        "generate_scatter_chart",
+        arguments={
+            "data": transformed,
+            "title": title,
+            "axisXTitle": keys[0],
+            "axisYTitle": keys[1],
+            "width": 800,
+            "height": 500,
+        }
+    )
+    
+    return extract_chart_url(result)
+
+
+def extract_chart_url(result) -> str:
+    """Extrahiert URL aus MCP-Tool-Ergebnis."""
+    if hasattr(result, 'content') and result.content:
+        for block in result.content:
+            if hasattr(block, 'text') and block.text.startswith("http"):
+                return block.text.strip()
+    return "Fehler: Keine URL vom Chart-Server"
+
+
+# Tool-Liste
+CHART_TOOLS = [
+    generate_line_chart_tool,
+    generate_column_chart_tool,
+    generate_scatter_chart_tool,
+]
+
+
+# =============================================================================
+# VIZ AGENT PROMPT
+# =============================================================================
+
+VIZ_AGENT_PROMPT = """Du bist ein Visualisierungs-Agent für IIoT-Daten.
+
+## VERFÜGBARE TOOLS
+
+1. **generate_line_chart_tool** - Für Zeitreihen, Verläufe, Trends
+2. **generate_column_chart_tool** - Für Vergleiche zwischen Kategorien
+3. **generate_scatter_chart_tool** - Für Korrelationen zwischen 2 Variablen
+
+## ENTSCHEIDUNGSREGELN
+
+| User sagt | Tool |
+|-----------|------|
+| "Verlauf", "Trend", "Historie", "über Zeit" | generate_line_chart_tool |
+| "Vergleich", "vs", "gegenüber" | generate_column_chart_tool |
+| "Korrelation", "Zusammenhang" | generate_scatter_chart_tool |
+| (Standard für Zeitreihen) | generate_line_chart_tool |
+
+## WICHTIG
+
+- Wähle EIN Tool und rufe es auf
+- Der Titel sollte beschreibend sein (inkl. Zeitraum wenn bekannt)
+- Die Daten werden automatisch aus dem System geladen
+"""
+
+
+# =============================================================================
+# HAUPTLOGIK (DEC-016: Aufgeteilt)
+# =============================================================================
+
+def prepare_viz_context(state: AgentState) -> Tuple[dict, str]:
+    """
+    Bereitet Kontext für LLM vor.
     
     Returns:
-        (context_string, transformed_data)
+        Tuple von (data, meta_info_string)
     """
-    context_parts = []
-    transformed_data = None
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
     
-    # Original-Query
-    for msg in state["messages"]:
-        if isinstance(msg, HumanMessage):
-            context_parts.append(f"User-Anfrage: {msg.content}")
-            break
+    if not data:
+        return {}, ""
     
-    # Daten-Summary
-    if state.get("data_summary"):
-        context_parts.append(f"Geladene Daten: {state['data_summary']}")
+    keys = list(data.keys())
+    meta_info = f"Verfügbare Daten: {len(keys)} Keys ({', '.join(keys[:5])}{'...' if len(keys) > 5 else ''})"
+    meta_info += f"\nGeladene Datasets: {', '.join(datasets.keys())}"
     
-    # Daten-Meta
-    if state.get("data_meta"):
-        meta = state["data_meta"]
-        if meta.get("data_points"):
-            context_parts.append(f"Datenpunkte: {meta['data_points']}")
-        if meta.get("timerange"):
-            tr = meta["timerange"]
-            context_parts.append(f"Zeitraum: {tr.get('start', '?')} bis {tr.get('end', '?')}")
+    dataset_meta = get_dataset_meta(datasets)
+    if dataset_meta.get("timerange"):
+        tr = dataset_meta["timerange"]
+        meta_info += f"\nZeitraum: {tr.get('weekday', '')} {tr.get('start', '')} - {tr.get('end', '')}"
     
-    # Tatsächliche Daten transformieren
-    if state.get("data"):
-        data = state["data"]
-        
-        if isinstance(data, dict) and data:
-            keys = list(data.keys())
-            context_parts.append(f"Verfügbare Keys: {keys}")
-            
-            # Prüfe ob Multi-Key oder Single-Key
-            if len(keys) > 1:
-                # Multi-Line Chart
-                transformed_data = transform_multikey_for_antv(data)
-                context_parts.append(f"\nMulti-Key Daten: {len(keys)} Serien")
-            else:
-                # Single-Line Chart
-                transformed_data = transform_timeseries_for_antv(data)
-            
-            if transformed_data:
-                # Sampling für große Datenmengen (max 500 Punkte für Chart)
-                MAX_POINTS = 500
-                if len(transformed_data) > MAX_POINTS:
-                    step = len(transformed_data) // MAX_POINTS
-                    transformed_data = transformed_data[::step][:MAX_POINTS]
-                    context_parts.append(f"Daten gesampelt auf {len(transformed_data)} Punkte (von {len(transformed_data) * step})")
-                else:
-                    context_parts.append(f"Datenpunkte für Chart: {len(transformed_data)}")
-                
-                # Einheit bestimmen
-                first_key = keys[0]
-                unit = get_unit_for_key(first_key)
-                context_parts.append(f"Einheit: {unit}")
-    
-    return "\n".join(context_parts), transformed_data
+    return data, meta_info
 
+
+async def select_and_execute_tool(
+    llm_with_tools,
+    user_query: str,
+    meta_info: str,
+    tool_state: dict
+) -> Tuple[str, str]:
+    """
+    Lässt LLM Tool auswählen und führt es aus.
+    
+    Returns:
+        Tuple von (chart_url, tool_name)
+    """
+    messages = [
+        SystemMessage(content=VIZ_AGENT_PROMPT),
+        HumanMessage(content=f"User-Anfrage: {user_query}\n\n{meta_info}\n\nWähle das passende Chart-Tool und erstelle einen guten Titel."),
+    ]
+    
+    logger.debug("LLM wählt Tool...")
+    response = await llm_with_tools.ainvoke(messages)
+    
+    if not response.tool_calls:
+        logger.debug("Kein Tool-Call, Fallback zu Line Chart")
+        keys = list(tool_state.get("datasets", {}).keys())
+        chart_url = await generate_line_chart_tool.ainvoke({
+            "title": f"{', '.join(keys[:2])} - Verlauf",
+            "state": tool_state,
+        })
+        return chart_url, "generate_line_chart_tool"
+    
+    tool_call = response.tool_calls[0]
+    tool_name = tool_call["name"]
+    tool_args = tool_call["args"]
+    
+    logger.debug(f"Tool gewählt: {tool_name}, args={tool_args}")
+    
+    tool_args["state"] = tool_state
+    
+    tool_map = {
+        "generate_line_chart_tool": generate_line_chart_tool,
+        "generate_column_chart_tool": generate_column_chart_tool,
+        "generate_scatter_chart_tool": generate_scatter_chart_tool,
+    }
+    
+    if tool_name in tool_map:
+        chart_url = await tool_map[tool_name].ainvoke(tool_args)
+    else:
+        chart_url = f"Unbekanntes Tool: {tool_name}"
+    
+    return chart_url, tool_name
+
+
+async def execute_viz_with_retry(
+    llm_with_tools,
+    user_query: str,
+    meta_info: str,
+    tool_state: dict,
+    max_retries: int = MAX_RETRIES
+) -> Tuple[str, str]:
+    """
+    Führt Visualisierung mit Retry aus.
+    """
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            return await select_and_execute_tool(llm_with_tools, user_query, meta_info, tool_state)
+        
+        except (ConnectionError, TimeoutError) as e:
+            last_exception = e
+            delay = RETRY_DELAY_BASE * (2 ** attempt)
+            logger.warning(f"Transienter Fehler (Versuch {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                await asyncio.sleep(delay)
+        
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "rate limit" in error_str:
+                last_exception = e
+                delay = RETRY_DELAY_BASE * (2 ** attempt)
+                logger.warning(f"Rate Limit (Versuch {attempt + 1}/{max_retries})")
+                
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(delay)
+            else:
+                raise
+    
+    raise last_exception or Exception("Viz execution failed after retries")
+
+
+def build_viz_result(chart_url: str, tool_name: str) -> dict[str, Any]:
+    """Baut Erfolgs-Ergebnis."""
+    logger.info(f"Chart erstellt: {chart_url[:80]}...")
+    
+    if chart_url.startswith("http"):
+        return {
+            "messages": [AIMessage(content=f"Chart erstellt: {chart_url}")],
+            "chart_url": chart_url,
+            "chart_type": tool_name.replace("generate_", "").replace("_chart_tool", ""),
+        }
+    else:
+        return {
+            "messages": [AIMessage(content=chart_url)],
+            "error": "chart_failed",
+        }
+
+
+def build_viz_error_result(error: Exception) -> dict[str, Any]:
+    """Baut Fehler-Ergebnis."""
+    error_msg = f"Fehler bei Visualisierung: {str(error)}"
+    logger.error(error_msg, exc_info=True)
+    return {
+        "messages": [AIMessage(content=error_msg)],
+        "error": str(error),
+    }
+
+
+# =============================================================================
+# HAUPTFUNKTION
+# =============================================================================
 
 async def run_viz_agent(state: AgentState) -> dict[str, Any]:
-    """Führt den Viz Agent aus."""
+    """
+    Führt den Viz Agent aus.
+    
+    Orchestriert:
+    1. Daten-Extraktion
+    2. Kontext-Vorbereitung
+    3. Tool-Auswahl (LLM)
+    4. Chart-Generierung (MCP)
+    """
     try:
-        debug_print("Starte run_viz_agent")
+        logger.debug("Starte Viz Agent")
         
-        # Prüfe ob Daten vorhanden
-        if not state.get("data"):
+        # 1. Daten und Kontext vorbereiten
+        data, meta_info = prepare_viz_context(state)
+        
+        if not data:
             return {
-                "messages": [AIMessage(content="Keine Daten zum Visualisieren vorhanden. Bitte erst Daten laden.")],
+                "messages": [AIMessage(content="Keine Daten zum Visualisieren.")],
                 "error": "no_data",
             }
         
-        async with antv_mcp_client_context() as tools:
-            debug_print("AntV MCP Context aktiv")
-            
-            agent = create_viz_agent(tools)
-            debug_print("Agent erstellt")
-            
-            # Kontext mit Daten vorbereiten (jetzt Tuple!)
-            data_context, transformed_data = prepare_viz_context(state)
-            
-            # Einheit und Keys bestimmen
-            data = state["data"]
-            keys = list(data.keys()) if isinstance(data, dict) else []
-            first_key = keys[0] if keys else ""
-            unit = get_unit_for_key(first_key)
-            
-            # Zeitraum aus Meta
-            timerange_str = ""
-            if state.get("data_meta") and state["data_meta"].get("timerange"):
-                tr = state["data_meta"]["timerange"]
-                timerange_str = f"{tr.get('start', '')} - {tr.get('end', '')}"
-            
-            # System Prompt + Daten-Kontext
-            system_content = f"""{VIZ_AGENT_SYSTEM_PROMPT}
-
-## AKTUELLE DATEN
-
-{data_context}
-
-## KRITISCH: VERWENDE DIESE DATEN EXAKT!
-
-Die folgenden Daten sind bereits transformiert und bereit für das Chart-Tool.
-**NUTZE SIE EXAKT SO WIE ANGEGEBEN!**
-**NICHT nochmal transformieren, filtern oder sampeln!**
-**Alle {len(transformed_data) if transformed_data else 0} Datenpunkte verwenden!**
-
-```json
-{json.dumps(transformed_data[:500] if transformed_data else [], indent=2)}
-```
-
-## EMPFOHLENE PARAMETER
-- title: "{', '.join(keys[:3])} - {timerange_str}"
-- axisXTitle: "Zeit"
-- axisYTitle: "Wert ({unit})"
-- width: 800
-- height: 500
-"""
-            
-            # WICHTIG: Nur HumanMessages übernehmen, keine SystemMessages!
-            human_messages = [
-                msg for msg in state["messages"]
-                if isinstance(msg, HumanMessage)
-            ]
-            
-            messages_with_system = [
-                SystemMessage(content=system_content),
-                *human_messages
-            ]
-            
-            debug_print(f"Starte Agent-Ausführung mit {len(transformed_data) if transformed_data else 0} Datenpunkten...")
-            result = await agent.ainvoke({"messages": messages_with_system})
-            debug_print(f"Agent fertig, {len(result.get('messages', []))} Messages")
-            
-            # Chart-URL extrahieren
-            chart_url = extract_chart_url(result.get("messages", []))
-            debug_print(f"Chart URL: {chart_url}")
-            
-            # Chart-Typ aus Tool-Call extrahieren
-            chart_type = None
-            for msg in result.get("messages", []):
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        if "chart" in tc.get("name", ""):
-                            chart_type = tc["name"].replace("generate_", "").replace("_chart", "")
-                            break
-            
-            return {
-                "messages": result.get("messages", []),
-                "chart_url": chart_url,
-                "chart_type": chart_type,
-            }
+        # 2. User-Query extrahieren
+        user_query = extract_user_query(state["messages"])
+        
+        # 3. LLM vorbereiten
+        llm = ChatAnthropic(
+            model=DEFAULT_MODEL,
+            api_key=ANTHROPIC_API_KEY,
+            temperature=0,
+        )
+        llm_with_tools = llm.bind_tools(CHART_TOOLS)
+        
+        # 4. Tool-State vorbereiten
+        tool_state = dict(state)
+        tool_state["datasets"] = state.get("datasets", {})
+        
+        # 5. Ausführen mit Retry
+        chart_url, tool_name = await execute_viz_with_retry(
+            llm_with_tools, user_query, meta_info, tool_state
+        )
+        
+        # 6. Ergebnis
+        return build_viz_result(chart_url, tool_name)
     
     except Exception as e:
-        error_details = traceback.format_exc()
-        if DEBUG:
-            print(f"\n❌ FEHLER DETAILS:\n{error_details}")
-        
-        error_msg = f"Fehler bei der Visualisierung: {str(e)}"
-        return {
-            "messages": [AIMessage(content=error_msg)],
-            "error": error_msg,
-        }
+        return build_viz_error_result(e)
 
 
 async def viz_agent_node(state: AgentState) -> dict[str, Any]:
@@ -477,98 +606,50 @@ async def viz_agent_node(state: AgentState) -> dict[str, Any]:
 
 
 # =============================================================================
-# STANDALONE TEST
+# TEST
 # =============================================================================
 
 async def test_viz_agent():
-    """Test des Viz Agents mit simulierten Daten."""
-    from datetime import datetime, timedelta
+    import time
+    from datetime import timedelta
+    
+    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     
     print("\n" + "="*60)
     print("🧪 Viz Agent Test")
     print("="*60)
     
-    # Simulierte Daten (wie vom Data Agent)
     now = datetime.now()
-    test_data = {
-        "axis_act_a1_deg": [
-            {"value": str(25.3 + i * 0.5), "timestamp": int((now - timedelta(minutes=10-i)).timestamp() * 1000)}
-            for i in range(10)
-        ]
+    
+    test_datasets = {
+        "torque": {
+            "data": {
+                "torque_act_a1_nm": [
+                    {"value": str(25 + i), "timestamp": int((now - timedelta(minutes=10-i)).timestamp() * 1000)}
+                    for i in range(10)
+                ],
+                "torque_act_a2_nm": [
+                    {"value": str(15 + i), "timestamp": int((now - timedelta(minutes=10-i)).timestamp() * 1000)}
+                    for i in range(10)
+                ],
+            },
+            "meta": {"timerange": {"weekday": "Dienstag", "start": "10:00", "end": "10:10"}},
+        },
     }
     
-    print(f"\n📊 Test-Daten: {len(test_data['axis_act_a1_deg'])} Punkte")
-    
-    # State mit Daten vorbereiten
     state = AgentState(
-        messages=[HumanMessage(content="Zeig mir den Verlauf als Liniendiagramm")],
-        data=test_data,
-        data_summary="10 Datenpunkte für axis_act_a1_deg der letzten 10 Minuten",
-        data_meta={"data_points": {"axis_act_a1_deg": 10}},
+        messages=[HumanMessage(content="Zeig mir den Verlauf der Drehmomente")],
+        datasets=test_datasets,
     )
     
-    print("⏳ Generiere Chart...")
+    start = time.time()
     result = await run_viz_agent(state)
+    duration = time.time() - start
     
-    if result.get("chart_url"):
-        print(f"\n✅ Chart generiert!")
-        print(f"   URL: {result['chart_url']}")
-        print(f"   Typ: {result.get('chart_type', 'unbekannt')}")
-    else:
-        print(f"\n❌ Kein Chart generiert")
-        if result.get("error"):
-            print(f"   Fehler: {result['error']}")
-    
-    # Letzte AI-Message
-    for msg in reversed(result.get("messages", [])):
-        if isinstance(msg, AIMessage) and isinstance(msg.content, str):
-            print(f"\n🤖 Agent: {msg.content[:300]}")
-            break
-
-
-async def test_with_real_data():
-    """Test mit echten Daten vom Data Agent."""
-    from agents.data_agent import run_data_agent
-    
-    print("\n" + "="*60)
-    print("🧪 Viz Agent Test mit echten Daten")
-    print("="*60)
-    
-    # Erst Daten laden
-    print("\n1️⃣ Lade Daten vom Data Agent...")
-    data_state = AgentState(
-        messages=[HumanMessage(content="Hole die Achsposition 1 der letzten 5 Minuten")]
-    )
-    data_result = await run_data_agent(data_state)
-    
-    print(f"   Summary: {data_result.get('data_summary', 'N/A')}")
-    
-    if not data_result.get("data"):
-        print("   ❌ Keine Daten erhalten")
-        return
-    
-    # Dann visualisieren
-    print("\n2️⃣ Generiere Visualisierung...")
-    viz_state = AgentState(
-        messages=[HumanMessage(content="Zeig das als Liniendiagramm")],
-        data=data_result.get("data"),
-        data_summary=data_result.get("data_summary"),
-        data_meta=data_result.get("data_meta"),
-    )
-    
-    viz_result = await run_viz_agent(viz_state)
-    
-    if viz_result.get("chart_url"):
-        print(f"\n✅ Chart generiert!")
-        print(f"   URL: {viz_result['chart_url']}")
-    else:
-        print(f"\n❌ Kein Chart generiert")
+    print(f"⏱️ Dauer: {duration:.1f}s")
+    print(f"📊 Typ: {result.get('chart_type')}")
+    print(f"🔗 URL: {result.get('chart_url', 'FEHLER')}")
 
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "--real":
-        asyncio.run(test_with_real_data())
-    else:
-        asyncio.run(test_viz_agent())
+    asyncio.run(test_viz_agent())

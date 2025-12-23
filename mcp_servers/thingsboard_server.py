@@ -5,6 +5,15 @@ Exponiert Tools für ThingsBoard-Zugriff via MCP.
 
 WICHTIG: Große Datenmengen werden in Dateien gespeichert,
 nur Zusammenfassungen gehen an den LLM-Context!
+
+DESIGN-ENTSCHEIDUNGEN:
+1. Zeitraum-Parsing wird vom LLM übernommen (nicht mehr vom Tool) [19.12.2025]
+2. Tools erwarten strukturierte Datum/Zeit-Parameter (ISO-Format) [19.12.2025]
+3. IMMER Aggregation nutzen - Intervall wird automatisch berechnet [19.12.2025]
+4. User wird über verwendete Einstellungen informiert [19.12.2025]
+5. Tool-Descriptions optimiert für LLM-Auswahl [19.12.2025]
+6. Error Handling: Custom Exceptions + ToolError für User-Feedback [20.12.2025]
+7. Datenpunkt-Limit: Warnung bei >1000, Fehler bei >10000 Punkten [20.12.2025]
 """
 
 import sys
@@ -15,15 +24,42 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import asyncio
 import json
-import re
+import logging
 import uuid
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 
-from mcp_servers.thingsboard_client import ThingsBoardClient
+from mcp_servers.thingsboard_client import (
+    ThingsBoardClient,
+    ThingsBoardError,
+    ThingsBoardAuthError,
+    ThingsBoardConnectionError,
+    ThingsBoardNotFoundError,
+    ThingsBoardRateLimitError,
+)
 from config.settings import KRC5_DEVICE_ID, VALID_DEVICES, OUTPUTS_DIR
+
+# =============================================================================
+# LOGGING SETUP
+# =============================================================================
+
+logger = logging.getLogger("thingsboard_server")
+logger.setLevel(logging.DEBUG)
+
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
 
 # MCP Server erstellen
 mcp = FastMCP("ThingsBoard")
@@ -36,11 +72,44 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 _client: ThingsBoardClient | None = None
 _client_context = None
 
+# Wochentag-Namen für Ausgabe
+WEEKDAY_NAMES = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+
+# Aggregations-Mapping: Nur noch Literal-Werte
+AGGREGATION_OPTIONS = {
+    "AVG": ("AVG", "Durchschnitt"),
+    "MIN": ("MIN", "Minimum"),
+    "MAX": ("MAX", "Maximum"),
+    "SUM": ("SUM", "Summe"),
+    "COUNT": ("COUNT", "Anzahl"),
+}
+
+# Intervall-Mapping: Vordefinierte Optionen statt Regex-Parsing
+# Format: "key" -> (milliseconds, human_readable)
+INTERVAL_OPTIONS = {
+    "1m": (60000, "1 Minute"),
+    "5m": (300000, "5 Minuten"),
+    "10m": (600000, "10 Minuten"),
+    "30m": (1800000, "30 Minuten"),
+    "1h": (3600000, "1 Stunde"),
+    "6h": (21600000, "6 Stunden"),
+    "1d": (86400000, "1 Tag"),
+}
+
+# Datenpunkt-Limits
+DATAPOINT_WARNING_THRESHOLD = 1000   # Ab hier: Warnung
+DATAPOINT_ERROR_THRESHOLD = 10000    # Ab hier: Fehler, User muss anpassen
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
 
 async def get_client() -> ThingsBoardClient:
     """Lazy initialization des ThingsBoard Clients."""
     global _client, _client_context
     if _client is None:
+        logger.info("Initialisiere ThingsBoard Client...")
         _client = ThingsBoardClient()
         _client_context = await _client.__aenter__()
     return _client
@@ -66,6 +135,7 @@ def save_data_to_file(data: dict, prefix: str = "telemetry") -> str:
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     
+    logger.debug(f"Daten gespeichert: {filepath}")
     return str(filepath)
 
 
@@ -98,7 +168,6 @@ def calculate_statistics(data: dict) -> dict:
                 "first": round(numeric_values[0], 3),
                 "last": round(numeric_values[-1], 3),
             }
-            # Zeitbereich der tatsächlichen Daten
             if timestamps:
                 stats[key]["first_timestamp"] = datetime.fromtimestamp(min(timestamps) / 1000).strftime("%d.%m.%Y %H:%M:%S")
                 stats[key]["last_timestamp"] = datetime.fromtimestamp(max(timestamps) / 1000).strftime("%d.%m.%Y %H:%M:%S")
@@ -106,272 +175,232 @@ def calculate_statistics(data: dict) -> dict:
     return stats
 
 
-# Wochentag-Mapping (Deutsch und Englisch)
-WEEKDAY_MAP = {
-    "montag": 0, "monday": 0, "mo": 0,
-    "dienstag": 1, "tuesday": 1, "di": 1,
-    "mittwoch": 2, "wednesday": 2, "mi": 2,
-    "donnerstag": 3, "thursday": 3, "do": 3,
-    "freitag": 4, "friday": 4, "fr": 4,
-    "samstag": 5, "saturday": 5, "sa": 5,
-    "sonntag": 6, "sunday": 6, "so": 6,
-}
-
-WEEKDAY_NAMES = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
-
-
-def parse_time_range_in_day(timerange_lower: str) -> tuple[int | None, int | None, int | None, int | None]:
+def parse_datetime(date_str: str, time_str: str = "00:00") -> datetime:
     """
-    Extrahiert Zeitbereich aus einem String.
+    Parst Datum und Zeit zu datetime.
     
-    Unterstützt:
-    - "zwischen 13 und 16 Uhr"
-    - "von 13 bis 16 Uhr"
-    - "13 bis 16 Uhr"
-    - "13:00 bis 16:30"
-    - "von 14:30 bis 15:45"
+    Args:
+        date_str: Datum im Format YYYY-MM-DD (ISO 8601)
+        time_str: Zeit im Format HH:MM (default: 00:00)
     
     Returns:
-        (start_hour, start_minute, end_hour, end_minute) oder (None, None, None, None)
+        datetime Objekt
+    
+    Raises:
+        ValueError: Bei ungültigem Format
     """
-    # Pattern für Zeitbereiche
-    time_range_patterns = [
-        # "zwischen 13 und 16 Uhr" oder "zwischen 13:00 und 16:30"
-        r'zwischen\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?\s*und\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?',
-        # "von 13 bis 16 Uhr" oder "von 13:00 bis 16:30"
-        r'von\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?\s*bis\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?',
-        # "13 bis 16 Uhr" oder "13:00 bis 16:30"
-        r'(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?\s*bis\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?',
-        # "13-16 Uhr"
-        r'(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?\s*(?:uhr)?',
-    ]
-    
-    for pattern in time_range_patterns:
-        match = re.search(pattern, timerange_lower)
-        if match:
-            groups = match.groups()
-            start_hour = int(groups[0])
-            start_minute = int(groups[1]) if groups[1] else 0
-            end_hour = int(groups[2])
-            end_minute = int(groups[3]) if groups[3] else 0
-            return start_hour, start_minute, end_hour, end_minute
-    
-    return None, None, None, None
+    try:
+        return datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    except ValueError as e:
+        raise ValueError(
+            f"Ungültiges Datum/Zeit-Format: date='{date_str}', time='{time_str}'. "
+            f"Erwartet: date='YYYY-MM-DD', time='HH:MM'. Fehler: {e}"
+        )
 
 
-def parse_single_time(timerange_lower: str) -> tuple[int | None, int | None]:
+def get_interval(interval: str | None) -> tuple[int, str, bool]:
     """
-    Extrahiert eine einzelne Uhrzeit aus einem String.
+    Holt Intervall aus vordefinierten Optionen.
+    
+    Args:
+        interval: Vordefinierter Key wie "1m", "5m", "1h" oder None für Auto
     
     Returns:
-        (hour, minute) oder (None, None)
+        (interval_ms, human_readable, is_auto)
+        
+    Design-Entscheidung (DEC-011):
+    Statt Regex-Parsing nutzen wir vordefinierte Optionen.
+    Das LLM wählt direkt aus den gültigen Werten.
     """
-    time_patterns = [
-        r'(\d{1,2}):(\d{2})',
-        r'(\d{1,2})\s*uhr',
-        r'um\s*(\d{1,2})',
-    ]
+    if interval is None:
+        return None, None, True  # Auto-Intervall wird später berechnet
     
-    for pattern in time_patterns:
-        match = re.search(pattern, timerange_lower)
-        if match:
-            groups = match.groups()
-            hour = int(groups[0])
-            minute = int(groups[1]) if len(groups) > 1 and groups[1] else 0
-            return hour, minute
+    interval_key = interval.lower().strip()
     
-    return None, None
+    if interval_key in INTERVAL_OPTIONS:
+        ms, human = INTERVAL_OPTIONS[interval_key]
+        return ms, human, False
+    
+    # Fallback: Unbekanntes Intervall -> Auto
+    logger.warning(f"Unbekanntes Intervall '{interval}', verwende Auto-Intervall")
+    return None, None, True
 
 
-def parse_timerange(timerange: str | None) -> tuple[int, int]:
+def get_aggregation(aggregation: str | None) -> tuple[str, str]:
     """
-    Parst Zeitraum-Angaben zu Timestamps.
+    Holt Aggregation aus vordefinierten Optionen.
     
-    Unterstützt:
-    - Relative: "letzte Stunde", "letzte 24h", "heute", "letzte 30 Minuten"
-    - Wochentage: "Dienstag", "Dienstag um 13 Uhr", "letzten Montag"
-    - Datum: "16.", "am 16.", "16. Dezember", "16.12.", "16.12.2025"
-    - Zeitbereiche: "Dienstag zwischen 13 und 16 Uhr", "16.12. von 14 bis 15 Uhr"
-    - Spezifisch: "gestern um 14:30"
+    Args:
+        aggregation: "AVG", "MIN", "MAX", "SUM", "COUNT" oder None
+    
+    Returns:
+        (tb_aggregation, human_readable)
+        
+    Design-Entscheidung (DEC-011):
+    Statt Multi-Alias-Mapping nutzen wir nur die API-Werte.
+    Das LLM übersetzt "Maximum" -> "MAX" selbst.
     """
-    now = datetime.now()
-    end_ts = int(now.timestamp() * 1000)
+    if aggregation is None:
+        return "AVG", "Durchschnitt"
     
-    if timerange is None:
-        start = now - timedelta(hours=1)
-        start_ts = int(start.timestamp() * 1000)
-        return start_ts, end_ts
+    agg_upper = aggregation.upper().strip()
     
-    timerange_lower = timerange.lower()
+    if agg_upper in AGGREGATION_OPTIONS:
+        return AGGREGATION_OPTIONS[agg_upper]
     
-    # === Explizite Datumsangaben (16., am 16., 16. Dezember, 16.12.) ===
-    # Pattern für Tag mit optionalem Monat und Jahr
-    date_patterns = [
-        # "16.12.2025" oder "16.12."
-        r'(\d{1,2})\.(\d{1,2})\.(\d{4})?',
-        # "am 16." oder "den 16." oder "für den 16." oder einfach "16."
-        r'(?:am|den|für den|vom)?\s*(\d{1,2})\.',
-    ]
+    # Fallback: Unbekannte Aggregation -> AVG
+    logger.warning(f"Unbekannte Aggregation '{aggregation}', verwende AVG")
+    return "AVG", "Durchschnitt"
+
+
+def calculate_auto_interval(start_dt: datetime, end_dt: datetime) -> tuple[int, str, str]:
+    """
+    Berechnet automatisch das optimale Aggregations-Intervall.
     
-    for pattern in date_patterns:
-        match = re.search(pattern, timerange_lower)
-        if match:
-            groups = match.groups()
-            day = int(groups[0])
-            
-            # Monat bestimmen
-            if len(groups) > 1 and groups[1] and groups[1].isdigit():
-                month = int(groups[1])
-            else:
-                # Monat aus Text extrahieren oder aktuellen Monat nehmen
-                month_map = {
-                    "januar": 1, "february": 2, "märz": 3, "april": 4,
-                    "mai": 5, "juni": 6, "juli": 7, "august": 8,
-                    "september": 9, "oktober": 10, "november": 11, "dezember": 12,
-                    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-                    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
-                }
-                month = now.month
-                for m_name, m_num in month_map.items():
-                    if m_name in timerange_lower:
-                        month = m_num
-                        break
-            
-            # Jahr bestimmen
-            if len(groups) > 2 and groups[2]:
-                year = int(groups[2])
-            else:
-                year = now.year
-            
-            # Datum erstellen
-            try:
-                target_date = datetime(year, month, day)
-                
-                # Wenn Datum in Zukunft liegt, letztes Jahr nehmen
-                if target_date > now:
-                    target_date = target_date.replace(year=year - 1)
-                
-                # Prüfe auf Zeitbereich (z.B. "zwischen 13 und 16 Uhr")
-                start_hour, start_min, end_hour, end_min = parse_time_range_in_day(timerange_lower)
-                
-                if start_hour is not None and end_hour is not None:
-                    # Zeitbereich angegeben
-                    start = target_date.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
-                    end = target_date.replace(hour=end_hour, minute=end_min, second=59, microsecond=999999)
-                else:
-                    # Prüfe auf einzelne Uhrzeit
-                    single_hour, single_min = parse_single_time(timerange_lower)
-                    if single_hour is not None:
-                        # Einzelne Uhrzeit -> 10 Minuten Fenster
-                        target_time = target_date.replace(hour=single_hour, minute=single_min, second=0, microsecond=0)
-                        start = target_time - timedelta(minutes=5)
-                        end = target_time + timedelta(minutes=5)
-                    else:
-                        # Keine Uhrzeit -> ganzen Tag abfragen
-                        start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
-                        end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
-                
-                start_ts = int(start.timestamp() * 1000)
-                end_ts = int(end.timestamp() * 1000)
-                return start_ts, end_ts
-            except ValueError:
-                pass  # Ungültiges Datum, weiter mit anderen Patterns
+    Args:
+        start_dt: Startzeitpunkt
+        end_dt: Endzeitpunkt
     
-    # === Spezifische Wochentage erkennen ===
-    found_weekday = None
-    for day_name, day_num in WEEKDAY_MAP.items():
-        if day_name in timerange_lower:
-            found_weekday = day_num
-            break
+    Returns:
+        (interval_ms, interval_human, reason)
+    """
+    duration = end_dt - start_dt
+    duration_hours = duration.total_seconds() / 3600
     
-    if found_weekday is not None:
-        current_weekday = now.weekday()
-        days_ago = (current_weekday - found_weekday) % 7
-        if days_ago == 0:
-            days_ago = 7
-        
-        target_date = now - timedelta(days=days_ago)
-        
-        # Prüfe auf Zeitbereich (z.B. "zwischen 13 und 16 Uhr")
-        start_hour, start_min, end_hour, end_min = parse_time_range_in_day(timerange_lower)
-        
-        if start_hour is not None and end_hour is not None:
-            # Zeitbereich angegeben
-            start = target_date.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
-            end = target_date.replace(hour=end_hour, minute=end_min, second=59, microsecond=999999)
-        else:
-            # Prüfe auf einzelne Uhrzeit
-            single_hour, single_min = parse_single_time(timerange_lower)
-            if single_hour is not None:
-                # Einzelne Uhrzeit -> 10 Minuten Fenster
-                target_time = target_date.replace(hour=single_hour, minute=single_min, second=0, microsecond=0)
-                start = target_time - timedelta(minutes=5)
-                end = target_time + timedelta(minutes=5)
-            else:
-                # KEINE Uhrzeit angegeben -> GANZEN TAG abfragen!
-                start = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
-                end = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
-        
-        start_ts = int(start.timestamp() * 1000)
-        end_ts = int(end.timestamp() * 1000)
-        return start_ts, end_ts
-    
-    # === "gestern" ===
-    if "gestern" in timerange_lower or "yesterday" in timerange_lower:
-        yesterday = now - timedelta(days=1)
-        
-        # Prüfe auf Zeitbereich
-        start_hour, start_min, end_hour, end_min = parse_time_range_in_day(timerange_lower)
-        
-        if start_hour is not None and end_hour is not None:
-            start = yesterday.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
-            end = yesterday.replace(hour=end_hour, minute=end_min, second=59, microsecond=999999)
-        else:
-            # Prüfe auf einzelne Uhrzeit
-            single_hour, single_min = parse_single_time(timerange_lower)
-            if single_hour is not None:
-                target_time = yesterday.replace(hour=single_hour, minute=single_min, second=0, microsecond=0)
-                start = target_time - timedelta(minutes=5)
-                end = target_time + timedelta(minutes=5)
-            else:
-                start = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
-                end = yesterday.replace(hour=23, minute=59, second=59, microsecond=999999)
-        
-        start_ts = int(start.timestamp() * 1000)
-        end_ts = int(end.timestamp() * 1000)
-        return start_ts, end_ts
-    
-    # === Relative Zeiträume ===
-    if "stunde" in timerange_lower or "hour" in timerange_lower:
-        hours = 1
-        for word in timerange.split():
-            if word.isdigit():
-                hours = int(word)
-                break
-        start = now - timedelta(hours=hours)
-    elif "tag" in timerange_lower or "day" in timerange_lower or "24h" in timerange_lower:
-        days = 1
-        for word in timerange.split():
-            if word.isdigit():
-                days = int(word)
-                break
-        start = now - timedelta(days=days)
-    elif "woche" in timerange_lower or "week" in timerange_lower:
-        start = now - timedelta(weeks=1)
-    elif "heute" in timerange_lower or "today" in timerange_lower:
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    elif "minute" in timerange_lower:
-        minutes = 10
-        for word in timerange.split():
-            if word.isdigit():
-                minutes = int(word)
-                break
-        start = now - timedelta(minutes=minutes)
+    if duration_hours <= 1:
+        # ≤ 1 Stunde → 1 Minute Intervall (~60 Punkte)
+        return 60000, "1 Minute", f"Zeitraum {duration_hours:.1f}h → 1-Minuten-Intervall"
+    elif duration_hours <= 24:
+        # ≤ 1 Tag → 10 Minuten Intervall (~144 Punkte max)
+        return 600000, "10 Minuten", f"Zeitraum {duration_hours:.1f}h → 10-Minuten-Intervall"
+    elif duration_hours <= 168:  # 7 Tage
+        # ≤ 1 Woche → 1 Stunde Intervall (~168 Punkte max)
+        return 3600000, "1 Stunde", f"Zeitraum {duration_hours/24:.1f} Tage → 1-Stunden-Intervall"
     else:
-        start = now - timedelta(hours=1)
+        # > 1 Woche → 1 Tag Intervall
+        days = duration_hours / 24
+        return 86400000, "1 Tag", f"Zeitraum {days:.0f} Tage → 1-Tages-Intervall"
+
+
+def calculate_expected_datapoints(
+    start_dt: datetime,
+    end_dt: datetime,
+    interval_ms: int,
+    num_keys: int
+) -> tuple[int, int]:
+    """
+    Berechnet die erwartete Anzahl an Datenpunkten.
     
-    start_ts = int(start.timestamp() * 1000)
-    return start_ts, end_ts
+    Args:
+        start_dt: Startzeitpunkt
+        end_dt: Endzeitpunkt
+        interval_ms: Intervall in Millisekunden
+        num_keys: Anzahl der abgefragten Keys
+    
+    Returns:
+        (points_per_key, total_points)
+    """
+    duration_ms = (end_dt - start_dt).total_seconds() * 1000
+    points_per_key = int(duration_ms / interval_ms) + 1
+    total_points = points_per_key * num_keys
+    return points_per_key, total_points
+
+
+def check_datapoint_limit(
+    start_dt: datetime,
+    end_dt: datetime,
+    interval_ms: int,
+    interval_human: str,
+    num_keys: int
+) -> dict | None:
+    """
+    Prüft ob die erwartete Datenmenge akzeptabel ist.
+    
+    Args:
+        start_dt: Startzeitpunkt
+        end_dt: Endzeitpunkt
+        interval_ms: Intervall in Millisekunden
+        interval_human: Menschenlesbares Intervall
+        num_keys: Anzahl der Keys
+    
+    Returns:
+        None wenn OK, sonst Error-Dict mit Korrekturvorschlag
+    """
+    points_per_key, total_points = calculate_expected_datapoints(
+        start_dt, end_dt, interval_ms, num_keys
+    )
+    
+    logger.debug(
+        f"Erwartete Datenpunkte: {points_per_key} pro Key × {num_keys} Keys = {total_points}"
+    )
+    
+    # Berechne empfohlenes Intervall
+    auto_interval_ms, auto_interval_human, _ = calculate_auto_interval(start_dt, end_dt)
+    
+    if points_per_key > DATAPOINT_ERROR_THRESHOLD:
+        # Zu viele Punkte - User muss anpassen
+        logger.warning(
+            f"Datenpunkt-Limit überschritten: {points_per_key} pro Key "
+            f"(Limit: {DATAPOINT_ERROR_THRESHOLD})"
+        )
+        return {
+            "status": "error_too_many_datapoints",
+            "message": (
+                f"Das gewählte Intervall ({interval_human}) würde ca. {points_per_key:,} "
+                f"Datenpunkte pro Key erzeugen. Das ist zu viel für eine sinnvolle Verarbeitung."
+            ),
+            "expected_points_per_key": points_per_key,
+            "expected_total_points": total_points,
+            "limit": DATAPOINT_ERROR_THRESHOLD,
+            "suggestion": {
+                "interval": auto_interval_human,
+                "expected_points": calculate_expected_datapoints(
+                    start_dt, end_dt, auto_interval_ms, num_keys
+                )[0],
+            },
+            "user_action": (
+                f"Bitte wähle ein größeres Intervall (z.B. '{auto_interval_human}') "
+                f"oder einen kürzeren Zeitraum."
+            ),
+            "hint": (
+                "Frage den User: 'Das würde sehr viele Datenpunkte erzeugen. "
+                f"Soll ich stattdessen {auto_interval_human}-Durchschnitte verwenden?'"
+            ),
+        }
+    
+    if points_per_key > DATAPOINT_WARNING_THRESHOLD:
+        # Warnung - funktioniert, aber User sollte es wissen
+        logger.info(
+            f"Datenpunkt-Warnung: {points_per_key} pro Key "
+            f"(Warnschwelle: {DATAPOINT_WARNING_THRESHOLD})"
+        )
+        return {
+            "status": "warning_many_datapoints",
+            "message": (
+                f"Das gewählte Intervall ({interval_human}) erzeugt ca. {points_per_key:,} "
+                f"Datenpunkte pro Key. Das ist viel, aber machbar."
+            ),
+            "expected_points_per_key": points_per_key,
+            "expected_total_points": total_points,
+            "warning_threshold": DATAPOINT_WARNING_THRESHOLD,
+            "continue": True,  # Trotzdem weitermachen
+            "user_info": (
+                f"Hinweis: Bei {points_per_key:,} Datenpunkten kann die Verarbeitung "
+                f"etwas länger dauern."
+            ),
+        }
+    
+    return None  # Alles OK
+
+
+def format_thingsboard_error(error: ThingsBoardError) -> dict:
+    """Formatiert ThingsBoard-Fehler für MCP-Response."""
+    return {
+        "status": "error",
+        "error_type": error.__class__.__name__,
+        "message": error.message,
+        "details": error.details,
+    }
 
 
 # =============================================================================
@@ -380,28 +409,92 @@ def parse_timerange(timerange: str | None) -> tuple[int, int]:
 
 @mcp.tool()
 async def list_devices() -> str:
-    """Listet alle verfügbaren Geräte in ThingsBoard auf."""
-    client = await get_client()
-    devices = await client.list_devices()
-    return json.dumps(devices, indent=2)
+    """
+    Listet alle verfügbaren Geräte/Roboter in ThingsBoard auf.
+    
+    WANN BENUTZEN:
+    - User fragt "Welche Geräte gibt es?" oder "Welche Roboter sind verfügbar?"
+    - User ist unsicher welches Gerät er abfragen soll
+    - Erste Orientierung im System
+    
+    NICHT BENUTZEN:
+    - User kennt bereits das Gerät (z.B. "KRC5") → direkt andere Tools nutzen
+    - User fragt nach Messwerten → get_telemetry oder get_latest_telemetry
+    """
+    logger.info("Tool aufgerufen: list_devices")
+    
+    try:
+        client = await get_client()
+        devices = await client.list_devices()
+        return json.dumps(devices, indent=2)
+    except ThingsBoardError as e:
+        logger.error(f"list_devices Fehler: {e.message}")
+        return json.dumps(format_thingsboard_error(e), indent=2)
 
 
 @mcp.tool()
 async def get_device_info(device_name: str = "KRC5") -> str:
-    """Gibt Detailinformationen zu einem Gerät zurück."""
-    device_id = resolve_device_id(device_name)
-    client = await get_client()
-    info = await client.get_device_info(device_id)
-    return json.dumps(info, indent=2)
+    """
+    Gibt Detailinformationen zu einem spezifischen Gerät zurück (Name, Typ, ID, Erstelldatum).
+    
+    WANN BENUTZEN:
+    - User fragt nach Geräte-Details: "Was ist das für ein Roboter?"
+    - User will Metadaten wie Erstelldatum oder Gerätetyp wissen
+    
+    NICHT BENUTZEN:
+    - User fragt nach Messwerten → get_telemetry oder get_latest_telemetry
+    - User fragt welche Messwerte verfügbar sind → list_telemetry_keys
+    - User fragt nach Attributen wie Masse → get_attributes
+    
+    Args:
+        device_name: Name des Geräts, z.B. "KRC5" (default)
+    """
+    logger.info(f"Tool aufgerufen: get_device_info(device_name={device_name})")
+    
+    try:
+        device_id = resolve_device_id(device_name)
+        client = await get_client()
+        info = await client.get_device_info(device_id)
+        return json.dumps(info, indent=2)
+    except ThingsBoardError as e:
+        logger.error(f"get_device_info Fehler: {e.message}")
+        return json.dumps(format_thingsboard_error(e), indent=2)
+    except ValueError as e:
+        return json.dumps({
+            "status": "error",
+            "message": str(e),
+        }, indent=2)
 
 
 @mcp.tool()
 async def list_telemetry_keys(device_name: str = "KRC5") -> str:
-    """Listet alle verfügbaren Telemetrie-Keys für ein Gerät auf."""
-    device_id = resolve_device_id(device_name)
-    client = await get_client()
-    keys = await client.get_telemetry_keys(device_id)
-    return json.dumps(keys, indent=2)
+    """
+    Listet alle verfügbaren Telemetrie-Keys (Messwert-Namen) für ein Gerät auf.
+    
+    WANN BENUTZEN:
+    - User fragt "Welche Messwerte gibt es?" oder "Was kann ich abfragen?"
+    - User ist unsicher welchen Key er für eine Abfrage nutzen soll
+    - User fragt nach "allen Daten" → erst Keys auflisten, dann nachfragen
+    
+    NICHT BENUTZEN:
+    - User nennt bereits konkrete Messwerte (z.B. "Position", "Drehmoment")
+    - User fragt nach konkreten Werten → get_telemetry oder get_latest_telemetry
+    
+    Args:
+        device_name: Name des Geräts, z.B. "KRC5" (default)
+    """
+    logger.info(f"Tool aufgerufen: list_telemetry_keys(device_name={device_name})")
+    
+    try:
+        device_id = resolve_device_id(device_name)
+        client = await get_client()
+        keys = await client.get_telemetry_keys(device_id)
+        return json.dumps(keys, indent=2)
+    except ThingsBoardError as e:
+        logger.error(f"list_telemetry_keys Fehler: {e.message}")
+        return json.dumps(format_thingsboard_error(e), indent=2)
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e)}, indent=2)
 
 
 @mcp.tool()
@@ -410,63 +503,78 @@ async def get_data_availability(
     device_name: str = "KRC5",
 ) -> str:
     """
-    Zeigt an, für welchen Zeitraum Daten verfügbar sind.
+    Prüft, ob und wann Daten für einen Key verfügbar sind (letzte 7 Tage).
     
-    WICHTIG: Rufe dieses Tool ZUERST auf, wenn du unsicher bist ob Daten existieren!
+    WANN BENUTZEN:
+    - BEVOR get_telemetry aufgerufen wird, wenn unklar ist ob Daten existieren
+    - User fragt "Gibt es Daten für gestern?" oder "Wann war der Roboter aktiv?"
+    - Nach einem no_data-Fehler um verfügbare Zeiträume zu finden
+    
+    NICHT BENUTZEN:
+    - User nennt einen konkreten Zeitraum und will Daten sehen → get_telemetry
+    - User fragt nach aktuellem Wert → get_latest_telemetry
     
     Args:
-        keys: Ein Key zum Prüfen, z.B. "pos_act_x_mm" oder "axis_act_a1_deg"
-        device_name: Name des Geräts
+        keys: Ein Key zum Prüfen, z.B. "pos_act_x_mm" (nur einer wird geprüft)
+        device_name: Name des Geräts (default: "KRC5")
         
     Returns:
-        Zeitraum der verfügbaren Daten (erstes und letztes Datum)
+        Zeitraum der verfügbaren Daten mit erstem und letztem Datum
     """
-    device_id = resolve_device_id(device_name)
-    key_list = [k.strip() for k in keys.split(",")][:1]  # Nur ersten Key
+    logger.info(f"Tool aufgerufen: get_data_availability(keys={keys})")
     
-    client = await get_client()
-    
-    # Hole die neuesten Daten (um zu sehen wann zuletzt Daten kamen)
-    latest = await client.get_latest_telemetry(device_id, key_list)
-    
-    # Hole Daten der letzten Woche um den Bereich zu finden
-    now = datetime.now()
-    week_ago = now - timedelta(days=7)
-    start_ts = int(week_ago.timestamp() * 1000)
-    end_ts = int(now.timestamp() * 1000)
-    
-    data = await client.get_telemetry(device_id, key_list, start_ts, end_ts)
-    
-    result = {
-        "device": device_name,
-        "key_checked": key_list[0],
-    }
-    
-    if not data or not data.get(key_list[0]):
-        result["status"] = "no_data"
-        result["message"] = "Keine Daten in der letzten Woche gefunden."
-        result["hint"] = "Der Roboter war möglicherweise nicht aktiv."
-    else:
-        values = data[key_list[0]]
-        timestamps = [v["timestamp"] for v in values if "timestamp" in v]
+    try:
+        device_id = resolve_device_id(device_name)
+        key_list = [k.strip() for k in keys.split(",")][:1]
         
-        if timestamps:
-            first_ts = min(timestamps)
-            last_ts = max(timestamps)
-            first_dt = datetime.fromtimestamp(first_ts / 1000)
-            last_dt = datetime.fromtimestamp(last_ts / 1000)
+        client = await get_client()
+        
+        # Hole Daten der letzten Woche um den Bereich zu finden
+        now = datetime.now()
+        week_ago = now - timedelta(days=7)
+        start_ts = int(week_ago.timestamp() * 1000)
+        end_ts = int(now.timestamp() * 1000)
+        
+        data = await client.get_telemetry(device_id, key_list, start_ts, end_ts)
+        
+        result = {
+            "device": device_name,
+            "key_checked": key_list[0],
+        }
+        
+        if not data or not data.get(key_list[0]):
+            result["status"] = "no_data"
+            result["message"] = "Keine Daten in der letzten Woche gefunden."
+            result["hint"] = "Der Roboter war möglicherweise nicht aktiv."
+        else:
+            values = data[key_list[0]]
+            timestamps = [v["timestamp"] for v in values if "timestamp" in v]
             
-            result["status"] = "data_available"
-            result["data_range"] = {
-                "first_data": first_dt.strftime("%d.%m.%Y %H:%M:%S"),
-                "first_weekday": WEEKDAY_NAMES[first_dt.weekday()],
-                "last_data": last_dt.strftime("%d.%m.%Y %H:%M:%S"),
-                "last_weekday": WEEKDAY_NAMES[last_dt.weekday()],
-            }
-            result["total_points"] = len(values)
-            result["message"] = f"Daten verfügbar von {first_dt.strftime('%d.%m.%Y %H:%M')} bis {last_dt.strftime('%d.%m.%Y %H:%M')}"
-    
-    return json.dumps(result, indent=2)
+            if timestamps:
+                first_ts = min(timestamps)
+                last_ts = max(timestamps)
+                first_dt = datetime.fromtimestamp(first_ts / 1000)
+                last_dt = datetime.fromtimestamp(last_ts / 1000)
+                
+                result["status"] = "data_available"
+                result["data_range"] = {
+                    "first_data": first_dt.strftime("%Y-%m-%d"),
+                    "first_time": first_dt.strftime("%H:%M"),
+                    "first_weekday": WEEKDAY_NAMES[first_dt.weekday()],
+                    "last_data": last_dt.strftime("%Y-%m-%d"),
+                    "last_time": last_dt.strftime("%H:%M"),
+                    "last_weekday": WEEKDAY_NAMES[last_dt.weekday()],
+                }
+                result["total_points"] = len(values)
+                result["message"] = f"Daten verfügbar von {first_dt.strftime('%d.%m.%Y %H:%M')} bis {last_dt.strftime('%d.%m.%Y %H:%M')}"
+        
+        return json.dumps(result, indent=2)
+        
+    except ThingsBoardError as e:
+        logger.error(f"get_data_availability Fehler: {e.message}")
+        return json.dumps(format_thingsboard_error(e), indent=2)
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e)}, indent=2)
 
 
 @mcp.tool()
@@ -475,220 +583,250 @@ async def get_latest_telemetry(
     device_name: str = "KRC5",
 ) -> str:
     """
-    Holt die aktuellsten Telemetrie-Werte (1 Wert pro Key).
+    Holt die aktuellsten Telemetrie-Werte (genau 1 Wert pro Key, der neueste).
+    
+    WANN BENUTZEN:
+    - User fragt nach AKTUELLEM Wert: "Wie ist die Position jetzt?"
+    - User will EINEN Momentanwert: "Aktueller Drehmoment?"
+    - Schnelle Statusabfrage ohne Zeitreihe
+    
+    NICHT BENUTZEN:
+    - User fragt nach Verlauf/Trend über Zeit → get_telemetry
+    - User nennt einen Zeitraum (gestern, letzte Stunde) → get_telemetry
+    - User will Daten visualisieren → get_telemetry
     
     Args:
         keys: Komma-separierte Liste von Keys, z.B. "axis_act_a1_deg,vel_act_m_per_s"
-        device_name: Name des Geräts, z.B. "KRC5"
+        device_name: Name des Geräts (default: "KRC5")
+        
+    Returns:
+        Aktuellster Wert pro Key mit Timestamp
     """
-    device_id = resolve_device_id(device_name)
-    key_list = [k.strip() for k in keys.split(",")]
+    logger.info(f"Tool aufgerufen: get_latest_telemetry(keys={keys})")
     
-    client = await get_client()
-    data = await client.get_latest_telemetry(device_id, key_list)
-    
-    # Füge Zeitinfo hinzu
-    result = {}
-    for key, value in data.items():
-        if isinstance(value, dict) and "timestamp" in value:
-            ts = value["timestamp"]
-            dt = datetime.fromtimestamp(ts / 1000)
-            result[key] = {
-                **value,
-                "timestamp_human": dt.strftime("%d.%m.%Y %H:%M:%S"),
-                "weekday": WEEKDAY_NAMES[dt.weekday()],
-            }
-        else:
-            result[key] = value
-    
-    return json.dumps(result, indent=2)
+    try:
+        device_id = resolve_device_id(device_name)
+        key_list = [k.strip() for k in keys.split(",")]
+        
+        client = await get_client()
+        data = await client.get_latest_telemetry(device_id, key_list)
+        
+        result = {}
+        for key, value in data.items():
+            if isinstance(value, dict) and "timestamp" in value:
+                ts = value["timestamp"]
+                dt = datetime.fromtimestamp(ts / 1000)
+                result[key] = {
+                    **value,
+                    "timestamp_human": dt.strftime("%d.%m.%Y %H:%M:%S"),
+                    "weekday": WEEKDAY_NAMES[dt.weekday()],
+                }
+            else:
+                result[key] = value
+        
+        return json.dumps(result, indent=2)
+        
+    except ThingsBoardError as e:
+        logger.error(f"get_latest_telemetry Fehler: {e.message}")
+        return json.dumps(format_thingsboard_error(e), indent=2)
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e)}, indent=2)
 
 
 @mcp.tool()
 async def get_telemetry(
     keys: str,
-    timerange: str = "letzte Stunde",
+    start_date: str,
+    end_date: str,
+    start_time: str = "00:00",
+    end_time: str = "23:59",
+    interval: Literal["1m", "5m", "10m", "30m", "1h", "6h", "1d"] | None = None,
+    aggregation: Literal["AVG", "MIN", "MAX", "SUM", "COUNT"] | None = None,
     device_name: str = "KRC5",
 ) -> str:
     """
-    Holt Telemetrie-Zeitreihen für einen Zeitraum.
+    Holt Telemetrie-ZEITREIHEN für einen definierten Zeitraum. Das HAUPTTOOL für Datenabfragen!
     
-    WICHTIG: 
-    - Wenn keine Daten gefunden werden, wird status="no_data" zurückgegeben
-    - Versuche NICHT einen anderen Zeitraum, sondern informiere den Nutzer!
-    - Nutze get_data_availability um zu prüfen wann Daten existieren
+    WANN BENUTZEN:
+    - User fragt nach VERLAUF/TREND: "Zeig Position von gestern"
+    - User nennt ZEITRAUM: "Drehmomente vom Dienstag", "letzte Stunde"
+    - User will VISUALISIEREN: "Zeig mir ein Diagramm der Geschwindigkeit"
+    - User will MEHRERE DATENPUNKTE über Zeit analysieren
+    
+    NICHT BENUTZEN:
+    - User fragt nur nach AKTUELLEM Wert → get_latest_telemetry
+    - User fragt ob Daten existieren → get_data_availability
+    - User fragt nach statischen Attributen (Masse, Energie gesamt) → get_attributes
+    
+    AUTOMATISCHE AGGREGATION:
+    Wenn interval=None, wird automatisch berechnet:
+    - ≤ 1 Stunde → 1m (1 Minute)
+    - ≤ 1 Tag → 10m (10 Minuten)
+    - ≤ 1 Woche → 1h (1 Stunde)
+    - > 1 Woche → 1d (1 Tag)
     
     Args:
-        keys: Komma-separierte Liste von Keys, z.B. "axis_act_a1_deg,torque_act_a1_nm"
-        timerange: Zeitraum, unterstützt viele Formate:
-            - Relativ: "letzte Stunde", "letzte 24h", "heute"
-            - Datum: "16.", "16. Dezember", "16.12.2025"
-            - Wochentag: "Dienstag", "letzten Montag"
-            - Mit Uhrzeit: "Dienstag um 13 Uhr", "16.12. um 14:30"
-            - Zeitbereich: "Dienstag zwischen 13 und 16 Uhr", "16.12. von 14 bis 15 Uhr"
-        device_name: Name des Geräts
+        keys: Komma-separierte Keys, z.B. "axis_act_a1_deg,torque_act_a1_nm"
+        start_date: Startdatum YYYY-MM-DD (z.B. "2025-12-16") - PFLICHT
+        end_date: Enddatum YYYY-MM-DD (z.B. "2025-12-16") - PFLICHT
+        start_time: Startzeit HH:MM (default: "00:00")
+        end_time: Endzeit HH:MM (default: "23:59")
+        interval: OPTIONAL - "1m", "5m", "10m", "30m", "1h", "6h", "1d" (sonst auto)
+        aggregation: OPTIONAL - "AVG", "MIN", "MAX", "SUM", "COUNT" (default: AVG)
+        device_name: Gerätename (default: "KRC5")
         
     Returns:
-        Zusammenfassung mit Statistiken (oder Fehlermeldung wenn keine Daten)
+        Zusammenfassung mit Statistiken + Dateipfad zu den Rohdaten
     """
-    device_id = resolve_device_id(device_name)
-    key_list = [k.strip() for k in keys.split(",")]
-    start_ts, end_ts = parse_timerange(timerange)
-    
-    client = await get_client()
-    data = await client.get_telemetry(device_id, key_list, start_ts, end_ts)
-    
-    # Menschenlesbare Zeit
-    start_dt = datetime.fromtimestamp(start_ts / 1000)
-    end_dt = datetime.fromtimestamp(end_ts / 1000)
-    start_human = start_dt.strftime("%d.%m.%Y %H:%M")
-    end_human = end_dt.strftime("%d.%m.%Y %H:%M")
-    start_weekday = WEEKDAY_NAMES[start_dt.weekday()]
-    
-    # Prüfe ob Daten vorhanden
-    total_points = sum(len(values) for values in data.values())
-    
-    if total_points == 0:
-        # KEINE DATEN - klare Fehlermeldung!
-        return json.dumps({
-            "status": "no_data",
-            "requested_timerange": {
-                "start": start_human,
-                "end": end_human,
-                "weekday": start_weekday,
-            },
-            "message": f"Keine Daten für den Zeitraum {start_weekday}, {start_human} bis {end_human} gefunden.",
-            "hint": "Nutze get_data_availability um zu prüfen, wann Daten verfügbar sind.",
-            "action": "Informiere den Nutzer, dass keine Daten für diesen Zeitraum existieren. Versuche NICHT automatisch andere Zeiträume!",
-        }, indent=2)
-    
-    # Daten vorhanden - normal verarbeiten
-    stats = calculate_statistics(data)
-    
-    full_data = {
-        "timerange": {
-            "start_ts": start_ts,
-            "end_ts": end_ts,
-            "start_human": start_human,
-            "end_human": end_human,
-            "weekday": start_weekday,
-        },
-        "keys": key_list,
-        "data": data,
-    }
-    data_file = save_data_to_file(full_data, "telemetry")
-    
-    summary = {
-        "status": "success",
-        "timerange": {
-            "start": start_human,
-            "end": end_human,
-            "weekday": start_weekday,
-        },
-        "data_points": {key: len(values) for key, values in data.items()},
-        "statistics": stats,
-        "data_file": data_file,
-    }
-    
-    return json.dumps(summary, indent=2)
-
-
-@mcp.tool()
-async def get_telemetry_aggregated(
-    keys: str,
-    timerange: str = "letzte 24 Stunden",
-    interval: str = "1 Stunde",
-    aggregation: str = "AVG",
-    device_name: str = "KRC5",
-) -> str:
-    """
-    Holt aggregierte Telemetrie-Daten. Ideal für längere Zeiträume!
-    
-    Args:
-        keys: Komma-separierte Liste von Keys
-        timerange: Zeitraum wie "letzte 24 Stunden", "letzte Woche"
-        interval: Aggregations-Intervall wie "1 Stunde", "30 Minuten"
-        aggregation: AVG, MIN, MAX, SUM, COUNT
-        device_name: Name des Geräts
-    """
-    device_id = resolve_device_id(device_name)
-    key_list = [k.strip() for k in keys.split(",")]
-    start_ts, end_ts = parse_timerange(timerange)
-    
-    # Interval in Millisekunden
-    interval_lower = interval.lower()
-    if "tag" in interval_lower or "day" in interval_lower:
-        interval_ms = 86400000
-    elif "stunde" in interval_lower or "hour" in interval_lower:
-        interval_ms = 3600000
-    elif "minute" in interval_lower:
-        minutes = 30
-        for word in interval.split():
-            if word.isdigit():
-                minutes = int(word)
-                break
-        interval_ms = minutes * 60000
-    else:
-        interval_ms = 3600000
-    
-    client = await get_client()
-    data = await client.get_telemetry_aggregated(
-        device_id, key_list, start_ts, end_ts, interval_ms, aggregation.upper()
+    logger.info(
+        f"Tool aufgerufen: get_telemetry(keys={keys}, "
+        f"start={start_date} {start_time}, end={end_date} {end_time}, "
+        f"interval={interval}, aggregation={aggregation})"
     )
     
-    start_dt = datetime.fromtimestamp(start_ts / 1000)
-    end_dt = datetime.fromtimestamp(end_ts / 1000)
-    start_human = start_dt.strftime("%d.%m.%Y %H:%M")
-    end_human = end_dt.strftime("%d.%m.%Y %H:%M")
-    start_weekday = WEEKDAY_NAMES[start_dt.weekday()]
-    
-    # Prüfe ob Daten vorhanden
-    total_points = sum(len(values) for values in data.values())
-    
-    if total_points == 0:
-        return json.dumps({
-            "status": "no_data",
-            "requested_timerange": {
+    try:
+        device_id = resolve_device_id(device_name)
+        key_list = [k.strip() for k in keys.split(",")]
+        
+        # Datum/Zeit parsen
+        try:
+            start_dt = parse_datetime(start_date, start_time)
+            end_dt = parse_datetime(end_date, end_time)
+        except ValueError as e:
+            return json.dumps({
+                "status": "error",
+                "message": str(e),
+                "hint": "Datum muss im Format YYYY-MM-DD sein, Zeit im Format HH:MM"
+            }, indent=2)
+        
+        start_ts = int(start_dt.timestamp() * 1000)
+        end_ts = int(end_dt.timestamp() * 1000)
+        
+        # Intervall berechnen oder übernehmen
+        interval_ms, interval_human, auto_interval = get_interval(interval)
+        
+        if auto_interval:
+            # Auto-Intervall basierend auf Zeitraum
+            interval_ms, interval_human, interval_reason = calculate_auto_interval(start_dt, end_dt)
+        else:
+            interval_reason = f"Vom User angegeben: {interval}"
+        
+        # =====================================================================
+        # DATENPUNKT-LIMIT CHECK (DEC-009)
+        # =====================================================================
+        limit_check = check_datapoint_limit(
+            start_dt, end_dt, interval_ms, interval_human, len(key_list)
+        )
+        
+        if limit_check:
+            if limit_check.get("status") == "error_too_many_datapoints":
+                # Fehler - User muss anpassen
+                logger.warning(f"Datenpunkt-Limit erreicht: {limit_check}")
+                return json.dumps(limit_check, indent=2)
+            
+            elif limit_check.get("status") == "warning_many_datapoints":
+                # Warnung - trotzdem weitermachen, aber User informieren
+                logger.info(f"Datenpunkt-Warnung: {limit_check}")
+                # Warnung wird später in Response integriert
+        
+        # Aggregation holen
+        tb_aggregation, aggregation_human = get_aggregation(aggregation)
+        
+        # Menschenlesbare Zeit
+        start_human = start_dt.strftime("%d.%m.%Y %H:%M")
+        end_human = end_dt.strftime("%d.%m.%Y %H:%M")
+        start_weekday = WEEKDAY_NAMES[start_dt.weekday()]
+        
+        # Daten holen (IMMER aggregiert!)
+        client = await get_client()
+        data = await client.get_telemetry_aggregated(
+            device_id, key_list, start_ts, end_ts, interval_ms, tb_aggregation
+        )
+        
+        # Prüfe ob Daten vorhanden
+        total_points = sum(len(values) for values in data.values())
+        
+        if total_points == 0:
+            return json.dumps({
+                "status": "no_data",
+                "requested_timerange": {
+                    "start": start_human,
+                    "end": end_human,
+                    "weekday": start_weekday,
+                },
+                "settings": {
+                    "interval": interval_human,
+                    "aggregation": aggregation_human,
+                    "auto_interval": auto_interval,
+                },
+                "message": f"Keine Daten für den Zeitraum {start_weekday}, {start_human} bis {end_human} gefunden.",
+                "hint": "Nutze get_data_availability um zu prüfen, wann Daten verfügbar sind.",
+                "action": "Informiere den Nutzer, dass keine Daten für diesen Zeitraum existieren. Versuche NICHT automatisch andere Zeiträume!",
+            }, indent=2)
+        
+        # Daten vorhanden - normal verarbeiten
+        stats = calculate_statistics(data)
+        
+        full_data = {
+            "timerange": {
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "start_human": start_human,
+                "end_human": end_human,
+                "weekday": start_weekday,
+            },
+            "settings": {
+                "interval_ms": interval_ms,
+                "interval_human": interval_human,
+                "aggregation": tb_aggregation,
+                "aggregation_human": aggregation_human,
+                "auto_interval": auto_interval,
+            },
+            "keys": key_list,
+            "data": data,
+        }
+        data_file = save_data_to_file(full_data, "telemetry")
+        
+        # Settings für User-Info aufbereiten
+        settings_info = {
+            "interval": interval_human,
+            "aggregation": aggregation_human,
+            "auto_interval": auto_interval,
+            "reason": interval_reason,
+        }
+        
+        # Info-Text für den User
+        if auto_interval:
+            settings_text = f"Automatisch: {aggregation_human} alle {interval_human} ({interval_reason})"
+        else:
+            settings_text = f"Benutzerdefiniert: {aggregation_human} alle {interval_human}"
+        
+        summary = {
+            "status": "success",
+            "timerange": {
                 "start": start_human,
                 "end": end_human,
                 "weekday": start_weekday,
             },
-            "message": f"Keine Daten für den Zeitraum {start_weekday}, {start_human} bis {end_human} gefunden.",
-            "hint": "Nutze get_data_availability um zu prüfen, wann Daten verfügbar sind.",
-        }, indent=2)
-    
-    stats = calculate_statistics(data)
-    
-    full_data = {
-        "timerange": {
-            "start_ts": start_ts,
-            "end_ts": end_ts,
-            "start_human": start_human,
-            "end_human": end_human,
-            "weekday": start_weekday,
-        },
-        "interval_ms": interval_ms,
-        "aggregation": aggregation.upper(),
-        "keys": key_list,
-        "data": data,
-    }
-    data_file = save_data_to_file(full_data, "telemetry_agg")
-    
-    summary = {
-        "status": "success",
-        "timerange": {
-            "start": start_human,
-            "end": end_human,
-            "weekday": start_weekday,
-        },
-        "interval": interval,
-        "aggregation": aggregation.upper(),
-        "data_points": {key: len(values) for key, values in data.items()},
-        "statistics": stats,
-        "data_file": data_file,
-    }
-    
-    return json.dumps(summary, indent=2)
+            "settings": settings_info,
+            "settings_text": settings_text,
+            "data_points": {key: len(values) for key, values in data.items()},
+            "statistics": stats,
+            "data_file": data_file,
+            "user_hint": "Du kannst die Einstellungen anpassen: 'zeig Maximum statt Durchschnitt' oder 'mit 5-Minuten-Intervall'",
+        }
+        
+        # Warnung hinzufügen falls vorhanden
+        if limit_check and limit_check.get("status") == "warning_many_datapoints":
+            summary["warning"] = limit_check.get("user_info")
+        
+        return json.dumps(summary, indent=2)
+        
+    except ThingsBoardError as e:
+        logger.error(f"get_telemetry Fehler: {e.message}")
+        return json.dumps(format_thingsboard_error(e), indent=2)
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e)}, indent=2)
 
 
 @mcp.tool()
@@ -697,25 +835,75 @@ async def get_attributes(
     device_name: str = "KRC5",
 ) -> str:
     """
-    Holt statische Attribute eines Geräts.
+    Holt statische Attribute eines Geräts (Werte die sich selten oder nie ändern).
     
-    Attribute sind Werte die sich selten ändern, z.B. load_mass_kg, energy_total_kwh.
+    WANN BENUTZEN:
+    - User fragt nach STATISCHEN Eigenschaften: "Wie schwer ist die Last?", "Gesamtenergie?"
+    - Typische Attribute: load_mass_kg, energy_total_kwh, Konfigurationswerte
+    - Werte die sich nicht sekündlich ändern
+    
+    NICHT BENUTZEN:
+    - User fragt nach Messwerten die sich ständig ändern → get_telemetry
+    - User fragt nach aktuellem Sensorwert → get_latest_telemetry
+    - User fragt nach Verlauf/Trend → get_telemetry
+    
+    Args:
+        keys: Komma-separierte Attribut-Keys, z.B. "load_mass_kg,energy_total_kwh"
+        device_name: Name des Geräts (default: "KRC5")
+        
+    Returns:
+        Attribut-Werte (ohne Zeitreihe, nur aktuelle Werte)
     """
-    device_id = resolve_device_id(device_name)
-    key_list = [k.strip() for k in keys.split(",")]
+    logger.info(f"Tool aufgerufen: get_attributes(keys={keys})")
     
-    client = await get_client()
-    data = await client.get_attributes(device_id, key_list)
-    return json.dumps(data, indent=2)
+    try:
+        device_id = resolve_device_id(device_name)
+        key_list = [k.strip() for k in keys.split(",")]
+        
+        client = await get_client()
+        data = await client.get_attributes(device_id, key_list)
+        return json.dumps(data, indent=2)
+        
+    except ThingsBoardError as e:
+        logger.error(f"get_attributes Fehler: {e.message}")
+        return json.dumps(format_thingsboard_error(e), indent=2)
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e)}, indent=2)
 
 
 @mcp.tool()
 async def list_attribute_keys(device_name: str = "KRC5") -> str:
-    """Listet alle verfügbaren Attribut-Keys für ein Gerät auf."""
-    device_id = resolve_device_id(device_name)
-    client = await get_client()
-    keys = await client.get_attribute_keys(device_id)
-    return json.dumps(keys, indent=2)
+    """
+    Listet alle verfügbaren Attribut-Keys (statische Eigenschaften) für ein Gerät auf.
+    
+    WANN BENUTZEN:
+    - User fragt "Welche Attribute gibt es?" oder "Was sind die Eigenschaften?"
+    - User ist unsicher welche statischen Werte verfügbar sind
+    - Unterscheidung: Attribute = statisch, Telemetrie = dynamische Zeitreihen
+    
+    NICHT BENUTZEN:
+    - User fragt nach Messwerten/Sensordaten → list_telemetry_keys
+    - User kennt bereits das Attribut → get_attributes direkt aufrufen
+    
+    Args:
+        device_name: Name des Geräts (default: "KRC5")
+        
+    Returns:
+        Liste aller Attribut-Keys gruppiert nach Scope (SERVER, SHARED, CLIENT)
+    """
+    logger.info(f"Tool aufgerufen: list_attribute_keys(device_name={device_name})")
+    
+    try:
+        device_id = resolve_device_id(device_name)
+        client = await get_client()
+        keys = await client.get_attribute_keys(device_id)
+        return json.dumps(keys, indent=2)
+        
+    except ThingsBoardError as e:
+        logger.error(f"list_attribute_keys Fehler: {e.message}")
+        return json.dumps(format_thingsboard_error(e), indent=2)
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e)}, indent=2)
 
 
 # =============================================================================

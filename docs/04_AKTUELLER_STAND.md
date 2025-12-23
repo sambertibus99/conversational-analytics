@@ -1,222 +1,130 @@
 # AKTUELLER STAND
 
-> Letzte Aktualisierung: 18. Dezember 2025, 23:00 Uhr
-> Diese Datei wird nach jeder Session aktualisiert.
+> **Letzte Aktualisierung:** 23. Dezember 2025, 10:30 Uhr
 
 ---
 
-## Arbeitspaket-Status
+## 🎯 Aktuelle Session: Multi-Turn Bug-Fixes
 
-| AP | Name | Status | Fortschritt | Notizen |
-|----|------|--------|-------------|---------|
-| 0 | Projekt-Setup | ✅ Fertig | 100% | venv, deps, config |
-| 1 | ThingsBoard MCP | ✅ Fertig | 100% | 9 Tools, File-Storage für große Daten |
-| 2 | Data Agent | ✅ Fertig | 100% | MCP Client, Response-Parsing, Pipeline-Stopp-Logik |
-| 3 | AntV MCP | ✅ Fertig | 100% | Nutzt `@antv/mcp-server-chart` (25 Tools) |
-| 4 | Viz Agent | ✅ Fertig | 100% | Message-Filtering fix, Daten-Transformation |
-| 5 | Stats Agent | ✅ Fertig | 100% | 8 Tools (mean, std, correlation, etc.) |
-| 6 | Supervisor + Graph | ✅ Fertig | 100% | Supervisor + LangGraph + needs_user_input Steuerung |
-| 7 | Frontend | ✅ Fertig | 100% | Chainlit, Chart-Anzeige, Follow-up Kontext |
-| 8 | Evaluation | ⬜ Offen | 0% | Nächster Schritt! |
-| 9 | Debugging & Testing | ✅ Fertig | 95% | 243 Unit Tests ✅, Integration Tests optional |
+### ✅ Erledigt (23.12.2025)
 
----
+**Bug 1: current_step Persistenz**
+- Problem: `current_step` wurde vom Checkpointer persistiert, aber bei neuem Plan nicht zurückgesetzt
+- Turn 1 endete mit `current_step=2`, Turn 2 startete mit Step 2 statt 0
+- Fix: `current_step: 0` im Supervisor-Return bei neuem Plan
 
-## System funktioniert! ✅
+**Bug 2: Multiple SystemMessages (Anthropic API)**
+- Problem: Messages aus Checkpoint enthielten alte SystemMessages
+- `ValueError: Received multiple non-consecutive system messages`
+- Fix: SystemMessages filtern in `data_agent.py` und `stats_agent.py`
 
-Das System ist jetzt **voll funktionsfähig**:
-- ✅ Daten laden für beliebige Zeiträume ("16. Dezember", "Dienstag 12 Uhr")
-- ✅ Charts erstellen (Line, Bar, Scatter)
-- ✅ Statistiken berechnen
-- ✅ Bei fehlenden Daten: Stoppt und fragt User
-- ✅ Bei erfolgreichen Daten: Läuft weiter zu viz_agent
+**Bug 3: Respond-Node zeigt keine Datenwerte**
+- Problem: User fragte "zeig die Werte", aber Respond sah nur "6 Keys" nicht die Werte
+- Fix: `respond_node` extrahiert jetzt tatsächliche Werte aus `datasets`
 
----
+**Bug 4: Unnötiger Viz-Agent bei Textanfragen**
+- Problem: "Zeig mir die Zahlenwerte" triggerte Viz-Agent statt direkte Antwort
+- Fix: Supervisor-Prompt erweitert mit Beispiel für leeren Plan bei vorhandenen Daten
 
-## Erledigte Dateien
-
+### Geänderte Dateien
 ```
-conversational-analytics/
-├── agents/
-│   ├── __init__.py
-│   ├── state.py                  # AgentState mit needs_user_input, user_input_reason
-│   ├── data_agent.py             # Mit detect_needs_user_input(), Pipeline-Steuerung
-│   ├── viz_agent.py              # Mit Message-Filtering (nur HumanMessages!)
-│   ├── stats_agent.py            # Stats Agent mit MCP
-│   └── graph.py                  # LangGraph mit needs_user_input Prüfung im Router
-├── mcp_servers/
-│   ├── thingsboard_client.py     # Async HTTP Client
-│   └── thingsboard_server.py     # 9 Tools, Timerange-Parser erweitert ("16.", "am 16.")
-├── prompts/
-│   ├── data_agent_prompt.py      # Mit STOPP-Regeln und KONTEXT-Verarbeitung
-│   ├── viz_agent_prompt.py
-│   ├── stats_agent_prompt.py
-│   └── supervisor_prompt.py
-├── outputs/
-│   └── data/                     # Telemetrie-Dateien (JSON) für Token-Sparung
-├── tests/                        # Systematische Tests (AP9)
-│   ├── conftest.py               # Pytest Fixtures & Mocks
-│   ├── pytest.ini                # Pytest Konfiguration
-│   ├── run_tests.py              # Test-Runner (umgeht ROS2-Konflikte)
-│   ├── test_mcp_server/          # 86 Tests
-│   ├── test_agents/              # 119 Tests
-│   ├── test_integration/         # E2E Tests
-│   └── test_token_budget.py      # 18 Tests
-├── docs/
-│   └── AP9_DEBUGGING_TESTING.md  # Testplan
-├── app.py                        # Chainlit mit pending_query Kontext für Follow-ups
-├── CLAUDE.md                     # Mit Debugging-Workflow & kritischen Regeln
-├── 05_ARCHITEKTUR.md             # Mit detailliertem Datenfluss
-└── 07_ERROR_HANDLING.md          # Mit bekannten Fehlern & Fixes (inkl. FEHLER 4)
+agents/supervisor.py      # current_step Reset + Datasets-Kontext für LLM
+agents/data_agent.py      # SystemMessage Filter
+agents/stats_agent.py     # SystemMessage Filter  
+agents/graph.py           # Respond-Node zeigt Datenwerte
+prompts/supervisor_prompt.py  # Multi-Turn Beispiele
 ```
 
+### Neue Entscheidung
+**DEC-014: SystemMessage-Handling bei Multi-Turn**
+- Anthropic erlaubt nur eine SystemMessage am Anfang
+- Best Practice: Messages aus State filtern, frische SystemMessage prependen
+
 ---
 
-## Session 18.12.2025 (Abend) - Komplette Zusammenfassung
+## 📚 Best Practices aus Recherche (23.12.2025)
 
-### 1. AP9 Test-Suite (243 Tests) ✅
+### LangGraph Multi-Turn mit Anthropic
 
-| Bereich | Tests | Status |
-|---------|-------|--------|
-| Response-Formate | 31 | ✅ |
-| Timerange-Parsing | 55 | ✅ |
-| Data Agent Parsing | 32 | ✅ |
-| Viz Agent | 42 | ✅ |
-| Supervisor | 45 | ✅ |
-| Token-Budget | 18 | ✅ |
-| Integration | ~20 | ⬜ (optional) |
+**Problem:** Bei Multi-Turn akkumulieren SystemMessages im State → API-Fehler
 
-```bash
-# Tests ausführen
-python run_tests.py
-```
-
-### 2. Pipeline-Steuerung (needs_user_input) ✅
-
-**Problem:** Agent machte bei partiellen Daten automatisch weiter
-**Lösung:** `detect_needs_user_input()` unterscheidet Erfolg vs. Fehler
-
+**Lösung 1: Filter (unser Ansatz)**
 ```python
-# state.py - Neue Felder
-needs_user_input: bool = False
-user_input_reason: str | None = None
-
-# graph.py - Router prüft ZUERST
-if state.get("needs_user_input", False):
-    return "respond"  # Pipeline stoppen!
+filtered_messages = [msg for msg in state["messages"] if not isinstance(msg, SystemMessage)]
+messages = [SystemMessage(content=prompt), *filtered_messages]
 ```
 
-**Logik:**
-- "erfolgreich", "geladen", "datenpunkte" → **KEIN STOPP** → weiter
-- "keine daten für den zeitraum" → **STOPP** → User fragen
-
-### 3. Timerange-Parser erweitert ✅
-
-Neue unterstützte Formate:
-- `"16."` → 16. des aktuellen Monats (ganzer Tag)
-- `"am 16."` → 16. des aktuellen Monats
-- `"für den 16."` → 16. des aktuellen Monats
-- `"16. Dezember"` → 16. Dezember
-- `"16.12."` → 16. Dezember
-- `"16.12.2025"` → Exaktes Datum
-
-### 4. Chat-Kontext für Follow-ups ✅
-
-`app.py` speichert jetzt `pending_query` und `pending_context` wenn Pipeline stoppt.
-Bei User-Antwort wird KONTEXT-Block an Data Agent übergeben.
-
-### 5. Behobene Fehler (gesamt)
-
-| # | Problem | Fix |
-|---|---------|-----|
-| 1 | Token-Limit (400 Bad Request) | File-Storage für Rohdaten |
-| 2 | "no_data" nicht erkannt | Status ZUERST prüfen |
-| 3 | Multiple SystemMessages | Nur HumanMessages weitergeben |
-| 4 | Agent macht bei partiellen Daten weiter | detect_needs_user_input() |
-| 5 | "16." wird nicht erkannt | Timerange-Parser erweitert |
-| 6 | Erfolgreiche Analyse stoppt fälschlich | Success-Indicators prüfen |
-
----
-
-## Getestete Flows (alle funktionieren!) ✅
-
-### Flow 1: Daten + Chart
-```
-User: "zeig mir die drehmomente aller 6 achsen für den 16. dezember"
-→ Data Agent: Lädt Daten erfolgreich
-→ Viz Agent: Erstellt Line Chart
-→ Output: Chart-URL angezeigt ✅
+**Lösung 2: create_react_agent mit prompt Parameter**
+```python
+agent = create_react_agent(model=llm, tools=tools, prompt="System prompt...")
 ```
 
-### Flow 2: Fehlende Daten
-```
-User: "vergleiche drehmomente mit temperatur"
-→ Data Agent: Drehmomente ✓, Temperatur ✗
-→ STOPP: "Temperatur nicht verfügbar. Was möchtest du tun?"
-→ User wählt Option
-→ Weiter mit gewählter Option ✅
-```
-
-### Flow 3: Keine Daten im Zeitraum
-```
-User: "TCP Position jetzt"
-→ Data Agent: Keine aktuellen Daten (Roboter aus)
-→ STOPP: "Keine Daten für den Zeitraum"
-→ User: "such verfügbare zeiträume"
-→ Zeigt verfügbare Daten ✅
+**Lösung 3: Custom call_model Node (offizielle Docs)**
+```python
+def call_model(state, config):
+    system_prompt = SystemMessage("...")
+    return model.invoke([system_prompt] + state["messages"])
 ```
 
 ---
 
-## Daten-Verfügbarkeit
+## 🧪 Test-Szenario für Multi-Turn
 
-- **Device:** KRC5 (KUKA Roboter)
-- **Device ID:** b8121f40-d446-11f0-866d-41534d350312
-- **Verfügbare Daten:** 11.12.2025 - 16.12.2025 (während Arbeitszeit)
-- **Keine Temperatur-Keys vorhanden!**
+```
+1. "Welche Position haben die Achsen des Roboters?"
+   → Plan: ['data_agent']
+   → Lädt axis Dataset (6 Keys)
+   
+2. "Zeig mir die Zahlenwerte"
+   → Plan: [] (leerer Plan - Daten sind schon da!)
+   → Respond zeigt: axis_act_a1_deg: 45.2, axis_act_a2_deg: -12.8, ...
 
----
-
-## Nächste Schritte
-
-### AP8: Evaluation (Priorität!)
-1. `08_TESTFRAGEN.md` lesen
-2. 15 Testfragen durchgehen
-3. Ergebnisse dokumentieren
-4. Für Masterarbeit aufbereiten
-
-### Optional
-- Integration Tests mit ThingsBoard
-- Weitere Chart-Typen testen
-- Edge Cases dokumentieren
+3. "Gibt es einen Zusammenhang mit dem Drehmoment?"
+   → Supervisor sieht: datasets=['axis'], keys nicht torque
+   → Plan: ['data_agent', 'stats_agent']
+   → Lädt torque, berechnet Korrelation
+```
 
 ---
 
-## Wichtige Befehle
+## 📋 Review-Status Gesamt
+
+| Komponente | Status | Offene Punkte |
+|------------|--------|---------------|
+| ThingsBoard MCP | ✅ Fertig | - |
+| Data Agent Prompt | ✅ AP2.1 | - |
+| Data Agent Code | ✅ AP2.2 | Multi-Turn Fix (DEC-013, DEC-014) |
+| Data Graph | ✅ AP2.3 | Respond-Node zeigt Werte |
+| Viz Agent | 🔄 3/4 | Error Handling |
+| Stats Agent | 🔄 | SystemMessage Fix |
+| Supervisor | ✅ | Multi-Turn Kontext |
+
+---
+
+## 📁 Dokumentations-Struktur
+
+```
+docs/
+├── DECISIONS.md              # ⭐ Entscheidungs-Datenbank (14 Patterns)
+├── 04_AKTUELLER_STAND.md     # Diese Datei
+├── 05_ARCHITEKTUR.md         # Systemübersicht
+├── 07_ERROR_HANDLING.md      # Fehler & Fixes
+├── 08_TESTFRAGEN.md          # Evaluation
+├── 09_THINGSBOARD_SETUP.md   # Setup-Referenz
+├── design/                   # Komponenten-Details
+└── archive/                  # Alte Dokumente
+```
+
+---
+
+## ⚡ Befehle
 
 ```bash
-# App starten
 cd ~/ma_ws/conversational-analytics
 source venv/bin/activate
 chainlit run app.py
 
-# Tests ausführen
-python run_tests.py
-
-# Git
-git status
-git add -A
-git commit -m "message"
-git push
+# Tests
+python -m pytest tests/ -m "not integration" -v  # Schnell
+python -m pytest tests/ -m integration -v         # Mit ThingsBoard
 ```
-
----
-
-## Update-Historie
-
-| Datum | Änderung |
-|-------|----------|
-| 16.12.2024 | AP0-AP6 abgeschlossen |
-| 18.12.2025 | AP7 abgeschlossen, File-Storage, Error Handling |
-| 18.12.2025 | AP9: 243 Unit Tests erstellt und bestanden |
-| 18.12.2025 | Pipeline-Steuerung: needs_user_input, Timerange-Parser, Follow-up Kontext |

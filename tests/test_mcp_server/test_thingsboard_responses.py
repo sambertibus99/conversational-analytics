@@ -165,7 +165,9 @@ class TestDataAvailableResponse:
         data_range = data_available_response["data_range"]
         
         assert "first_data" in data_range, "data_range.first_data fehlt"
+        assert "first_time" in data_range, "data_range.first_time fehlt"
         assert "last_data" in data_range, "data_range.last_data fehlt"
+        assert "last_time" in data_range, "data_range.last_time fehlt"
         assert "first_weekday" in data_range, "data_range.first_weekday fehlt"
         assert "last_weekday" in data_range, "data_range.last_weekday fehlt"
     

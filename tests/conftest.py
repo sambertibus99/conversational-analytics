@@ -14,12 +14,65 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 import json
+import asyncio
 
 import pytest
 
 # Projektroot zum Pfad hinzufügen
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# =============================================================================
+# MCP SESSION CLEANUP (für Integration Tests)
+# =============================================================================
+
+@pytest.fixture(scope="session")
+def event_loop():
+    """
+    Session-scoped event loop für alle async Tests.
+    
+    Best Practice: Ein Event Loop für alle Tests vermeidet
+    Probleme mit MCP Session Cleanup zwischen Tests.
+    """
+    import asyncio
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
+@pytest.fixture(scope="function")
+async def cleanup_mcp_after_test():
+    """
+    Cleanup MCP Session nach jedem Integration Test.
+    
+    Best Practice aus FastMCP Docs:
+    - Session nach jedem Test aufräumen
+    - Globale Variablen zurücksetzen
+    - Delay um Rate Limits zu vermeiden
+    """
+    yield
+    # Cleanup nach dem Test
+    try:
+        from agents.data_agent import cleanup_mcp, _mcp_tools, _mcp_exit_stack
+        import agents.data_agent as da
+        
+        # Globale Session schließen
+        if da._mcp_exit_stack is not None:
+            try:
+                await da._mcp_exit_stack.aclose()
+            except Exception:
+                pass
+        
+        # Globale Variablen zurücksetzen
+        da._mcp_tools = None
+        da._mcp_exit_stack = None
+        
+        # Rate Limit Best Practice: 2 Sekunden Pause zwischen Tests
+        # um 30k tokens/minute Limit nicht zu überschreiten
+        await asyncio.sleep(2)
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -116,9 +169,11 @@ def data_available_response():
         "device": "KRC5",
         "key_checked": "pos_act_x_mm",
         "data_range": {
-            "first_data": "16.12.2025 11:56:00",
+            "first_data": "2025-12-16",
+            "first_time": "11:56",
             "first_weekday": "Dienstag",
-            "last_data": "16.12.2025 18:36:00",
+            "last_data": "2025-12-16",
+            "last_time": "18:36",
             "last_weekday": "Dienstag",
         },
         "total_points": 24000,

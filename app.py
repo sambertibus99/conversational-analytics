@@ -3,7 +3,9 @@ Chainlit Frontend für das Conversational Analytics System.
 
 Startet mit: chainlit run app.py
 
-WICHTIG: Speichert Chat-Kontext zwischen Nachrichten für Follow-up Fragen!
+PERFORMANCE-OPTIMIERUNG (19.12.2025):
+- MCP Server werden beim Chat-Start vorgewärmt
+- Erster Request ist dadurch auch schnell!
 """
 
 import sys
@@ -14,10 +16,13 @@ PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import asyncio
+import uuid
 import chainlit as cl
 from chainlit import Message, Image, Text
 
 from agents.graph import run_query
+from agents.data_agent import get_mcp_tools
+from agents.viz_agent import get_antv_tools
 
 
 # =============================================================================
@@ -27,21 +32,50 @@ from agents.graph import run_query
 @cl.on_chat_start
 async def on_chat_start():
     """Wird aufgerufen wenn ein neuer Chat startet."""
+    # Eindeutige Thread-ID für diese Chat-Session (DEC-013)
+    thread_id = str(uuid.uuid4())
+    cl.user_session.set("thread_id", thread_id)
+    
     # Session-State initialisieren
     cl.user_session.set("pending_query", None)
     cl.user_session.set("pending_context", None)
     cl.user_session.set("chat_history", [])
     
-    await cl.Message(
-        content="👋 Willkommen beim **IIoT Analytics Assistant**!\n\n"
-                "Ich kann dir helfen, Sensordaten vom KRC5 Roboter zu analysieren und zu visualisieren.\n\n"
-                "**Beispiel-Fragen:**\n"
-                "- *Wie ist die aktuelle Position von Achse 1?*\n"
-                "- *Zeig mir den Verlauf der Bahngeschwindigkeit der letzten Stunde*\n"
-                "- *Was ist der Durchschnitt des Drehmoments von Achse 3?*\n"
-                "- *Gibt es Anomalien beim Drehmoment?*\n\n"
-                "Was möchtest du wissen? 🤖"
+    # MCP Server im Hintergrund vorwärmen
+    init_msg = await cl.Message(
+        content="⏳ Initialisiere System..."
     ).send()
+    
+    try:
+        # Beide MCP Server parallel starten
+        print("🔄 Starte MCP Server Warmup...")
+        mcp_tools, antv_tools = await asyncio.gather(
+            get_mcp_tools(),      # ThingsBoard MCP Server
+            get_antv_tools(),     # AntV Chart MCP Server
+        )
+        print(f"✅ ThingsBoard Tools: {len(mcp_tools)}")
+        print(f"✅ AntV Tools: {len(antv_tools)}")
+        
+        # Init-Nachricht aktualisieren
+        await init_msg.remove()
+        
+        await cl.Message(
+            content="👋 Willkommen beim **IIoT Analytics Assistant**!\n\n"
+                    "Ich kann dir helfen, Sensordaten vom KRC5 Roboter zu analysieren und zu visualisieren.\n\n"
+                    "**Beispiel-Fragen:**\n"
+                    "- *Zeig Drehmomente vom 16. Dezember*\n"
+                    "- *Wie ist die aktuelle Position von Achse 1?*\n"
+                    "- *Zeig mir den Verlauf der Bahngeschwindigkeit der letzten Stunde*\n"
+                    "- *Zeig Maximum statt Durchschnitt*\n\n"
+                    "Was möchtest du wissen? 🤖"
+        ).send()
+        
+    except Exception as e:
+        await init_msg.remove()
+        await cl.Message(
+            content=f"⚠️ System gestartet, aber MCP-Initialisierung fehlgeschlagen: {e}\n\n"
+                    "Das System funktioniert trotzdem, der erste Request könnte aber länger dauern."
+        ).send()
 
 
 @cl.on_message
@@ -74,34 +108,28 @@ async def on_message(message: cl.Message):
     await thinking_msg.send()
     
     try:
-        # Graph ausführen
-        result = await run_query(effective_query)
+        # Graph ausführen mit thread_id für State-Persistenz (DEC-013)
+        thread_id = cl.user_session.get("thread_id")
+        result = await run_query(effective_query, thread_id=thread_id)
         
         # Thinking-Nachricht entfernen
         await thinking_msg.remove()
         
         # Prüfe ob die Pipeline gestoppt hat und auf User-Input wartet
-        # (erkennbar an bestimmten Patterns in der Response)
         response_text = result.get("response", "")
         is_waiting_for_input = (
             "möchtest du" in response_text.lower() or
             "was möchtest du tun" in response_text.lower() or
             "bitte wähle" in response_text.lower() or
-            ("1." in response_text and "2." in response_text)  # Nummerierte Optionen
+            ("1." in response_text and "2." in response_text)
         )
         
         if is_waiting_for_input:
-            # Speichere den Kontext für die nächste Nachricht
             cl.user_session.set("pending_query", user_query)
-            cl.user_session.set("pending_context", response_text[:500])  # Erste 500 Zeichen
+            cl.user_session.set("pending_context", response_text[:500])
         
         # Response zusammenbauen
         response_parts = []
-        
-        # Plan anzeigen (optional, für Debug)
-        if result.get("plan"):
-            plan_str = " → ".join(result["plan"])
-            response_parts.append(f"📋 *Plan: {plan_str}*\n")
         
         # Hauptantwort
         if result.get("response"):
@@ -115,10 +143,9 @@ async def on_message(message: cl.Message):
         final_response = "\n".join(response_parts)
         await cl.Message(content=final_response).send()
         
-        # Chart als Bild einbetten (wenn URL vorhanden)
+        # Chart als Bild einbetten
         if result.get("chart_url"):
             try:
-                # Chainlit kann URLs als Bilder anzeigen
                 elements = [
                     cl.Image(
                         url=result["chart_url"],
@@ -131,42 +158,22 @@ async def on_message(message: cl.Message):
                     elements=elements
                 ).send()
             except Exception as e:
-                # Falls Bild-Embedding fehlschlägt, nur Link zeigen
                 pass
         
         # Chat-History aktualisieren
         history = cl.user_session.get("chat_history", [])
         history.append({"role": "user", "content": user_query})
         history.append({"role": "assistant", "content": response_text})
-        cl.user_session.set("chat_history", history[-10:])  # Letzte 10 behalten
+        cl.user_session.set("chat_history", history[-10:])
         
     except Exception as e:
-        # Thinking-Nachricht entfernen
         await thinking_msg.remove()
         
-        # Pending-State zurücksetzen bei Fehler
         cl.user_session.set("pending_query", None)
         cl.user_session.set("pending_context", None)
         
-        # Fehlermeldung
         error_msg = f"❌ **Fehler bei der Verarbeitung:**\n\n```\n{str(e)}\n```\n\nBitte versuche es erneut oder formuliere deine Frage anders."
         await cl.Message(content=error_msg).send()
-
-
-# =============================================================================
-# OPTIONAL: Actions für häufige Anfragen
-# =============================================================================
-
-@cl.action_callback("quick_status")
-async def quick_status(action: cl.Action):
-    """Quick Action: Aktueller Roboter-Status."""
-    await on_message(cl.Message(content="Wie ist die aktuelle Position aller Achsen?"))
-
-
-@cl.action_callback("quick_chart")
-async def quick_chart(action: cl.Action):
-    """Quick Action: Schnelles Chart."""
-    await on_message(cl.Message(content="Zeig mir den Verlauf der Achsposition 1 der letzten 10 Minuten als Liniendiagramm"))
 
 
 # =============================================================================
@@ -174,6 +181,4 @@ async def quick_chart(action: cl.Action):
 # =============================================================================
 
 if __name__ == "__main__":
-    # Für lokales Testing ohne chainlit run
     print("Starte mit: chainlit run app.py")
-    print("Oder: chainlit run app.py --port 8000")

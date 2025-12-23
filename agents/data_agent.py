@@ -3,9 +3,11 @@ Data Agent für ThingsBoard-Datenabfragen.
 
 Nutzt MCP (Model Context Protocol) um mit dem ThingsBoard Server zu kommunizieren.
 
-WICHTIG: Der MCP Server speichert große Datenmengen in Dateien.
-Der Data Agent liest diese Dateien und lädt die Daten in den State.
-So landen die Rohdaten NICHT im LLM-Context!
+DESIGN-ENTSCHEIDUNGEN:
+- DEC-005: MCP Session wird EINMAL beim Start erstellt und wiederverwendet
+- DEC-013: Datasets werden über Turns akkumuliert (nicht überschrieben)
+- DEC-014: SystemMessages aus State filtern
+- DEC-016: Strukturiertes Logging, Retry-Mechanismus, Funktionsaufteilung
 """
 
 import sys
@@ -16,9 +18,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import json
 import asyncio
-import traceback
-from typing import Any
-from contextlib import asynccontextmanager
+import logging
+from contextlib import AsyncExitStack
+from typing import Any, Tuple, Optional
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -29,103 +31,154 @@ from mcp.client.stdio import stdio_client
 from langchain_mcp_adapters.tools import load_mcp_tools
 
 from agents.state import AgentState
-from prompts.data_agent_prompt import DATA_AGENT_SYSTEM_PROMPT
+from prompts.data_agent_prompt import get_data_agent_prompt
 from config.settings import ANTHROPIC_API_KEY, DEFAULT_MODEL, PROJECT_ROOT
 
+
+# =============================================================================
+# LOGGING KONFIGURATION (DEC-016)
+# =============================================================================
+
+logger = logging.getLogger(__name__)
 
 # Pfad zum MCP Server
 MCP_SERVER_PATH = PROJECT_ROOT / "mcp_servers" / "thingsboard_server.py"
 
-# Debug-Modus
-DEBUG = False
+# Retry-Konfiguration
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 2  # Sekunden
 
 
 # =============================================================================
-# DATENVALIDIERUNG
+# MCP TOOLS PROVIDER (DEC-005, DEC-016)
+# =============================================================================
+
+class MCPToolsProvider:
+    """
+    Verwaltet MCP Tools mit Caching und sauberem Lifecycle.
+    
+    Vorteile gegenüber globalen Variablen:
+    - Testbar (kann gemockt werden)
+    - Klarer Lifecycle (init, cleanup)
+    - Thread-safe durch Lock
+    """
+    
+    def __init__(self, server_path: Path = MCP_SERVER_PATH):
+        self._tools: list | None = None
+        self._exit_stack: AsyncExitStack | None = None
+        self._lock = asyncio.Lock()
+        self._server_path = server_path
+    
+    async def get_tools(self) -> list:
+        """Holt MCP Tools - startet Server nur beim ersten Aufruf."""
+        # Schneller Check ohne Lock
+        if self._tools is not None:
+            logger.debug("MCP Tools aus Cache")
+            return self._tools
+        
+        # Mit Lock für Thread-Safety
+        async with self._lock:
+            # Double-Check nach Lock
+            if self._tools is not None:
+                return self._tools
+            
+            logger.info("Starte MCP Server (einmalig)...")
+            
+            server_params = StdioServerParameters(
+                command="python",
+                args=[str(self._server_path)],
+                env=None,
+            )
+            
+            self._exit_stack = AsyncExitStack()
+            
+            streams = await self._exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            read_stream, write_stream = streams
+            
+            session = await self._exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            await session.initialize()
+            
+            self._tools = await load_mcp_tools(session)
+            
+            logger.info(f"MCP Server gestartet, {len(self._tools)} Tools geladen")
+            
+            return self._tools
+    
+    async def cleanup(self):
+        """Räumt MCP Session auf."""
+        if self._exit_stack:
+            await self._exit_stack.aclose()
+            self._exit_stack = None
+        self._tools = None
+        logger.debug("MCP Session aufgeräumt")
+    
+    def is_initialized(self) -> bool:
+        """Prüft ob Tools geladen sind."""
+        return self._tools is not None
+
+
+# Globale Instanz (kann in Tests ersetzt werden)
+_mcp_provider = MCPToolsProvider()
+
+
+async def get_mcp_tools() -> list:
+    """Wrapper für Rückwärtskompatibilität."""
+    return await _mcp_provider.get_tools()
+
+
+async def cleanup_mcp():
+    """Wrapper für Rückwärtskompatibilität."""
+    await _mcp_provider.cleanup()
+
+
+# =============================================================================
+# HILFSFUNKTIONEN - DATENVALIDIERUNG
 # =============================================================================
 
 def is_error_value(value: Any) -> bool:
-    """
-    Prüft ob ein Wert eine Fehlermeldung ist statt eines gültigen Messwerts.
-    
-    Erkennt verschiedene Fehlermuster:
-    - "Bad status code: ..."
-    - "Error: ..."
-    - "null", "None", "NaN"
-    - OPC-UA Fehler
-    - Leere Strings
-    """
+    """Prüft ob ein Wert eine Fehlermeldung ist."""
     if value is None:
         return True
     
     if isinstance(value, (int, float)):
-        return False  # Numerisch = gültig
+        return False
     
     if isinstance(value, str):
         value_lower = value.lower().strip()
         
         if not value_lower:
-            return True  # Leerer String
+            return True
         
-        # Bekannte Fehlermuster
         error_patterns = [
-            "bad status",
-            "error",
-            "unavailable",
-            "null",
-            "nan",
-            "invalid",
-            "failed",
-            "timeout",
-            "exception",
-            "not found",
-            "no data",
-            "bad_",  # OPC-UA Status codes
-            "nodeid",
-            "statuscode",
+            "bad status", "error", "unavailable", "null", "nan",
+            "invalid", "failed", "timeout", "exception", "not found",
+            "no data", "bad_", "nodeid", "statuscode",
         ]
         
         for pattern in error_patterns:
             if pattern in value_lower:
                 return True
         
-        # Versuche als Zahl zu parsen
         try:
             float(value)
-            return False  # Ist eine Zahl
+            return False
         except (ValueError, TypeError):
-            # Kein Fehlermuster, aber auch keine Zahl - verdächtig
-            if len(value) > 50:  # Lange Strings sind meist Fehlermeldungen
+            if len(value) > 50:
                 return True
     
     return False
 
 
 def validate_data_quality(data: dict) -> dict:
-    """
-    Validiert die Datenqualität und gibt einen Report zurück.
-    
-    Args:
-        data: Dict mit Keys und Werten im ThingsBoard-Format
-        
-    Returns:
-        {
-            "valid": bool,
-            "total_points": int,
-            "valid_points": int,
-            "error_points": int,
-            "error_keys": ["key1", ...],
-            "error_sample": "Bad status code..."
-        }
-    """
+    """Validiert die Datenqualität und gibt Metriken zurück."""
     if not data or not isinstance(data, dict):
         return {
-            "valid": False,
-            "total_points": 0,
-            "valid_points": 0,
-            "error_points": 0,
-            "error_keys": [],
-            "error_sample": None,
+            "valid": False, "total_points": 0, "valid_points": 0,
+            "error_points": 0, "error_keys": [], "error_sample": None,
         }
     
     total = 0
@@ -136,7 +189,6 @@ def validate_data_quality(data: dict) -> dict:
     
     for key, values in data.items():
         if not isinstance(values, list):
-            # Einzelwert (latest)
             if isinstance(values, dict) and "value" in values:
                 total += 1
                 if is_error_value(values["value"]):
@@ -149,7 +201,6 @@ def validate_data_quality(data: dict) -> dict:
                     valid += 1
             continue
         
-        # Liste von Werten
         key_errors = 0
         for point in values:
             total += 1
@@ -169,7 +220,6 @@ def validate_data_quality(data: dict) -> dict:
         if key_errors > 0:
             error_keys.append(key)
     
-    # Daten sind gültig wenn mindestens 50% der Punkte ok sind
     is_valid = valid > 0 and (valid / max(total, 1)) >= 0.5
     
     return {
@@ -183,57 +233,12 @@ def validate_data_quality(data: dict) -> dict:
     }
 
 
-def debug_print(msg: str):
-    """Gibt Debug-Nachrichten aus wenn DEBUG=True."""
-    if DEBUG:
-        print(f"🔍 DEBUG: {msg}")
+# =============================================================================
+# HILFSFUNKTIONEN - PARSING
+# =============================================================================
 
-
-@asynccontextmanager
-async def mcp_client_context():
-    """Async Context Manager für MCP Client."""
-    server_params = StdioServerParameters(
-        command="python",
-        args=[str(MCP_SERVER_PATH)],
-        env=None,
-    )
-    
-    debug_print(f"Starte MCP Server: {MCP_SERVER_PATH}")
-    
-    async with stdio_client(server_params) as (read_stream, write_stream):
-        debug_print("stdio_client gestartet")
-        async with ClientSession(read_stream, write_stream) as session:
-            debug_print("ClientSession erstellt")
-            await session.initialize()
-            debug_print("Session initialisiert")
-            tools = await load_mcp_tools(session)
-            debug_print(f"Tools geladen: {[t.name for t in tools]}")
-            yield tools
-
-
-def create_data_agent(tools: list):
-    """Erstellt den Data Agent mit den gegebenen Tools."""
-    debug_print(f"Erstelle Agent mit Model: {DEFAULT_MODEL}")
-    
-    llm = ChatAnthropic(
-        model=DEFAULT_MODEL,
-        api_key=ANTHROPIC_API_KEY,
-        temperature=0,
-    )
-    
-    agent = create_react_agent(llm, tools)
-    
-    return agent
-
-
-def extract_text_from_tool_content(content: Any) -> str | None:
-    """
-    Extrahiert den Text aus ToolMessage.content.
-    
-    Content kann sein:
-    - String (direkt)
-    - Liste von Content-Blöcken: [{'type': 'text', 'text': '...'}]
-    """
+def extract_text_from_tool_content(content: Any) -> Optional[str]:
+    """Extrahiert Text aus ToolMessage.content (verschiedene Formate)."""
     if content is None:
         return None
     
@@ -253,8 +258,8 @@ def extract_text_from_tool_content(content: Any) -> str | None:
     return None
 
 
-def parse_json_safe(text: str) -> Any:
-    """Parst JSON sicher."""
+def parse_json_safe(text: str) -> Optional[Any]:
+    """Parst JSON sicher, gibt None bei Fehler zurück."""
     if not text:
         return None
     try:
@@ -263,64 +268,74 @@ def parse_json_safe(text: str) -> Any:
         return None
 
 
-def load_data_from_file(filepath: str) -> dict | None:
-    """
-    Lädt Daten aus einer JSON-Datei.
-    
-    Args:
-        filepath: Pfad zur JSON-Datei
-        
-    Returns:
-        Die geladenen Daten oder None bei Fehler
-    """
+def load_data_from_file(filepath: str) -> Optional[dict]:
+    """Lädt Daten aus einer JSON-Datei."""
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        debug_print(f"Fehler beim Laden von {filepath}: {e}")
+        logger.warning(f"Fehler beim Laden von {filepath}: {e}")
         return None
 
 
-def extract_data_from_parsed(parsed: Any) -> tuple[Any, dict | None, str | None]:
+def extract_data_from_parsed(
+    parsed: Any
+) -> Tuple[Optional[Any], Optional[dict], Optional[str]]:
     """
-    Extrahiert Daten aus geparstem Content.
+    Extrahiert Daten aus geparstem Tool-Response.
     
     Returns:
-        (data, meta, data_file_path)
+        Tuple von (data, meta, data_file)
     """
     if parsed is None:
         return None, None, None
     
-    # NO_DATA Response - WICHTIG: Muss zuerst geprüft werden!
-    # Format: {"status": "no_data", "message": "...", "requested_timerange": {...}}
+    # ERROR Response (DEC-009)
+    if isinstance(parsed, dict) and parsed.get("status") == "error":
+        logger.debug(f"ERROR erkannt: {parsed.get('message')}")
+        return None, {
+            "type": "error",
+            "message": parsed.get("message"),
+            "error_type": parsed.get("error_type"),
+            "details": parsed.get("details"),
+        }, None
+    
+    # NO_DATA Response
     if isinstance(parsed, dict) and parsed.get("status") == "no_data":
-        debug_print(f"NO_DATA erkannt: {parsed.get('message')}")
+        logger.debug(f"NO_DATA erkannt: {parsed.get('message')}")
         return None, {
             "type": "no_data",
             "message": parsed.get("message"),
             "requested_timerange": parsed.get("requested_timerange"),
             "hint": parsed.get("hint"),
+            "settings": parsed.get("settings"),
         }, None
     
     # DATA_AVAILABILITY Response
-    # Format: {"status": "data_available", "data_range": {...}, "message": "..."}
     if isinstance(parsed, dict) and parsed.get("status") == "data_available":
-        debug_print(f"DATA_AVAILABLE erkannt: {parsed.get('message')}")
-        data_range = parsed.get("data_range", {})
+        logger.debug(f"DATA_AVAILABLE erkannt: {parsed.get('message')}")
         return parsed, {
             "type": "data_availability",
-            "data_range": data_range,
+            "data_range": parsed.get("data_range", {}),
             "message": parsed.get("message"),
             "total_points": parsed.get("total_points"),
         }, None
     
+    # ERROR_TOO_MANY_DATAPOINTS Response (DEC-010)
+    if isinstance(parsed, dict) and parsed.get("status") == "error_too_many_datapoints":
+        logger.debug(f"TOO_MANY_DATAPOINTS: {parsed.get('message')}")
+        return None, {
+            "type": "error_datapoints",
+            "message": parsed.get("message"),
+            "suggestion": parsed.get("suggestion"),
+            "user_action": parsed.get("user_action"),
+        }, None
+    
     # SUCCESS Response mit data_file
-    # Format: {"status": "success", "statistics": {...}, "data_file": "/path/to/file.json", ...}
     if isinstance(parsed, dict) and parsed.get("status") == "success" and "data_file" in parsed:
         data_file = parsed.get("data_file")
-        debug_print(f"SUCCESS mit data_file: {data_file}")
+        logger.debug(f"SUCCESS mit data_file: {data_file}")
         
-        # Lade die echten Daten aus der Datei
         file_data = load_data_from_file(data_file)
         if file_data and "data" in file_data:
             data = file_data["data"]
@@ -329,30 +344,21 @@ def extract_data_from_parsed(parsed: Any) -> tuple[Any, dict | None, str | None]
                 "timerange": parsed.get("timerange") or file_data.get("timerange"),
                 "data_points": parsed.get("data_points"),
                 "statistics": parsed.get("statistics"),
-                "interval_ms": file_data.get("interval_ms"),
-                "aggregation": file_data.get("aggregation"),
+                "settings": parsed.get("settings"),
+                "settings_text": parsed.get("settings_text"),
+                "user_hint": parsed.get("user_hint"),
+                "keys": list(data.keys()) if isinstance(data, dict) else [],
             }
             return data, meta, data_file
     
-    # ALTES FORMAT (Fallback): Daten direkt in der Response
-    if isinstance(parsed, dict) and "data" in parsed and "data_points" in parsed:
-        return parsed["data"], {
-            "type": "success",
-            "timerange": parsed.get("timerange"),
-            "data_points": parsed.get("data_points"),
-            "interval_ms": parsed.get("interval_ms"),
-            "aggregation": parsed.get("aggregation"),
-        }, None
-    
     # get_latest_telemetry Response
-    # Format: {"axis_act_a1_deg": {"value": "13.82", "timestamp": 123}}
     if isinstance(parsed, dict) and parsed:
         first_key = next(iter(parsed.keys()), None)
         first_val = parsed.get(first_key) if first_key else None
         if isinstance(first_val, dict) and "value" in first_val:
             return parsed, {"type": "latest", "data_points": {k: 1 for k in parsed}}, None
     
-    # Liste (z.B. list_telemetry_keys, list_devices)
+    # Liste
     if isinstance(parsed, list):
         return parsed, {"type": "list", "count": len(parsed)}, None
     
@@ -363,10 +369,59 @@ def extract_data_from_parsed(parsed: Any) -> tuple[Any, dict | None, str | None]
     return None, None, None
 
 
-def generate_data_summary(data: Any, meta: dict | None, quality: dict | None = None) -> str:
-    """Generiert eine kurze Zusammenfassung der Daten inkl. Qualitätswarnung."""
+# =============================================================================
+# HILFSFUNKTIONEN - DATASET HANDLING
+# =============================================================================
+
+def determine_dataset_key(data: Optional[dict], meta: Optional[dict]) -> str:
+    """
+    Bestimmt einen eindeutigen Key für den Datensatz.
     
-    # ZUERST: Qualitätsproblem melden!
+    Beispiele:
+    - Drehmomente → "torque"
+    - Geschwindigkeit → "velocity"
+    """
+    if data is None:
+        return "unknown"
+    
+    if not isinstance(data, dict):
+        return "data"
+    
+    keys = list(data.keys())
+    if not keys:
+        return "empty"
+    
+    first_key = keys[0].lower()
+    
+    key_mapping = {
+        "torque": "torque",
+        "vel": "velocity",
+        "speed": "velocity",
+        "pos": "position",
+        "acc": "acceleration",
+        "temp": "temperature",
+        "current": "current",
+        "amp": "current",
+        "axis": "axis",
+        "energy": "energy",
+    }
+    
+    for pattern, name in key_mapping.items():
+        if pattern in first_key:
+            return name
+    
+    # Fallback: Ersten Key-Teil als Basis
+    return first_key.split("_")[0] if "_" in first_key else first_key[:10]
+
+
+def generate_data_summary(
+    data: Any, 
+    meta: Optional[dict], 
+    quality: Optional[dict] = None
+) -> str:
+    """Generiert eine kurze Zusammenfassung der Daten."""
+    
+    # Qualitätsproblem melden
     if quality and not quality.get("valid", True):
         error_pct = quality.get("error_percentage", 100)
         error_keys = quality.get("error_keys", [])
@@ -374,111 +429,98 @@ def generate_data_summary(data: Any, meta: dict | None, quality: dict | None = N
         total_pts = quality.get("total_points", 0)
         
         if error_pct >= 95:
-            # Fast alle Daten fehlerhaft
             keys_str = ", ".join(error_keys[:3])
-            return f"FEHLERHAFTE DATEN: Die Messwerte für {keys_str} enthalten ungültige Werte (OPC-UA/Sensor-Fehler). {error_pct:.0f}% der {total_pts} Datenpunkte sind fehlerhaft. Der Sensor liefert möglicherweise keine gültigen Daten."
+            return f"FEHLERHAFTE DATEN: {keys_str} ({error_pct:.0f}% fehlerhaft)"
         elif error_pct > 50:
-            # Mehr als die Hälfte fehlerhaft
-            return f"DATENQUALITÄT EINGESCHRÄNKT: {error_pct:.0f}% der Daten sind fehlerhaft. Nur {valid_pts} von {total_pts} Messwerten sind gültig."
+            return f"DATENQUALITÄT EINGESCHRÄNKT: {valid_pts}/{total_pts} gültig"
     
-    # NO_DATA - Klare Fehlermeldung!
+    # ERROR
+    if meta and meta.get("type") == "error":
+        return f"FEHLER: {meta.get('message', 'Unbekannter Fehler')}"
+    
+    # NO_DATA
     if meta and meta.get("type") == "no_data":
-        message = meta.get("message", "Keine Daten gefunden.")
-        timerange = meta.get("requested_timerange", {})
-        weekday = timerange.get("weekday", "")
-        start = timerange.get("start", "")
-        end = timerange.get("end", "")
-        
-        if weekday and start:
-            return f"KEINE DATEN: Für {weekday}, {start} bis {end} sind keine Daten verfügbar. Der Roboter war zu diesem Zeitpunkt möglicherweise nicht aktiv."
-        return f"KEINE DATEN: {message}"
+        return f"KEINE DATEN: {meta.get('message', 'Keine Daten gefunden')}"
     
-    # DATA_AVAILABILITY - Zeige verfügbaren Zeitraum
+    # DATA_AVAILABILITY
     if meta and meta.get("type") == "data_availability":
         data_range = meta.get("data_range", {})
-        first_data = data_range.get("first_data", "?")
-        first_weekday = data_range.get("first_weekday", "")
-        last_data = data_range.get("last_data", "?")
-        last_weekday = data_range.get("last_weekday", "")
-        total_points = meta.get("total_points", "?")
-        
-        return f"DATEN VERFÜGBAR: Von {first_weekday}, {first_data} bis {last_weekday}, {last_data} ({total_points} Datenpunkte in der letzten Woche)"
+        return f"VERFÜGBAR: {data_range.get('first_data', '?')} bis {data_range.get('last_data', '?')}"
+    
+    # ERROR_DATAPOINTS
+    if meta and meta.get("type") == "error_datapoints":
+        return f"ZU VIELE PUNKTE: {meta.get('message', '')}"
     
     if data is None:
-        return "Keine Daten erhalten."
+        return "Keine Daten"
     
-    # Statistiken vorhanden? Dann nutze diese für die Zusammenfassung
+    # Statistiken vorhanden
     if meta and meta.get("statistics"):
         stats = meta["statistics"]
+        keys = meta.get("keys", list(stats.keys())[:3])
+        
         summaries = []
-        for key, stat in stats.items():
+        for key in keys[:3]:
+            stat = stats.get(key, {})
             if isinstance(stat, dict):
-                avg = stat.get("avg", "?")
-                min_val = stat.get("min", "?")
-                max_val = stat.get("max", "?")
                 count = stat.get("count", "?")
-                summaries.append(f"{key}: Ø {avg} (min: {min_val}, max: {max_val}, {count} Punkte)")
+                summaries.append(f"{key}: {count} Punkte")
+        
         if summaries:
-            timerange = meta.get("timerange", {})
-            time_str = ""
-            weekday = ""
-            if isinstance(timerange, dict):
-                weekday = timerange.get("weekday", "")
-                start = timerange.get("start", "?")
-                end = timerange.get("end", "?")
-                time_str = f" am {weekday}, {start} bis {end}" if weekday else f" von {start} bis {end}"
-            return f"Daten{time_str}: " + "; ".join(summaries)
+            return "; ".join(summaries)
     
-    # Aktuellste Werte (get_latest_telemetry)
+    # Aktuellste Werte
     if meta and meta.get("type") == "latest":
-        summaries = []
-        for key, val in data.items():
-            if isinstance(val, dict) and "value" in val:
-                value = val.get('value')
-                weekday = val.get('weekday', '')
-                timestamp = val.get('timestamp_human', '')
-                if weekday and timestamp:
-                    summaries.append(f"{key}: {value} ({weekday}, {timestamp})")
-                else:
-                    summaries.append(f"{key}: {value}")
-        if summaries:
-            return f"Aktuelle Werte: {', '.join(summaries)}"
+        return f"Aktuelle Werte: {len(data)} Keys"
     
-    # Zeitreihen (get_telemetry, get_telemetry_aggregated)
-    if meta and meta.get("data_points"):
-        total_points = sum(meta["data_points"].values())
-        keys = list(meta["data_points"].keys())
-        agg = meta.get("aggregation", "")
-        agg_str = f" ({agg})" if agg else ""
-        return f"{total_points} Datenpunkte{agg_str} für {', '.join(keys)} geladen."
-    
-    # Listen
-    if meta and meta.get("type") == "list":
-        count = meta.get("count", len(data) if isinstance(data, list) else 0)
-        return f"{count} Einträge geladen."
-    
-    if isinstance(data, list):
-        return f"{len(data)} Einträge geladen."
-    
+    # Fallback
     if isinstance(data, dict):
-        return f"Daten mit {len(data)} Feldern abgerufen."
+        return f"{len(data)} Keys geladen"
     
-    return "Daten erfolgreich abgerufen."
+    return "Daten geladen"
 
 
-def detect_needs_user_input(messages: list) -> tuple[bool, str | None]:
-    """
-    Erkennt ob der Agent User-Input benötigt BEVOR er weitermachen kann.
+def format_existing_datasets_hint(datasets: dict[str, Any]) -> str:
+    """Formatiert einen Hinweis über bereits geladene Datasets für den Prompt."""
+    if not datasets:
+        return ""
     
-    WICHTIG: 
-    - Nur bei ECHTEN Stopp-Situationen True zurückgeben
-    - Höfliche Nachfragen am Ende erfolgreicher Analysen sind KEIN Stopp!
-    - False Positives vermeiden (z.B. Auflistungen in Analysen)
+    lines = ["## BEREITS GELADENE DATEN", ""]
+    lines.append("Folgende Datensätze sind bereits im State verfügbar:")
     
-    Returns:
-        (needs_input, reason)
-    """
-    # Finde letzte AI-Message
+    for key, dataset in datasets.items():
+        meta = dataset.get("meta", {})
+        data = dataset.get("data", {})
+        
+        num_keys = len(data) if isinstance(data, dict) else 0
+        data_keys = list(data.keys())[:5] if isinstance(data, dict) else []
+        timerange = meta.get("timerange", {})
+        
+        lines.append(f"")
+        lines.append(f"### {key}")
+        lines.append(f"- Keys: {', '.join(data_keys)}")
+        if timerange:
+            lines.append(f"- Zeitraum: {timerange.get('start', '?')} bis {timerange.get('end', '?')}")
+        if meta.get("statistics"):
+            stats = meta["statistics"]
+            first_stat = next(iter(stats.values()), {})
+            if isinstance(first_stat, dict):
+                lines.append(f"- Punkte pro Key: {first_stat.get('count', '?')}")
+    
+    lines.append("")
+    lines.append("Diese Daten müssen NICHT erneut geladen werden.")
+    lines.append("Für Vergleiche/Korrelationen: Lade nur die FEHLENDEN Daten.")
+    lines.append("")
+    
+    return "\n".join(lines)
+
+
+# =============================================================================
+# HILFSFUNKTIONEN - USER INPUT DETECTION
+# =============================================================================
+
+def detect_needs_user_input(messages: list) -> Tuple[bool, Optional[str]]:
+    """Erkennt ob der Agent auf User-Eingabe wartet."""
     last_ai_content = ""
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and isinstance(msg.content, str):
@@ -488,139 +530,257 @@ def detect_needs_user_input(messages: list) -> tuple[bool, str | None]:
     if not last_ai_content:
         return False, None
     
-    # Wenn Daten erfolgreich geladen wurden, ist es KEIN Stopp
     success_indicators = [
-        "erfolgreich",
-        "geladen",
-        "datenpunkte",
-        "hier ist",
-        "hier sind",
-        "zusammenfassung",
-        "analyse",
-        "statistik",
+        "erfolgreich", "geladen", "datenpunkte", "hier ist",
+        "hier sind", "zusammenfassung", "analyse", "statistik",
     ]
     
     has_success = any(ind in last_ai_content for ind in success_indicators)
     
-    # Patterns die auf ECHTEN Stopp hindeuten (User MUSS entscheiden)
     hard_stop_patterns = [
-        "keine daten für den zeitraum",
-        "keine daten gefunden",
-        "nicht verfügbar",
-        "konnte nicht gefunden werden",
-        "fehlgeschlagen",
-        "nicht möglich",
-        "was möchtest du tun?",  # Explizite Aufforderung zur Entscheidung
+        "keine daten für den zeitraum", "keine daten gefunden",
+        "nicht verfügbar", "konnte nicht gefunden werden",
+        "fehlgeschlagen", "nicht möglich", "was möchtest du tun?",
         "bitte wähle",
     ]
     
-    # Prüfe auf harten Stopp
     for pattern in hard_stop_patterns:
         if pattern in last_ai_content:
-            # Aber nur wenn es NICHT erfolgreich war!
             if not has_success:
                 return True, f"Agent stoppt wegen: '{pattern}'"
     
-    # Prüfe auf explizite Optionsliste MIT Stopp-Grund
-    has_option_list = ("1." in last_ai_content and "2." in last_ai_content and "3." in last_ai_content)
-    
+    # Option-Liste ohne Erfolg
+    has_option_list = ("1." in last_ai_content and "2." in last_ai_content)
     if has_option_list and not has_success:
-        # Checke ob es wirklich Entscheidungs-Optionen sind
-        option_words = ["verfügbar", "zeitraum", "prüfen", "angeben", "anzeigen"]
+        option_words = ["verfügbar", "zeitraum", "prüfen", "angeben"]
         if any(word in last_ai_content for word in option_words):
             return True, "Agent bietet Optionen nach Problem"
     
     return False, None
 
 
-async def run_data_agent(state: AgentState) -> dict[str, Any]:
-    """Führt den Data Agent aus."""
-    try:
-        debug_print("Starte run_data_agent")
+# =============================================================================
+# AGENT ERSTELLUNG
+# =============================================================================
+
+def create_data_agent(tools: list):
+    """Erstellt den Data Agent mit Claude."""
+    llm = ChatAnthropic(
+        model=DEFAULT_MODEL,
+        api_key=ANTHROPIC_API_KEY,
+        temperature=0,
+    )
+    return create_react_agent(llm, tools)
+
+
+# =============================================================================
+# HAUPTLOGIK - AUFGETEILT (DEC-016)
+# =============================================================================
+
+def prepare_messages(state: AgentState, existing_datasets: dict) -> list:
+    """
+    Bereitet Messages für den Agent vor.
+    
+    - Filtert SystemMessages (DEC-014)
+    - Fügt aktuellen Prompt hinzu
+    - Fügt Dataset-Hint hinzu wenn vorhanden
+    """
+    # Prompt generieren
+    current_prompt = get_data_agent_prompt()
+    
+    # Dataset-Hint hinzufügen wenn Daten vorhanden
+    if existing_datasets:
+        datasets_hint = format_existing_datasets_hint(existing_datasets)
+        current_prompt = current_prompt + "\n\n" + datasets_hint
+        logger.debug("Datasets-Hint zum Prompt hinzugefügt")
+    
+    # SystemMessages filtern (DEC-014)
+    filtered_messages = [
+        msg for msg in state["messages"]
+        if not isinstance(msg, SystemMessage)
+    ]
+    
+    return [SystemMessage(content=current_prompt), *filtered_messages]
+
+
+async def execute_agent_with_retry(agent, messages: list, max_retries: int = MAX_RETRIES) -> dict:
+    """
+    Führt Agent aus mit Retry bei transienten Fehlern.
+    
+    Retry bei:
+    - ConnectionError
+    - TimeoutError
+    - Rate Limit (429)
+    """
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            result = await agent.ainvoke({"messages": messages})
+            logger.debug(f"Agent erfolgreich (Versuch {attempt + 1})")
+            return result
+            
+        except (ConnectionError, TimeoutError) as e:
+            last_exception = e
+            delay = RETRY_DELAY_BASE * (2 ** attempt)  # Exponential backoff
+            logger.warning(f"Transienter Fehler (Versuch {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                logger.info(f"Warte {delay}s vor Retry...")
+                await asyncio.sleep(delay)
         
-        async with mcp_client_context() as tools:
-            debug_print("MCP Context aktiv")
-            
-            agent = create_data_agent(tools)
-            debug_print("Agent erstellt, starte Ausführung...")
-            
-            messages_with_system = [
-                SystemMessage(content=DATA_AGENT_SYSTEM_PROMPT),
-                *state["messages"]
-            ]
-            
-            result = await agent.ainvoke({"messages": messages_with_system})
-            debug_print(f"Agent fertig, {len(result.get('messages', []))} Messages")
-            
-            data = None
-            meta = None
-            data_file = None
-            
-            # Durchsuche alle Messages nach Tool-Ergebnissen
-            for msg in result.get("messages", []):
-                msg_type = type(msg).__name__
-                debug_print(f"Message type: {msg_type}")
+        except Exception as e:
+            # Nicht-transiente Fehler sofort werfen
+            error_str = str(e).lower()
+            if "429" in error_str or "rate limit" in error_str:
+                last_exception = e
+                delay = RETRY_DELAY_BASE * (2 ** attempt)
+                logger.warning(f"Rate Limit (Versuch {attempt + 1}/{max_retries})")
                 
-                if isinstance(msg, ToolMessage):
-                    text_content = extract_text_from_tool_content(msg.content)
-                    debug_print(f"Extracted text: {text_content[:300] if text_content else 'None'}...")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(delay)
+            else:
+                raise
+    
+    # Alle Retries fehlgeschlagen
+    raise last_exception or Exception("Agent execution failed after retries")
+
+
+def extract_tool_results(
+    result: dict
+) -> Tuple[Optional[Any], Optional[dict], Optional[str]]:
+    """
+    Extrahiert Daten aus Agent-Ergebnis.
+    
+    Durchsucht alle ToolMessages und extrahiert die relevantesten Daten.
+    """
+    data = None
+    meta = None
+    data_file = None
+    
+    for msg in result.get("messages", []):
+        if isinstance(msg, ToolMessage):
+            text_content = extract_text_from_tool_content(msg.content)
+            
+            if text_content:
+                parsed = parse_json_safe(text_content)
+                
+                if parsed is not None:
+                    extracted_data, extracted_meta, extracted_file = extract_data_from_parsed(parsed)
                     
-                    if text_content:
-                        parsed = parse_json_safe(text_content)
-                        debug_print(f"Parsed type: {type(parsed)}")
+                    if extracted_data is not None:
+                        # Priorisiere Ergebnisse mit Statistiken
+                        current_is_list = meta and meta.get("type") == "list"
+                        new_has_stats = extracted_meta and extracted_meta.get("statistics")
+                        new_is_not_list = extracted_meta and extracted_meta.get("type") != "list"
                         
-                        if parsed is not None:
-                            extracted_data, extracted_meta, extracted_file = extract_data_from_parsed(parsed)
-                            
-                            if extracted_data is not None:
-                                # Priorisiere Daten mit Statistiken über Listen
-                                current_is_list = meta and meta.get("type") == "list"
-                                new_has_stats = extracted_meta and extracted_meta.get("statistics")
-                                new_is_not_list = extracted_meta and extracted_meta.get("type") != "list"
-                                
-                                if data is None or (current_is_list and new_is_not_list) or new_has_stats:
-                                    data = extracted_data
-                                    meta = extracted_meta
-                                    data_file = extracted_file
-                                    debug_print(f"Daten extrahiert: meta keys={list(meta.keys()) if meta else None}, file={data_file}")
-            
-            # Datenqualität prüfen
-            quality = None
-            if data and isinstance(data, dict):
-                quality = validate_data_quality(data)
-                debug_print(f"Datenqualität: valid={quality['valid']}, errors={quality['error_percentage']}%")
-                
-                # Qualitätsdaten in meta speichern
-                if meta:
-                    meta["quality"] = quality
-            
-            # Summary generieren (mit Qualitätsinfo)
-            summary = generate_data_summary(data, meta, quality)
-            debug_print(f"Summary: {summary}")
-            
-            # Prüfen ob User-Input benötigt wird
-            needs_input, input_reason = detect_needs_user_input(result.get("messages", []))
-            debug_print(f"needs_user_input: {needs_input}, reason: {input_reason}")
-            
-            return {
-                "messages": result.get("messages", []),
-                "data": data,
-                "data_meta": meta,
-                "data_summary": summary,
-                "needs_user_input": needs_input,
-                "user_input_reason": input_reason,
-            }
+                        if data is None or (current_is_list and new_is_not_list) or new_has_stats:
+                            data = extracted_data
+                            meta = extracted_meta
+                            data_file = extracted_file
+    
+    return data, meta, data_file
+
+
+def build_result(
+    result: dict,
+    data: Optional[Any],
+    meta: Optional[dict],
+    data_file: Optional[str],
+    quality: Optional[dict],
+    needs_input: bool,
+    input_reason: Optional[str]
+) -> dict[str, Any]:
+    """Baut das Ergebnis-Dictionary zusammen."""
+    
+    summary = generate_data_summary(data, meta, quality)
+    logger.info(f"Summary: {summary}")
+    
+    # Dataset unter Key speichern
+    new_datasets = {}
+    if data is not None and isinstance(data, dict):
+        dataset_key = determine_dataset_key(data, meta)
+        new_datasets[dataset_key] = {
+            "data": data,
+            "meta": meta,
+            "data_file": data_file,
+        }
+        logger.debug(f"Neuer Datensatz unter Key '{dataset_key}'")
+    
+    return {
+        "messages": result.get("messages", []),
+        "datasets": new_datasets,
+        "data_summary": summary,
+        "current_data_file": data_file,
+        "needs_user_input": needs_input,
+        "user_input_reason": input_reason,
+    }
+
+
+def build_error_result(error: Exception) -> dict[str, Any]:
+    """Baut Fehler-Ergebnis."""
+    error_msg = f"Fehler beim Datenabruf: {str(error)}"
+    logger.error(error_msg, exc_info=True)
+    
+    return {
+        "messages": [AIMessage(content=error_msg)],
+        "error": error_msg,
+    }
+
+
+# =============================================================================
+# HAUPTFUNKTION
+# =============================================================================
+
+async def run_data_agent(state: AgentState) -> dict[str, Any]:
+    """
+    Führt den Data Agent aus.
+    
+    Orchestriert die einzelnen Schritte:
+    1. Vorbereitung (Tools, Messages)
+    2. Ausführung (mit Retry)
+    3. Verarbeitung (Parsing, Validierung)
+    4. Ergebnis (Summary, Datasets)
+    """
+    try:
+        logger.debug("Starte run_data_agent")
+        
+        # 1. Vorhandene Datasets aus State
+        existing_datasets = state.get("datasets", {}) or {}
+        logger.debug(f"Vorhandene Datasets: {list(existing_datasets.keys())}")
+        
+        # 2. MCP Tools holen
+        tools = await get_mcp_tools()
+        logger.debug(f"Tools bereit: {len(tools)}")
+        
+        # 3. Agent erstellen
+        agent = create_data_agent(tools)
+        
+        # 4. Messages vorbereiten
+        messages = prepare_messages(state, existing_datasets)
+        
+        # 5. Agent ausführen (mit Retry)
+        result = await execute_agent_with_retry(agent, messages)
+        logger.debug(f"Agent fertig, {len(result.get('messages', []))} Messages")
+        
+        # 6. Tool-Ergebnisse extrahieren
+        data, meta, data_file = extract_tool_results(result)
+        
+        # 7. Datenqualität prüfen
+        quality = None
+        if data and isinstance(data, dict):
+            quality = validate_data_quality(data)
+            if meta:
+                meta["quality"] = quality
+        
+        # 8. User-Input-Bedarf prüfen
+        needs_input, input_reason = detect_needs_user_input(result.get("messages", []))
+        
+        # 9. Ergebnis zusammenstellen
+        return build_result(result, data, meta, data_file, quality, needs_input, input_reason)
         
     except Exception as e:
-        error_details = traceback.format_exc()
-        if DEBUG:
-            print(f"\n❌ FEHLER DETAILS:\n{error_details}")
-        
-        error_msg = f"Fehler beim Datenabruf: {str(e)}"
-        return {
-            "messages": [AIMessage(content=error_msg)],
-            "error": error_msg,
-        }
+        return build_error_result(e)
 
 
 async def data_agent_node(state: AgentState) -> dict[str, Any]:
@@ -633,12 +793,17 @@ async def data_agent_node(state: AgentState) -> dict[str, Any]:
 # =============================================================================
 
 async def test_data_agent():
-    """Test des Data Agents mit verschiedenen Queries."""
+    """Test des Data Agents."""
+    
+    # Logging für Test konfigurieren
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
     
     test_queries = [
         "Wie ist die aktuelle Position von Achse 1?",
         "Zeig mir den Verlauf der Bahngeschwindigkeit der letzten 10 Minuten",
-        "Welche Telemetrie-Keys sind verfügbar?",
     ]
     
     for query in test_queries:
@@ -653,74 +818,19 @@ async def test_data_agent():
         result = await run_data_agent(state)
         
         print(f"\n📊 Data Summary: {result.get('data_summary', 'N/A')}")
-        
-        if result.get("data_meta"):
-            print(f"📈 Meta: {result['data_meta']}")
-        
-        if result.get("data"):
-            data = result["data"]
-            if isinstance(data, dict):
-                print(f"📁 Data keys: {list(data.keys())}")
-                for key in list(data.keys())[:2]:
-                    vals = data[key]
-                    if isinstance(vals, list) and len(vals) > 0:
-                        print(f"   {key}: {len(vals)} Einträge, erster: {vals[0]}")
+        print(f"📁 Datasets: {list(result.get('datasets', {}).keys())}")
         
         if result.get("error"):
             print(f"❌ Error: {result['error']}")
         
-        # Letzte AI-Message anzeigen
         for msg in reversed(result.get("messages", [])):
             if isinstance(msg, AIMessage) and isinstance(msg.content, str):
                 print(f"\n🤖 Agent: {msg.content[:500]}")
                 break
-        
-        print()
-
-
-async def interactive_test():
-    """Interaktiver Test mit eigenen Queries."""
-    print("\n" + "="*60)
-    print("🤖 Data Agent Interactive Test")
-    print("="*60)
-    print("Gib eine Frage ein (oder 'quit' zum Beenden):\n")
     
-    while True:
-        query = input("📝 Query: ").strip()
-        
-        if query.lower() in ["quit", "exit", "q"]:
-            break
-        
-        if not query:
-            continue
-        
-        state = AgentState(
-            messages=[HumanMessage(content=query)]
-        )
-        
-        print("\n⏳ Verarbeite...")
-        result = await run_data_agent(state)
-        
-        print(f"\n📊 Data Summary: {result.get('data_summary', 'N/A')}")
-        
-        if result.get("data_meta"):
-            print(f"📈 Meta: {result['data_meta']}")
-        
-        if result.get("error"):
-            print(f"❌ Error: {result['error']}")
-        
-        for msg in reversed(result.get("messages", [])):
-            if isinstance(msg, AIMessage) and isinstance(msg.content, str):
-                print(f"\n🤖 Agent: {msg.content}")
-                break
-        
-        print("\n" + "-"*40)
+    # Cleanup
+    await cleanup_mcp()
 
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "--interactive":
-        asyncio.run(interactive_test())
-    else:
-        asyncio.run(test_data_agent())
+    asyncio.run(test_data_agent())

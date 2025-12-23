@@ -17,7 +17,7 @@ import pytest
 import asyncio
 
 # Integration Tests brauchen ThingsBoard
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 
 # =============================================================================
@@ -27,6 +27,11 @@ pytestmark = pytest.mark.integration
 @pytest.mark.asyncio
 class TestDataAgentHappyPath:
     """Happy Path Tests für Data Agent."""
+    
+    @pytest.fixture(autouse=True)
+    async def setup_cleanup(self, cleanup_mcp_after_test):
+        """Nutzt die Cleanup-Fixture für jeden Test."""
+        pass
     
     async def test_get_latest_telemetry(self):
         """Testet Abruf aktueller Werte."""
@@ -94,6 +99,11 @@ class TestDataAgentHappyPath:
 class TestDataVizPipeline:
     """Tests für Data → Viz Pipeline."""
     
+    @pytest.fixture(autouse=True)
+    async def setup_cleanup(self, cleanup_mcp_after_test):
+        """Nutzt die Cleanup-Fixture für jeden Test."""
+        pass
+    
     async def test_data_to_viz_with_known_data(self):
         """
         Testet Pipeline mit bekanntem Daten-Zeitraum.
@@ -138,6 +148,11 @@ class TestDataVizPipeline:
 @pytest.mark.asyncio
 class TestFullGraphHappyPath:
     """Tests für den kompletten Graph."""
+    
+    @pytest.fixture(autouse=True)
+    async def setup_cleanup(self, cleanup_mcp_after_test):
+        """Nutzt die Cleanup-Fixture für jeden Test."""
+        pass
     
     async def test_simple_data_query(self):
         """Testet einfache Datenabfrage durch Graph."""
