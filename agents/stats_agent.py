@@ -24,7 +24,7 @@ import json
 import asyncio
 import logging
 from typing import Any, Optional
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, AsyncExitStack
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -38,7 +38,7 @@ from agents.utils import (
     extract_user_query,
 )
 from prompts.stats_agent_prompt import STATS_AGENT_SYSTEM_PROMPT
-from config.settings import ANTHROPIC_API_KEY, DEFAULT_MODEL, PROJECT_ROOT as CONFIG_PROJECT_ROOT
+from config.settings import DEFAULT_MODEL, PROJECT_ROOT as CONFIG_PROJECT_ROOT, api_key_rotator, create_anthropic_client
 
 # Direkte Stats-Funktionen als Fallback
 from tools.stats_functions import (
@@ -69,37 +69,92 @@ MCP_TIMEOUT = 30
 
 
 # =============================================================================
-# MCP CLIENT (mit Timeout)
+# MCP TOOLS PROVIDER (DEC-005 - Persistent Session)
 # =============================================================================
 
-@asynccontextmanager
-async def stats_mcp_client_context():
-    """Async Context Manager für Stats MCP Client mit Timeout."""
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
-    from langchain_mcp_adapters.tools import load_mcp_tools
-    
-    server_params = StdioServerParameters(
-        command="python",
-        args=[str(STATS_MCP_SERVER_PATH)],
-        env=None,
-    )
-    
-    logger.debug(f"Starte Stats MCP Server: {STATS_MCP_SERVER_PATH}")
-    
-    try:
-        async with stdio_client(server_params) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                await asyncio.wait_for(session.initialize(), timeout=MCP_TIMEOUT)
-                tools = await asyncio.wait_for(load_mcp_tools(session), timeout=MCP_TIMEOUT)
-                logger.debug(f"Stats MCP Tools geladen: {[t.name for t in tools]}")
-                yield tools
-    except asyncio.TimeoutError:
-        logger.warning("Stats MCP Client Timeout")
-        raise
-    except Exception as e:
-        logger.warning(f"Stats MCP Client Error: {e}")
-        raise
+class StatsMCPToolsProvider:
+    """
+    Verwaltet Stats MCP Tools mit Caching und sauberem Lifecycle.
+
+    Gleiche Pattern wie MCPToolsProvider in data_agent.py:
+    - Server wird EINMAL gestartet und wiederverwendet
+    - Spart 1-3 Sekunden pro Stats-Aufruf
+    """
+
+    def __init__(self, server_path: Path = STATS_MCP_SERVER_PATH):
+        self._tools: list | None = None
+        self._exit_stack: AsyncExitStack | None = None
+        self._lock = asyncio.Lock()
+        self._server_path = server_path
+
+    async def get_tools(self) -> list:
+        """Holt Stats MCP Tools - startet Server nur beim ersten Aufruf."""
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        from langchain_mcp_adapters.tools import load_mcp_tools
+
+        # Schneller Check ohne Lock
+        if self._tools is not None:
+            logger.debug("Stats MCP Tools aus Cache")
+            return self._tools
+
+        # Mit Lock für Thread-Safety
+        async with self._lock:
+            # Double-Check nach Lock
+            if self._tools is not None:
+                return self._tools
+
+            logger.info("Starte Stats MCP Server (einmalig)...")
+
+            server_params = StdioServerParameters(
+                command="python",
+                args=[str(self._server_path)],
+                env=None,
+            )
+
+            self._exit_stack = AsyncExitStack()
+
+            streams = await self._exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            read_stream, write_stream = streams
+
+            session = await self._exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            await asyncio.wait_for(session.initialize(), timeout=MCP_TIMEOUT)
+
+            self._tools = await asyncio.wait_for(load_mcp_tools(session), timeout=MCP_TIMEOUT)
+
+            logger.info(f"Stats MCP Server gestartet, {len(self._tools)} Tools geladen")
+
+            return self._tools
+
+    async def cleanup(self):
+        """Räumt MCP Session auf."""
+        if self._exit_stack:
+            await self._exit_stack.aclose()
+            self._exit_stack = None
+        self._tools = None
+        logger.debug("Stats MCP Session aufgeräumt")
+
+    def is_initialized(self) -> bool:
+        """Prüft ob Tools geladen sind."""
+        return self._tools is not None
+
+
+# Globale Instanz (kann in Tests ersetzt werden)
+_stats_mcp_provider = StatsMCPToolsProvider()
+
+
+async def get_stats_mcp_tools() -> list:
+    """Wrapper für Warmup und Rückwärtskompatibilität."""
+    return await _stats_mcp_provider.get_tools()
+
+
+async def cleanup_stats_mcp():
+    """Wrapper für Cleanup."""
+    await _stats_mcp_provider.cleanup()
 
 
 # =============================================================================
@@ -107,12 +162,8 @@ async def stats_mcp_client_context():
 # =============================================================================
 
 def create_stats_agent(tools: list):
-    """Erstellt den Stats Agent."""
-    llm = ChatAnthropic(
-        model=DEFAULT_MODEL,
-        api_key=ANTHROPIC_API_KEY,
-        temperature=0,
-    )
+    """Erstellt den Stats Agent mit aktuellem API Key (DEC-018)."""
+    llm = create_anthropic_client()
     return create_react_agent(llm, tools)
 
 
@@ -331,41 +382,41 @@ def compute_stats_directly(state: AgentState, query: str) -> dict[str, Any]:
 # =============================================================================
 
 async def run_stats_agent_with_mcp(state: AgentState) -> dict[str, Any]:
-    """Führt den Stats Agent mit MCP Server aus."""
-    async with stats_mcp_client_context() as tools:
-        logger.debug("Stats MCP Context aktiv")
-        
-        agent = create_stats_agent(tools)
-        data_context = prepare_stats_context(state)
-        
-        system_content = f"{STATS_AGENT_SYSTEM_PROMPT}\n\n## AKTUELLE DATEN\n\n{data_context}"
-        
-        # SystemMessages filtern (DEC-014)
-        filtered_messages = [
-            msg for msg in state["messages"]
-            if not isinstance(msg, SystemMessage)
-        ]
-        
-        messages_with_system = [
-            SystemMessage(content=system_content),
-            *filtered_messages
-        ]
-        
-        logger.debug("Starte Agent-Ausführung...")
-        result = await asyncio.wait_for(
-            agent.ainvoke({"messages": messages_with_system}),
-            timeout=60
-        )
-        logger.debug(f"Agent fertig, {len(result.get('messages', []))} Messages")
-        
-        statistics = extract_statistics_from_messages(result.get("messages", []))
-        stats_summary = generate_statistics_summary(statistics)
-        
-        return {
-            "messages": result.get("messages", []),
-            "statistics": statistics,
-            "statistics_summary": stats_summary,
-        }
+    """Führt den Stats Agent mit MCP Server aus (nutzt gecachte Session)."""
+    tools = await get_stats_mcp_tools()
+    logger.debug(f"Stats MCP Tools bereit: {len(tools)} Tools")
+
+    agent = create_stats_agent(tools)
+    data_context = prepare_stats_context(state)
+
+    system_content = f"{STATS_AGENT_SYSTEM_PROMPT}\n\n## AKTUELLE DATEN\n\n{data_context}"
+
+    # SystemMessages filtern (DEC-014)
+    filtered_messages = [
+        msg for msg in state["messages"]
+        if not isinstance(msg, SystemMessage)
+    ]
+
+    messages_with_system = [
+        SystemMessage(content=system_content),
+        *filtered_messages
+    ]
+
+    logger.debug("Starte Agent-Ausführung...")
+    result = await asyncio.wait_for(
+        agent.ainvoke({"messages": messages_with_system}),
+        timeout=60
+    )
+    logger.debug(f"Agent fertig, {len(result.get('messages', []))} Messages")
+
+    statistics = extract_statistics_from_messages(result.get("messages", []))
+    stats_summary = generate_statistics_summary(statistics)
+
+    return {
+        "messages": result.get("messages", []),
+        "statistics": statistics,
+        "statistics_summary": stats_summary,
+    }
 
 
 async def execute_stats_with_retry(state: AgentState, max_retries: int = MAX_RETRIES) -> Optional[dict]:

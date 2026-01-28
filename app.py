@@ -23,6 +23,7 @@ from chainlit import Message, Image, Text
 from agents.graph import run_query
 from agents.data_agent import get_mcp_tools
 from agents.viz_agent import get_antv_tools
+from agents.stats_agent import get_stats_mcp_tools
 
 
 # =============================================================================
@@ -47,14 +48,16 @@ async def on_chat_start():
     ).send()
     
     try:
-        # Beide MCP Server parallel starten
+        # Alle 3 MCP Server parallel starten
         print("🔄 Starte MCP Server Warmup...")
-        mcp_tools, antv_tools = await asyncio.gather(
-            get_mcp_tools(),      # ThingsBoard MCP Server
-            get_antv_tools(),     # AntV Chart MCP Server
+        mcp_tools, antv_tools, stats_tools = await asyncio.gather(
+            get_mcp_tools(),         # ThingsBoard MCP Server
+            get_antv_tools(),        # AntV Chart MCP Server
+            get_stats_mcp_tools(),   # Stats MCP Server
         )
         print(f"✅ ThingsBoard Tools: {len(mcp_tools)}")
         print(f"✅ AntV Tools: {len(antv_tools)}")
+        print(f"✅ Stats Tools: {len(stats_tools)}")
         
         # Init-Nachricht aktualisieren
         await init_msg.remove()
