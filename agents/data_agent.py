@@ -8,6 +8,7 @@ DESIGN-ENTSCHEIDUNGEN:
 - DEC-013: Datasets werden über Turns akkumuliert (nicht überschrieben)
 - DEC-014: SystemMessages aus State filtern
 - DEC-016: Strukturiertes Logging, Retry-Mechanismus, Funktionsaufteilung
+- DEC-023: Data Retrieval Mode (raw vs aggregated) aus State lesen
 """
 
 import sys
@@ -600,9 +601,14 @@ def prepare_messages(state: AgentState, existing_datasets: dict) -> list:
     - Filtert SystemMessages (DEC-014)
     - Fügt aktuellen Prompt hinzu (DEC-021: mit cache_control)
     - Fügt Dataset-Hint hinzu wenn vorhanden
+    - DEC-023: Übergibt data_retrieval_mode an den Prompt
     """
-    # Prompt generieren
-    current_prompt = get_data_agent_prompt()
+    # DEC-023: Data Mode aus State lesen
+    data_mode = state.get("data_retrieval_mode", "aggregated")
+    logger.debug(f"Data Retrieval Mode: {data_mode}")
+
+    # Prompt generieren mit data_mode
+    current_prompt = get_data_agent_prompt(data_mode=data_mode)
 
     # Dataset-Hint hinzufügen wenn Daten vorhanden
     if existing_datasets:

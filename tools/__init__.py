@@ -8,7 +8,7 @@ from tools.stats_functions import (
     calculate_mean,
     calculate_std,
     calculate_min_max,
-    calculate_correlation,
+    calculate_correlation_timeseries,  # DEC-024
     calculate_linear_trend,
     calculate_moving_average,
     calculate_percentiles,
@@ -21,7 +21,7 @@ __all__ = [
     "calculate_mean",
     "calculate_std",
     "calculate_min_max",
-    "calculate_correlation",
+    "calculate_correlation_timeseries",
     "calculate_linear_trend",
     "calculate_moving_average",
     "calculate_percentiles",

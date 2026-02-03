@@ -1,0 +1,98 @@
+{
+  "$schema": "telemetry_lookup_v1",
+  "version": "1.0.0",
+  "description": "Komprimierter Lookup-Index für search_telemetry_keys. Generiert aus krc5_telemetry_catalog.json.",
+  
+  "groups": {
+    "axis_position": {
+      "name": "Achspositionen (Soll)",
+      "aliases": ["position", "achsposition", "gelenkwinkel", "stellung", "achswinkel", "roboterposition", "gelenk", "sollposition"],
+      "unit": "°",
+      "keys": ["axis_act_a1_deg", "axis_act_a2_deg", "axis_act_a3_deg", "axis_act_a4_deg", "axis_act_a5_deg", "axis_act_a6_deg"],
+      "description": "Soll-Achswinkel A1-A6 ($AXIS_ACT)"
+    },
+    "axis_position_measured": {
+      "name": "Achspositionen (Ist/Gemessen)",
+      "aliases": ["istposition", "gemessene position", "messwert", "tatsächliche position", "encoderposition", "ist-achswinkel"],
+      "unit": "°",
+      "keys": ["axis_meas_a1_deg", "axis_meas_a2_deg", "axis_meas_a3_deg", "axis_meas_a4_deg", "axis_meas_a5_deg", "axis_meas_a6_deg"],
+      "description": "Ist-Achswinkel vom Encoder ($AXIS_ACT_MEAS)"
+    },
+    "cartesian_position": {
+      "name": "Kartesische TCP-Position",
+      "aliases": ["tcp", "werkzeugposition", "kartesisch", "xyz", "raumposition", "endeffektorposition", "koordinaten", "tool center point"],
+      "unit": "mm/°",
+      "keys": ["pos_act_x_mm", "pos_act_y_mm", "pos_act_z_mm", "pos_act_a_deg", "pos_act_b_deg", "pos_act_c_deg"],
+      "description": "TCP-Position X/Y/Z + Orientierung A/B/C ($POS_ACT)"
+    },
+    "torque_actual": {
+      "name": "Ist-Drehmomente",
+      "aliases": ["moment", "drehmoment", "kraft", "last", "torque", "belastung", "antriebsmoment", "istmoment"],
+      "unit": "Nm",
+      "keys": ["torque_act_a1_nm", "torque_act_a2_nm", "torque_act_a3_nm", "torque_act_a4_nm", "torque_act_a5_nm", "torque_act_a6_nm"],
+      "description": "Ist-Drehmomente A1-A6 ($TORQUE_AXIS_ACT)"
+    },
+    "torque_commanded": {
+      "name": "Soll-Drehmomente",
+      "aliases": ["sollmoment", "kommandiertes moment", "zielmoment", "regelgröße"],
+      "unit": "Nm",
+      "keys": ["torque_cmd_a1_nm", "torque_cmd_a2_nm", "torque_cmd_a3_nm", "torque_cmd_a4_nm", "torque_cmd_a5_nm", "torque_cmd_a6_nm"],
+      "description": "Soll-Drehmomente A1-A6 ($TORQUE_AXIS_CMD)"
+    },
+    "torque_monitoring": {
+      "name": "Momentenüberwachung",
+      "aliases": ["kollision", "überwachung", "toleranz", "kraftüberwachung", "kollisionserkennung"],
+      "unit": "%",
+      "keys": ["torqmon_a1_pct", "torqmon_a2_pct", "torqmon_a3_pct", "torqmon_a4_pct", "torqmon_a5_pct", "torqmon_a6_pct"],
+      "description": "Momentenüberwachung/Kollisionserkennung ($TORQMON)"
+    },
+    "velocity_tcp": {
+      "name": "Bahngeschwindigkeit TCP",
+      "aliases": ["geschwindigkeit", "speed", "tempo", "velocity", "tcp-geschwindigkeit", "bahngeschwindigkeit", "fahrgeschwindigkeit"],
+      "unit": "m/s",
+      "keys": ["vel_act_m_per_s"],
+      "description": "TCP-Bahngeschwindigkeit ($VEL_ACT)"
+    },
+    "velocity_axis": {
+      "name": "Achsgeschwindigkeiten",
+      "aliases": ["achsgeschwindigkeit", "drehzahl", "rotationsgeschwindigkeit", "motordrehzahl"],
+      "unit": "%",
+      "keys": ["vel_axis_a1_pct", "vel_axis_a2_pct", "vel_axis_a3_pct", "vel_axis_a4_pct", "vel_axis_a5_pct", "vel_axis_a6_pct"],
+      "description": "Achsgeschwindigkeiten in % der Max-Drehzahl ($VEL_AXIS_ACT)"
+    },
+    "acceleration_tcp": {
+      "name": "TCP-Beschleunigung",
+      "aliases": ["beschleunigung", "acceleration", "tcp-beschleunigung"],
+      "unit": "m/s² / °/s²",
+      "keys": ["acc_cp_m_per_s2", "acc_ori1_deg_per_s2", "acc_ori2_deg_per_s2"],
+      "description": "TCP-Beschleunigung: Bahn + Orientierung ($ACC_C)"
+    },
+    "acceleration_axis": {
+      "name": "Achsbeschleunigungen",
+      "aliases": ["achsbeschleunigung"],
+      "unit": "%",
+      "keys": ["acc_axis_a1_pct", "acc_axis_a2_pct", "acc_axis_a3_pct", "acc_axis_a4_pct", "acc_axis_a5_pct", "acc_axis_a6_pct"],
+      "description": "Achsbeschleunigungen in % ($ACC_AXIS_C)"
+    },
+    "energy": {
+      "name": "Energieverbrauch",
+      "aliases": ["energie", "verbrauch", "strom", "leistung", "kwh", "energiekosten", "stromverbrauch"],
+      "unit": "kWh",
+      "keys": ["energy_period_kwh"],
+      "description": "Energieverbrauch letzte 60 Min ($ENERGY_PERIOD)"
+    },
+    "utilization": {
+      "name": "Momentanbelastung",
+      "aliases": ["auslastung", "belastung", "nutzung", "getriebebelastung"],
+      "unit": "%",
+      "keys": ["utilization_current", "utilization_moving_max"],
+      "description": "Momentanbelastung aller Achsen ($UTILIZATION)"
+    },
+    "program_state": {
+      "name": "Programmzustand",
+      "aliases": ["status", "programm", "override", "zustand", "programmstatus"],
+      "keys": ["pro_state", "override_pct"],
+      "description": "Programmstatus + Override ($PRO_STATE, $OV_PRO)"
+    }
+  }
+}

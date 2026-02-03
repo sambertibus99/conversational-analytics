@@ -1,0 +1,427 @@
+{
+  "$schema": "telemetry_catalog_v1",
+  "version": "1.0.0",
+  "device_type": "KUKA KRC5",
+  "device_profile": "KUKA_Robot",
+  "source": "KUKA System Software 8.7 - Expert Documentation Systemvariablen (KSS 8.7 System variables V1, Stand: 19.05.2022)",
+  
+  "groups": {
+    "axis_position": {
+      "name": "Achspositionen (Soll)",
+      "kuka_variable": "$AXIS_ACT",
+      "description": "Aktuelle achsspezifische Sollposition des Roboters. Die Variable vom Strukturtyp E6AXIS enthält die aktuellen Achswinkel. A1 bis A6 sind die Sollpositionen der Roboterachsen. Im Roboterprogramm löst die Variable einen Vorlaufstopp aus.",
+      "aliases": ["Position", "Achsposition", "Gelenkwinkel", "Stellung", "Achswinkel", "Roboterposition", "Gelenk", "Sollposition"],
+      "unit": "°",
+      "unit_long": "Grad",
+      "data_type": "REAL",
+      "read_only": true,
+      "sample_rate_ms": 100,
+      "keys": {
+        "axis_act_a1_deg": {
+          "description": "Sollposition der Roboterachse A1 (Karussell/Basis-Rotation). Die erste Achse dreht den gesamten Roboterarm horizontal um die Basis.",
+          "axis_name": "A1",
+          "axis_function": "Karussell / Basis-Drehung"
+        },
+        "axis_act_a2_deg": {
+          "description": "Sollposition der Roboterachse A2 (Schwinge/Schulter). Die zweite Achse kippt den Oberarm nach vorne oder hinten.",
+          "axis_name": "A2",
+          "axis_function": "Schwinge / Schulter"
+        },
+        "axis_act_a3_deg": {
+          "description": "Sollposition der Roboterachse A3 (Arm/Ellbogen). Die dritte Achse steuert die Beugung des Unterarms.",
+          "axis_name": "A3",
+          "axis_function": "Arm / Ellbogen"
+        },
+        "axis_act_a4_deg": {
+          "description": "Sollposition der Roboterachse A4 (Handgelenk-Rotation). Die vierte Achse dreht den Unterarm um seine Längsachse.",
+          "axis_name": "A4",
+          "axis_function": "Handachse / Unterarm-Rotation"
+        },
+        "axis_act_a5_deg": {
+          "description": "Sollposition der Roboterachse A5 (Handgelenk-Neigung/Beugen). Die fünfte Achse neigt das Handgelenk nach oben oder unten.",
+          "axis_name": "A5",
+          "axis_function": "Handachse / Beugen"
+        },
+        "axis_act_a6_deg": {
+          "description": "Sollposition der Roboterachse A6 (Flansch-Rotation/Drehen). Die sechste Achse dreht den Werkzeugflansch und damit das montierte Werkzeug.",
+          "axis_name": "A6",
+          "axis_function": "Handachse / Flansch-Drehung"
+        }
+      }
+    },
+    
+    "axis_position_measured": {
+      "name": "Achspositionen (Ist/Gemessen)",
+      "kuka_variable": "$AXIS_ACT_MEAS",
+      "description": "Aktuelle achsspezifische Istposition des Roboters. Die Variable enthält die aktuellen Achswinkel direkt vom Antrieb gemessen. Im Gegensatz zu $AXIS_ACT (Sollpositionen) liefert diese Variable immer die tatsächlich gemessenen Ist-Achswinkel. Die Differenz zwischen Soll und Ist zeigt den Schleppfehler.",
+      "aliases": ["Istposition", "gemessene Position", "Messwert", "tatsächliche Position", "Ist-Achswinkel", "Encoderposition"],
+      "unit": "°",
+      "unit_long": "Grad",
+      "data_type": "REAL",
+      "read_only": true,
+      "sample_rate_ms": 100,
+      "keys": {
+        "axis_meas_a1_deg": {
+          "description": "Gemessene Istposition der Roboterachse A1 vom Antriebsencoder.",
+          "axis_name": "A1"
+        },
+        "axis_meas_a2_deg": {
+          "description": "Gemessene Istposition der Roboterachse A2 vom Antriebsencoder.",
+          "axis_name": "A2"
+        },
+        "axis_meas_a3_deg": {
+          "description": "Gemessene Istposition der Roboterachse A3 vom Antriebsencoder.",
+          "axis_name": "A3"
+        },
+        "axis_meas_a4_deg": {
+          "description": "Gemessene Istposition der Roboterachse A4 vom Antriebsencoder.",
+          "axis_name": "A4"
+        },
+        "axis_meas_a5_deg": {
+          "description": "Gemessene Istposition der Roboterachse A5 vom Antriebsencoder.",
+          "axis_name": "A5"
+        },
+        "axis_meas_a6_deg": {
+          "description": "Gemessene Istposition der Roboterachse A6 vom Antriebsencoder.",
+          "axis_name": "A6"
+        }
+      }
+    },
+    
+    "cartesian_position": {
+      "name": "Kartesische TCP-Position",
+      "kuka_variable": "$POS_ACT",
+      "description": "Aktuelle kartesische Roboterposition. Die Variable vom Strukturtyp E6POS beschreibt die Sollposition des TCP (Tool Center Point) bezogen auf das aktuell eingestellte BASE-Koordinatensystem. X, Y, Z geben die Translation an, A, B, C die Orientierung (Euler-Winkel ZYX-Konvention). Die Variable ist schreibgeschützt und löst im Roboterprogramm einen Vorlaufstopp aus.",
+      "aliases": ["TCP", "Werkzeugposition", "kartesisch", "XYZ", "Raumposition", "Endeffektorposition", "Koordinaten", "Tool Center Point"],
+      "data_type": "E6POS",
+      "read_only": true,
+      "sample_rate_ms": 100,
+      "keys": {
+        "pos_act_x_mm": {
+          "description": "X-Koordinate des TCP: Verschiebung des Ursprungs entlang der X-Achse des BASE-Koordinatensystems.",
+          "unit": "mm",
+          "component": "Translation"
+        },
+        "pos_act_y_mm": {
+          "description": "Y-Koordinate des TCP: Verschiebung des Ursprungs entlang der Y-Achse des BASE-Koordinatensystems.",
+          "unit": "mm",
+          "component": "Translation"
+        },
+        "pos_act_z_mm": {
+          "description": "Z-Koordinate des TCP: Verschiebung des Ursprungs entlang der Z-Achse des BASE-Koordinatensystems (typischerweise Höhe).",
+          "unit": "mm",
+          "component": "Translation"
+        },
+        "pos_act_a_deg": {
+          "description": "A-Winkel (Euler-Winkel): Rotation um die Z-Achse des BASE-Koordinatensystems. Entspricht dem Gierwinkel (Yaw).",
+          "unit": "°",
+          "component": "Orientierung"
+        },
+        "pos_act_b_deg": {
+          "description": "B-Winkel (Euler-Winkel): Rotation um die Y-Achse des gedrehten Koordinatensystems. Entspricht dem Nickwinkel (Pitch).",
+          "unit": "°",
+          "component": "Orientierung"
+        },
+        "pos_act_c_deg": {
+          "description": "C-Winkel (Euler-Winkel): Rotation um die X-Achse des gedrehten Koordinatensystems. Entspricht dem Rollwinkel (Roll).",
+          "unit": "°",
+          "component": "Orientierung"
+        }
+      }
+    },
+    
+    "torque_actual": {
+      "name": "Ist-Drehmomente",
+      "kuka_variable": "$TORQUE_AXIS_ACT",
+      "description": "Aktuelles Moment einer Achse (Momentenbetrieb). Der angezeigte Wert hat nur Aussagekraft, wenn die Bremsen offen sind. Wenn die Bremsen geschlossen sind, ist der Wert nahe Null. Der Zustand der Bremsen kann über $BRAKE_SIG angezeigt werden. Die Systemvariable ist schreibgeschützt und löst im Roboterprogramm einen Vorlaufstopp aus.",
+      "aliases": ["Moment", "Drehmoment", "Kraft", "Last", "Torque", "Belastung", "Antriebsmoment", "Istmoment"],
+      "unit": "Nm",
+      "unit_long": "Newtonmeter",
+      "note": "Für Linearachsen wird die Einheit N (Newton) statt Nm verwendet.",
+      "data_type": "REAL",
+      "read_only": true,
+      "sample_rate_ms": 100,
+      "keys": {
+        "torque_act_a1_nm": {
+          "description": "Aktuelles Ist-Drehmoment der Roboterachse A1. Gibt das tatsächlich am Getriebeausgang anliegende Moment an. Hohe Werte können auf Last, Reibung oder Kollision hindeuten.",
+          "axis_name": "A1"
+        },
+        "torque_act_a2_nm": {
+          "description": "Aktuelles Ist-Drehmoment der Roboterachse A2. Diese Achse trägt typischerweise die höchste Last durch das Gewicht des Roboterarms.",
+          "axis_name": "A2"
+        },
+        "torque_act_a3_nm": {
+          "description": "Aktuelles Ist-Drehmoment der Roboterachse A3. Moment am Ellbogengelenk, beeinflusst durch Armstellung und Nutzlast.",
+          "axis_name": "A3"
+        },
+        "torque_act_a4_nm": {
+          "description": "Aktuelles Ist-Drehmoment der Roboterachse A4. Handachse mit typischerweise geringeren Momenten als Hauptachsen.",
+          "axis_name": "A4"
+        },
+        "torque_act_a5_nm": {
+          "description": "Aktuelles Ist-Drehmoment der Roboterachse A5. Handachse, beeinflusst durch Werkzeugorientierung.",
+          "axis_name": "A5"
+        },
+        "torque_act_a6_nm": {
+          "description": "Aktuelles Ist-Drehmoment der Roboterachse A6. Flanschachse, direkt beeinflusst durch Werkzeugmasse und -schwerpunkt.",
+          "axis_name": "A6"
+        }
+      }
+    },
+    
+    "torque_commanded": {
+      "name": "Soll-Drehmomente",
+      "kuka_variable": "$TORQUE_AXIS_CMD",
+      "description": "Aktuelles Sollmoment einer Achse (Momentenbetrieb). Der angezeigte Wert ist das von der Steuerung berechnete Sollmoment, unmittelbar bevor es an den Antriebstreiber gegeben wird. Es handelt sich um das Motormoment, aber über die Getriebeübersetzung auf den Abtrieb umgerechnet. Enthält auch die Korrektur durch die Elastizitätskompensation.",
+      "aliases": ["Sollmoment", "kommandiertes Moment", "Zielmoment", "Regelgröße"],
+      "unit": "Nm",
+      "unit_long": "Newtonmeter",
+      "data_type": "REAL",
+      "read_only": true,
+      "sample_rate_ms": 100,
+      "keys": {
+        "torque_cmd_a1_nm": {
+          "description": "Berechnetes Sollmoment für Roboterachse A1. Differenz zu $TORQUE_AXIS_ACT zeigt Regelabweichung.",
+          "axis_name": "A1"
+        },
+        "torque_cmd_a2_nm": {
+          "description": "Berechnetes Sollmoment für Roboterachse A2, inklusive Elastizitätskompensation.",
+          "axis_name": "A2"
+        },
+        "torque_cmd_a3_nm": {
+          "description": "Berechnetes Sollmoment für Roboterachse A3, inklusive Elastizitätskompensation.",
+          "axis_name": "A3"
+        },
+        "torque_cmd_a4_nm": {
+          "description": "Berechnetes Sollmoment für Roboterachse A4.",
+          "axis_name": "A4"
+        },
+        "torque_cmd_a5_nm": {
+          "description": "Berechnetes Sollmoment für Roboterachse A5.",
+          "axis_name": "A5"
+        },
+        "torque_cmd_a6_nm": {
+          "description": "Berechnetes Sollmoment für Roboterachse A6.",
+          "axis_name": "A6"
+        }
+      }
+    },
+    
+    "torque_monitoring": {
+      "name": "Momentenüberwachung",
+      "kuka_variable": "$TORQMON",
+      "description": "Aktueller Faktor der Momentenüberwachung im Programmbetrieb (Kraftmoment). Wenn ein Roboter mit einem Objekt kollidiert, erhöht die Robotersteuerung die Achsmomente, um den Widerstand zu überwinden. Roboter, Werkzeug oder andere Teile können hierbei beschädigt werden. Die Variable enthält den aktuellen Toleranzbereich für die Achsmomente im Programmbetrieb. Definiert wird dieser Toleranzbereich mit $TORQMON_DEF.",
+      "aliases": ["Kollision", "Überwachung", "Toleranz", "Kraftüberwachung", "Kollisionserkennung"],
+      "unit": "%",
+      "unit_long": "Prozent",
+      "data_type": "INT",
+      "default_value": 0,
+      "sample_rate_ms": 500,
+      "keys": {
+        "torqmon_a1_pct": {
+          "description": "Momentenüberwachungsfaktor für Achse A1. Erhöhte Werte deuten auf Widerstand oder Kollision hin.",
+          "axis_name": "A1"
+        },
+        "torqmon_a2_pct": {
+          "description": "Momentenüberwachungsfaktor für Achse A2. Erhöhte Werte deuten auf Widerstand oder Kollision hin.",
+          "axis_name": "A2"
+        },
+        "torqmon_a3_pct": {
+          "description": "Momentenüberwachungsfaktor für Achse A3. Erhöhte Werte deuten auf Widerstand oder Kollision hin.",
+          "axis_name": "A3"
+        },
+        "torqmon_a4_pct": {
+          "description": "Momentenüberwachungsfaktor für Achse A4. Erhöhte Werte deuten auf Widerstand oder Kollision hin.",
+          "axis_name": "A4"
+        },
+        "torqmon_a5_pct": {
+          "description": "Momentenüberwachungsfaktor für Achse A5. Erhöhte Werte deuten auf Widerstand oder Kollision hin.",
+          "axis_name": "A5"
+        },
+        "torqmon_a6_pct": {
+          "description": "Momentenüberwachungsfaktor für Achse A6. Erhöhte Werte deuten auf Widerstand oder Kollision hin.",
+          "axis_name": "A6"
+        }
+      }
+    },
+    
+    "velocity_tcp": {
+      "name": "Bahngeschwindigkeit TCP",
+      "kuka_variable": "$VEL_ACT",
+      "description": "Aktuelle Bahngeschwindigkeit des Tool Center Points. Gibt an, wie schnell sich der TCP im kartesischen Raum bewegt. Die Systemvariable ist schreibgeschützt. Der Wertebereich reicht von 0 bis zum konfigurierten Maximum in $VEL_MA.CP.",
+      "aliases": ["Geschwindigkeit", "Speed", "Tempo", "Velocity", "TCP-Geschwindigkeit", "Bahngeschwindigkeit", "Fahrgeschwindigkeit"],
+      "unit": "m/s",
+      "unit_long": "Meter pro Sekunde",
+      "data_type": "REAL",
+      "read_only": true,
+      "sample_rate_ms": 100,
+      "keys": {
+        "vel_act_m_per_s": {
+          "description": "Aktuelle Bahngeschwindigkeit des TCP in Meter pro Sekunde. Beschreibt die Geschwindigkeit der Werkzeugspitze im Raum unabhängig von der Bewegungsrichtung."
+        }
+      }
+    },
+    
+    "velocity_axis": {
+      "name": "Achsgeschwindigkeiten",
+      "kuka_variable": "$VEL_AXIS_ACT",
+      "description": "Aktuelle Geschwindigkeit der Roboter- oder Zusatzachse. Die Variable enthält die aktuelle Achsgeschwindigkeit in Prozent, bezogen auf die maximale Motordrehzahl $VEL_AXIS_MA. Negative Werte bedeuten Bewegung in negativer Drehrichtung. Die Systemvariable ist schreibgeschützt.",
+      "aliases": ["Achsgeschwindigkeit", "Drehzahl", "Rotationsgeschwindigkeit", "Motordrehzahl"],
+      "unit": "%",
+      "unit_long": "Prozent der Maximalgeschwindigkeit",
+      "data_type": "REAL",
+      "read_only": true,
+      "value_range": "-100.0 bis +100.0",
+      "sample_rate_ms": 100,
+      "keys": {
+        "vel_axis_a1_pct": {
+          "description": "Aktuelle Geschwindigkeit der Roboterachse A1 in Prozent der maximalen Motordrehzahl. Positive Werte = Drehung im Uhrzeigersinn (von oben gesehen).",
+          "axis_name": "A1"
+        },
+        "vel_axis_a2_pct": {
+          "description": "Aktuelle Geschwindigkeit der Roboterachse A2 in Prozent der maximalen Motordrehzahl.",
+          "axis_name": "A2"
+        },
+        "vel_axis_a3_pct": {
+          "description": "Aktuelle Geschwindigkeit der Roboterachse A3 in Prozent der maximalen Motordrehzahl.",
+          "axis_name": "A3"
+        },
+        "vel_axis_a4_pct": {
+          "description": "Aktuelle Geschwindigkeit der Roboterachse A4 in Prozent der maximalen Motordrehzahl.",
+          "axis_name": "A4"
+        },
+        "vel_axis_a5_pct": {
+          "description": "Aktuelle Geschwindigkeit der Roboterachse A5 in Prozent der maximalen Motordrehzahl.",
+          "axis_name": "A5"
+        },
+        "vel_axis_a6_pct": {
+          "description": "Aktuelle Geschwindigkeit der Roboterachse A6 in Prozent der maximalen Motordrehzahl.",
+          "axis_name": "A6"
+        }
+      }
+    },
+    
+    "acceleration_tcp": {
+      "name": "TCP-Beschleunigung",
+      "kuka_variable": "$ACC_C",
+      "description": "Beschleunigung des TCP im Hauptlauf. Die Systemvariable enthält die programmierte kartesische Beschleunigung des aktuellen Bewegungssatzes und ist die Hauptlaufkopie des Bewegungsparameters. CP ist die Bahnbeschleunigung, ORI1 die Schwenkbeschleunigung und ORI2 die Drehbeschleunigung. Die Variable ist schreibgeschützt.",
+      "aliases": ["Beschleunigung", "Acceleration", "TCP-Beschleunigung"],
+      "data_type": "ACC_CAR",
+      "read_only": true,
+      "sample_rate_ms": 500,
+      "keys": {
+        "acc_cp_m_per_s2": {
+          "description": "Bahnbeschleunigung (CP = Continuous Path): Beschleunigung des TCP entlang der Bewegungsbahn. Wertebereich: 0 bis $ACC_MA.CP.",
+          "unit": "m/s²",
+          "component": "CP (Bahnbeschleunigung)"
+        },
+        "acc_ori1_deg_per_s2": {
+          "description": "Schwenkbeschleunigung (ORI1): Beschleunigung der Werkzeugorientierung beim Schwenken. Wertebereich: 0 bis $ACC_MA.ORI1.",
+          "unit": "°/s²",
+          "component": "ORI1 (Schwenken)"
+        },
+        "acc_ori2_deg_per_s2": {
+          "description": "Drehbeschleunigung (ORI2): Beschleunigung der Werkzeugorientierung beim Drehen. Wertebereich: 0 bis $ACC_MA.ORI2.",
+          "unit": "°/s²",
+          "component": "ORI2 (Drehen)"
+        }
+      }
+    },
+    
+    "acceleration_axis": {
+      "name": "Achsbeschleunigungen",
+      "kuka_variable": "$ACC_AXIS_C",
+      "description": "Beschleunigung der Roboterachsen im Hauptlauf. Die Variable enthält die Achsbeschleunigung der aktuell ausgeführten Bewegung in Prozent. Bei Bewegungen, die mithilfe des Dynamikmodells geplant werden, bezieht sich der Prozentwert auf die zum Beschleunigen zur Verfügung stehenden Achsmomente. Ohne Dynamikmodell bezieht sich der Wert auf die in WorkVisual konfigurierte Achshochlaufzeit. Die Systemvariable ist schreibgeschützt.",
+      "aliases": ["Achsbeschleunigung"],
+      "unit": "%",
+      "unit_long": "Prozent",
+      "data_type": "INT",
+      "read_only": true,
+      "value_range": "1 bis 100",
+      "sample_rate_ms": 500,
+      "keys": {
+        "acc_axis_a1_pct": {
+          "description": "Achsbeschleunigung der Roboterachse A1 in Prozent der maximal verfügbaren Beschleunigung.",
+          "axis_name": "A1"
+        },
+        "acc_axis_a2_pct": {
+          "description": "Achsbeschleunigung der Roboterachse A2 in Prozent der maximal verfügbaren Beschleunigung.",
+          "axis_name": "A2"
+        },
+        "acc_axis_a3_pct": {
+          "description": "Achsbeschleunigung der Roboterachse A3 in Prozent der maximal verfügbaren Beschleunigung.",
+          "axis_name": "A3"
+        },
+        "acc_axis_a4_pct": {
+          "description": "Achsbeschleunigung der Roboterachse A4 in Prozent der maximal verfügbaren Beschleunigung.",
+          "axis_name": "A4"
+        },
+        "acc_axis_a5_pct": {
+          "description": "Achsbeschleunigung der Roboterachse A5 in Prozent der maximal verfügbaren Beschleunigung.",
+          "axis_name": "A5"
+        },
+        "acc_axis_a6_pct": {
+          "description": "Achsbeschleunigung der Roboterachse A6 in Prozent der maximal verfügbaren Beschleunigung.",
+          "axis_name": "A6"
+        }
+      }
+    },
+    
+    "energy": {
+      "name": "Energieverbrauch",
+      "kuka_variable": "$ENERGY_PERIOD",
+      "description": "Energieverbrauch von Roboter und Robotersteuerung während der letzten 60 Minuten seit dem letzten Kaltstart. Die Verbräuche optionaler Komponenten der Robotersteuerung und von anderen Steuerungen werden nicht erfasst. Die Messung beginnt beim letzten Kaltstart. Wenn der Kaltstart mehr als 60 min zurückliegt, werden immer die letzten 60 min betrachtet (gleitendes Fenster). Wird auch auf der smartHMI im Fenster Energieverbrauch angezeigt.",
+      "aliases": ["Energie", "Verbrauch", "Strom", "Leistung", "kWh", "Energiekosten", "Stromverbrauch"],
+      "unit": "kWh",
+      "unit_long": "Kilowattstunden",
+      "data_type": "Energy_Data_Struc",
+      "read_only": true,
+      "sample_rate_ms": 5000,
+      "keys": {
+        "energy_period_kwh": {
+          "description": "Energieverbrauch im Messzeitraum der letzten 60 Minuten in Kilowattstunden. Das Zeitfenster ist gleitend und beginnt beim Kaltstart. Nach 60 Minuten Betrieb zeigt der Wert immer den Verbrauch der letzten Stunde."
+        }
+      }
+    },
+    
+    "utilization": {
+      "name": "Momentanbelastung",
+      "kuka_variable": "$UTILIZATION",
+      "description": "Komponenten für die Funktionalität Momentanbelastung. CURRENT_VALUE ist der aktuelle maximale Belastungswert aller Achsen. Der Belastungswert einer einzelnen Achse ist das Maximum interner Indikatorwerte für Getriebe-, Antriebs- und Temperaturbelastung. CURRENT_VALUE fällt in der Regel auch bei einem stehenden Roboter nicht unter eine relativ hoch erscheinende Grundbelastung. MOVING_MAX ist ein gleitender Maximalwert über einen konfigurierbaren Zeitraum.",
+      "aliases": ["Auslastung", "Belastung", "Last", "Nutzung", "Getriebebelastung"],
+      "unit": "%",
+      "unit_long": "Prozent",
+      "data_type": "Utilization_Struc",
+      "sample_rate_ms": 100,
+      "keys": {
+        "utilization_current": {
+          "description": "Aktueller Indikatorwert der Momentanbelastung. Der aktuelle maximale Belastungswert aller Achsen. Der Belastungswert einer einzelnen Achse ist das Maximum interner Indikatorwerte für Getriebe-, Antriebs- und Temperaturbelastung. Auch bei stehendem Roboter kann eine relativ hohe Grundbelastung angezeigt werden."
+        },
+        "utilization_moving_max": {
+          "description": "Gleitender Maximalwert der Momentanbelastung über einen konfigurierbaren Zeitraum (MOVING_MAX_DURATION). Zeigt die höchste Belastung im beobachteten Zeitfenster."
+        }
+      }
+    },
+    
+    "program_state": {
+      "name": "Programmzustand",
+      "kuka_variable": "$PRO_STATE, $OV_PRO",
+      "description": "Status des Roboterprogramms und Override-Einstellungen. $PRO_STATE zeigt den Programmstatus des Interpreters. $OV_PRO ist der Programm-Override, ein Reduzierfaktor für die Geschwindigkeit des Roboters beim Programmablauf, der auch zur Laufzeit geändert werden kann. Der Override wird in Prozent angegeben und alle Bewegungen werden um diesen Faktor langsamer abgefahren als programmiert.",
+      "aliases": ["Status", "Programm", "Override", "Zustand", "Programmstatus"],
+      "sample_rate_ms": 500,
+      "keys": {
+        "pro_state": {
+          "description": "Programmstatus des Interpreters. Zeigt kontextabhängig den Zustand des Roboter-Interpreters oder Submit-Interpreters an. Mögliche Werte sind abhängig vom Submit-Modus der Steuerung.",
+          "data_type": "ENUM"
+        },
+        "override_pct": {
+          "description": "Programm-Override in Prozent. Reduzierfaktor für die Robotergeschwindigkeit beim Programmablauf (0-100%). Bei 50% fährt der Roboter mit halber programmierter Geschwindigkeit. Default ist 100%. Kann auch über die KUKA smartHMI Bedienoberfläche eingestellt werden.",
+          "unit": "%",
+          "data_type": "INT",
+          "value_range": "0 bis 100",
+          "default_value": 100
+        }
+      }
+    }
+  }
+}

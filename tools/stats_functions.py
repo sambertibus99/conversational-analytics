@@ -2,9 +2,13 @@
 Statistische Funktionen für IIoT-Zeitreihendaten.
 
 Pure Python/NumPy Implementierungen - werden vom Stats MCP Server genutzt.
+
+DESIGN-ENTSCHEIDUNGEN:
+- DEC-024: merge_asof für Zeitreihen-Korrelation mit unterschiedlichen Timestamps
 """
 
 import numpy as np
+import pandas as pd
 from scipy import stats as scipy_stats
 from typing import Any
 
@@ -81,35 +85,79 @@ def calculate_min_max(values: list[float]) -> dict[str, Any]:
     }
 
 
-def calculate_correlation(x_values: list[float], y_values: list[float]) -> dict[str, Any]:
+def calculate_correlation_timeseries(
+    x_timestamps: list[int],
+    x_values: list[float],
+    y_timestamps: list[int],
+    y_values: list[float],
+    tolerance_ms: int = 1000,
+) -> dict[str, Any]:
     """
-    Berechnet Pearson-Korrelationskoeffizient.
-    
+    Berechnet Pearson-Korrelation für Zeitreihen mit unterschiedlichen Timestamps.
+
+    Nutzt pd.merge_asof um Datenpunkte anhand der nächsten Timestamps zu matchen.
+    Dies ist ideal für IoT-Sensordaten die mit leicht unterschiedlichen Frequenzen
+    oder Timing-Jitter aufgezeichnet werden (DEC-024).
+
     Args:
-        x_values: Erste Variable
-        y_values: Zweite Variable (gleiche Länge!)
-        
+        x_timestamps: Timestamps der ersten Variable (Millisekunden)
+        x_values: Werte der ersten Variable
+        y_timestamps: Timestamps der zweiten Variable (Millisekunden)
+        y_values: Werte der zweiten Variable
+        tolerance_ms: Maximale erlaubte Zeitdifferenz für Match (default: 1000ms)
+
     Returns:
-        dict mit r, p_value und Interpretation
+        dict mit r, p_value, Interpretation und Match-Statistiken
     """
     if not x_values or not y_values:
         return {"error": "Beide Variablen müssen Werte enthalten", "r": None}
-    
-    if len(x_values) != len(y_values):
-        return {"error": f"Ungleiche Längen: x={len(x_values)}, y={len(y_values)}", "r": None}
-    
-    if len(x_values) < 3:
-        return {"error": "Mindestens 3 Wertepaare nötig", "r": None}
-    
-    x = np.array(x_values, dtype=float)
-    y = np.array(y_values, dtype=float)
-    
-    # Prüfe auf konstante Werte (keine Korrelation möglich)
-    if np.std(x) == 0 or np.std(y) == 0:
+
+    if not x_timestamps or not y_timestamps:
+        return {"error": "Timestamps für beide Variablen erforderlich", "r": None}
+
+    if len(x_timestamps) != len(x_values):
+        return {"error": f"x: Timestamps ({len(x_timestamps)}) und Werte ({len(x_values)}) unterschiedlich", "r": None}
+
+    if len(y_timestamps) != len(y_values):
+        return {"error": f"y: Timestamps ({len(y_timestamps)}) und Werte ({len(y_values)}) unterschiedlich", "r": None}
+
+    # DataFrames erstellen und sortieren
+    df_x = pd.DataFrame({"ts": x_timestamps, "x": x_values}).sort_values("ts")
+    df_y = pd.DataFrame({"ts": y_timestamps, "y": y_values}).sort_values("ts")
+
+    # merge_asof: Für jeden x-Timestamp den nächsten y-Timestamp finden
+    merged = pd.merge_asof(
+        df_x,
+        df_y,
+        on="ts",
+        tolerance=tolerance_ms,
+        direction="nearest",
+    )
+
+    # NaN entfernen (Punkte ohne Match innerhalb der Toleranz)
+    merged_clean = merged.dropna()
+    n_matched = len(merged_clean)
+    n_dropped = len(df_x) - n_matched
+
+    if n_matched < 3:
+        return {
+            "error": f"Zu wenige überlappende Datenpunkte ({n_matched}). Benötigt: mindestens 3",
+            "r": None,
+            "n_matched": n_matched,
+            "n_x": len(x_values),
+            "n_y": len(y_values),
+            "tolerance_ms": tolerance_ms,
+        }
+
+    x_matched = merged_clean["x"].values
+    y_matched = merged_clean["y"].values
+
+    # Prüfe auf konstante Werte
+    if np.std(x_matched) == 0 or np.std(y_matched) == 0:
         return {"error": "Eine Variable ist konstant - keine Korrelation berechenbar", "r": None}
-    
-    r, p_value = scipy_stats.pearsonr(x, y)
-    
+
+    r, p_value = scipy_stats.pearsonr(x_matched, y_matched)
+
     # Interpretation
     abs_r = abs(r)
     if abs_r >= 0.7:
@@ -118,17 +166,22 @@ def calculate_correlation(x_values: list[float], y_values: list[float]) -> dict[
         strength = "moderat"
     else:
         strength = "schwach"
-    
+
     direction = "positiv" if r > 0 else "negativ" if r < 0 else "keine"
-    
+
     return {
-        "r": float(r),
-        "r_squared": float(r ** 2),
-        "p_value": float(p_value),
+        "r": round(float(r), 4),
+        "r_squared": round(float(r ** 2), 4),
+        "p_value": round(float(p_value), 6),
         "strength": strength,
         "direction": direction,
         "interpretation": f"{strength} {direction}",
-        "count": len(x),
+        "n_matched": n_matched,
+        "n_dropped": n_dropped,
+        "n_x": len(x_values),
+        "n_y": len(y_values),
+        "tolerance_ms": tolerance_ms,
+        "match_rate": round(100 * n_matched / len(df_x), 1),
     }
 
 
@@ -433,9 +486,15 @@ if __name__ == "__main__":
     print("\n7. Anomaly Detection (2σ):")
     print(f"   {detect_anomalies(test_values, sigma_threshold=2.0)}")
     
-    print("\n8. Correlation:")
-    x = [1, 2, 3, 4, 5]
-    y = [2, 4, 5, 4, 5]
-    print(f"   {calculate_correlation(x, y)}")
-    
+    print("\n8. Correlation Timeseries (DEC-024):")
+    # Sensor X: 5 Punkte bei t=1000, 2000, 3000, 4000, 5000
+    x_ts = [1000, 2000, 3000, 4000, 5000]
+    x_vals = [10.0, 20.0, 30.0, 40.0, 50.0]
+    # Sensor Y: 4 Punkte bei leicht anderen Timestamps (jitter)
+    y_ts = [1010, 2005, 3020, 4002]  # 4 Punkte statt 5!
+    y_vals = [11.0, 19.0, 31.0, 39.0]
+    result = calculate_correlation_timeseries(x_ts, x_vals, y_ts, y_vals)
+    print(f"   n_x={result.get('n_x')}, n_y={result.get('n_y')}, n_matched={result.get('n_matched')}")
+    print(f"   r={result.get('r')}, interpretation: {result.get('interpretation')}")
+
     print("\n✅ Alle Tests abgeschlossen!")

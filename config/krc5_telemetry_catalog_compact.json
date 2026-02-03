@@ -1,0 +1,152 @@
+{
+  "version": "1.0.0",
+  "device_type": "KUKA KRC5",
+  
+  "groups": {
+    "axis_position": {
+      "description": "Aktuelle achsspezifische Sollposition des Roboters ($AXIS_ACT). Enthält die Soll-Achswinkel A1-A6 in Grad.",
+      "aliases": ["Position", "Achsposition", "Gelenkwinkel", "Stellung", "Sollposition"],
+      "unit": "°",
+      "keys": {
+        "axis_act_a1_deg": "Achse A1 (Karussell/Basis-Rotation) - dreht gesamten Arm horizontal",
+        "axis_act_a2_deg": "Achse A2 (Schwinge/Schulter) - kippt Oberarm vor/zurück",
+        "axis_act_a3_deg": "Achse A3 (Arm/Ellbogen) - Beugung des Unterarms",
+        "axis_act_a4_deg": "Achse A4 (Handgelenk-Rotation) - dreht Unterarm um Längsachse",
+        "axis_act_a5_deg": "Achse A5 (Handgelenk-Neigung) - neigt Handgelenk hoch/runter",
+        "axis_act_a6_deg": "Achse A6 (Flansch-Rotation) - dreht Werkzeugflansch"
+      }
+    },
+    "axis_position_measured": {
+      "description": "Aktuelle Ist-Achspositionen vom Encoder ($AXIS_ACT_MEAS). Im Gegensatz zu Soll zeigt dies die tatsächlich gemessenen Werte. Differenz = Schleppfehler.",
+      "aliases": ["Istposition", "gemessene Position", "Encoderposition"],
+      "unit": "°",
+      "keys": {
+        "axis_meas_a1_deg": "Gemessene Istposition Achse A1",
+        "axis_meas_a2_deg": "Gemessene Istposition Achse A2",
+        "axis_meas_a3_deg": "Gemessene Istposition Achse A3",
+        "axis_meas_a4_deg": "Gemessene Istposition Achse A4",
+        "axis_meas_a5_deg": "Gemessene Istposition Achse A5",
+        "axis_meas_a6_deg": "Gemessene Istposition Achse A6"
+      }
+    },
+    "cartesian_position": {
+      "description": "Kartesische TCP-Position ($POS_ACT). Sollposition des Tool Center Point bezogen auf BASE-Koordinatensystem. X,Y,Z = Translation in mm, A,B,C = Euler-Winkel (ZYX) in Grad.",
+      "aliases": ["TCP", "Werkzeugposition", "kartesisch", "XYZ", "Koordinaten", "Tool Center Point"],
+      "keys": {
+        "pos_act_x_mm": "X-Koordinate TCP (mm) - Verschiebung entlang X-Achse",
+        "pos_act_y_mm": "Y-Koordinate TCP (mm) - Verschiebung entlang Y-Achse",
+        "pos_act_z_mm": "Z-Koordinate TCP (mm) - Verschiebung entlang Z-Achse (Höhe)",
+        "pos_act_a_deg": "A-Winkel (°) - Rotation um Z-Achse (Gieren/Yaw)",
+        "pos_act_b_deg": "B-Winkel (°) - Rotation um Y-Achse (Nicken/Pitch)",
+        "pos_act_c_deg": "C-Winkel (°) - Rotation um X-Achse (Rollen/Roll)"
+      }
+    },
+    "torque_actual": {
+      "description": "Aktuelles Ist-Drehmoment der Achsen ($TORQUE_AXIS_ACT). Nur aussagekräftig bei offenen Bremsen. Bei geschlossenen Bremsen nahe Null. Für Linearachsen: Einheit N statt Nm.",
+      "aliases": ["Moment", "Drehmoment", "Kraft", "Last", "Torque", "Istmoment"],
+      "unit": "Nm",
+      "keys": {
+        "torque_act_a1_nm": "Ist-Drehmoment A1 - hohe Werte können auf Last/Reibung/Kollision deuten",
+        "torque_act_a2_nm": "Ist-Drehmoment A2 - trägt typischerweise höchste Last (Armgewicht)",
+        "torque_act_a3_nm": "Ist-Drehmoment A3 - Ellbogen, beeinflusst durch Armstellung",
+        "torque_act_a4_nm": "Ist-Drehmoment A4 - Handachse, geringere Momente",
+        "torque_act_a5_nm": "Ist-Drehmoment A5 - Handachse, beeinflusst durch Werkzeugorientierung",
+        "torque_act_a6_nm": "Ist-Drehmoment A6 - Flansch, beeinflusst durch Werkzeugmasse"
+      }
+    },
+    "torque_commanded": {
+      "description": "Soll-Drehmoment der Achsen ($TORQUE_AXIS_CMD). Von Steuerung berechnetes Moment bevor es an Antrieb geht. Über Getriebeübersetzung umgerechnet, inkl. Elastizitätskompensation.",
+      "aliases": ["Sollmoment", "kommandiertes Moment"],
+      "unit": "Nm",
+      "keys": {
+        "torque_cmd_a1_nm": "Soll-Drehmoment A1 - Differenz zu Ist zeigt Regelabweichung",
+        "torque_cmd_a2_nm": "Soll-Drehmoment A2 inkl. Elastizitätskompensation",
+        "torque_cmd_a3_nm": "Soll-Drehmoment A3 inkl. Elastizitätskompensation",
+        "torque_cmd_a4_nm": "Soll-Drehmoment A4",
+        "torque_cmd_a5_nm": "Soll-Drehmoment A5",
+        "torque_cmd_a6_nm": "Soll-Drehmoment A6"
+      }
+    },
+    "torque_monitoring": {
+      "description": "Momentenüberwachung ($TORQMON). Toleranzbereich für Achsmomente im Programmbetrieb. Bei Kollision erhöht Steuerung Momente um Widerstand zu überwinden - erhöhte Werte deuten auf Kollision/Widerstand.",
+      "aliases": ["Kollision", "Überwachung", "Kollisionserkennung"],
+      "unit": "%",
+      "keys": {
+        "torqmon_a1_pct": "Momentenüberwachung A1 - erhöhte Werte = Widerstand/Kollision",
+        "torqmon_a2_pct": "Momentenüberwachung A2 - erhöhte Werte = Widerstand/Kollision",
+        "torqmon_a3_pct": "Momentenüberwachung A3 - erhöhte Werte = Widerstand/Kollision",
+        "torqmon_a4_pct": "Momentenüberwachung A4 - erhöhte Werte = Widerstand/Kollision",
+        "torqmon_a5_pct": "Momentenüberwachung A5 - erhöhte Werte = Widerstand/Kollision",
+        "torqmon_a6_pct": "Momentenüberwachung A6 - erhöhte Werte = Widerstand/Kollision"
+      }
+    },
+    "velocity_tcp": {
+      "description": "Aktuelle Bahngeschwindigkeit des TCP ($VEL_ACT). Wie schnell sich Werkzeugspitze im kartesischen Raum bewegt, unabhängig von Bewegungsrichtung.",
+      "aliases": ["Geschwindigkeit", "Speed", "Tempo", "Velocity", "TCP-Geschwindigkeit", "Bahngeschwindigkeit"],
+      "unit": "m/s",
+      "keys": {
+        "vel_act_m_per_s": "Bahngeschwindigkeit TCP in m/s - Geschwindigkeit der Werkzeugspitze im Raum"
+      }
+    },
+    "velocity_axis": {
+      "description": "Aktuelle Achsgeschwindigkeit ($VEL_AXIS_ACT). Geschwindigkeit in % der maximalen Motordrehzahl. Negative Werte = Bewegung in negativer Richtung. Bereich: -100% bis +100%.",
+      "aliases": ["Achsgeschwindigkeit", "Drehzahl", "Motordrehzahl"],
+      "unit": "%",
+      "keys": {
+        "vel_axis_a1_pct": "Geschwindigkeit A1 in % der max. Motordrehzahl",
+        "vel_axis_a2_pct": "Geschwindigkeit A2 in % der max. Motordrehzahl",
+        "vel_axis_a3_pct": "Geschwindigkeit A3 in % der max. Motordrehzahl",
+        "vel_axis_a4_pct": "Geschwindigkeit A4 in % der max. Motordrehzahl",
+        "vel_axis_a5_pct": "Geschwindigkeit A5 in % der max. Motordrehzahl",
+        "vel_axis_a6_pct": "Geschwindigkeit A6 in % der max. Motordrehzahl"
+      }
+    },
+    "acceleration_tcp": {
+      "description": "TCP-Beschleunigung im Hauptlauf ($ACC_C). CP=Bahnbeschleunigung, ORI1=Schwenkbeschleunigung, ORI2=Drehbeschleunigung.",
+      "aliases": ["Beschleunigung", "Acceleration"],
+      "keys": {
+        "acc_cp_m_per_s2": "Bahnbeschleunigung CP (m/s²) - Beschleunigung entlang Bewegungsbahn",
+        "acc_ori1_deg_per_s2": "Schwenkbeschleunigung ORI1 (°/s²) - Orientierungsänderung Schwenken",
+        "acc_ori2_deg_per_s2": "Drehbeschleunigung ORI2 (°/s²) - Orientierungsänderung Drehen"
+      }
+    },
+    "acceleration_axis": {
+      "description": "Achsbeschleunigung im Hauptlauf ($ACC_AXIS_C). Bei Dynamikmodell: % der verfügbaren Achsmomente. Ohne Dynamikmodell: % der konfigurierten Hochlaufzeit.",
+      "aliases": ["Achsbeschleunigung"],
+      "unit": "%",
+      "keys": {
+        "acc_axis_a1_pct": "Achsbeschleunigung A1 in % der max. Beschleunigung",
+        "acc_axis_a2_pct": "Achsbeschleunigung A2 in % der max. Beschleunigung",
+        "acc_axis_a3_pct": "Achsbeschleunigung A3 in % der max. Beschleunigung",
+        "acc_axis_a4_pct": "Achsbeschleunigung A4 in % der max. Beschleunigung",
+        "acc_axis_a5_pct": "Achsbeschleunigung A5 in % der max. Beschleunigung",
+        "acc_axis_a6_pct": "Achsbeschleunigung A6 in % der max. Beschleunigung"
+      }
+    },
+    "energy": {
+      "description": "Energieverbrauch ($ENERGY_PERIOD). Verbrauch von Roboter und Steuerung der letzten 60 Min seit Kaltstart. Gleitendes Fenster - nach 60 Min immer letzte Stunde. Optionale Komponenten nicht erfasst.",
+      "aliases": ["Energie", "Verbrauch", "Strom", "kWh", "Stromverbrauch"],
+      "unit": "kWh",
+      "keys": {
+        "energy_period_kwh": "Energieverbrauch letzte 60 Min (kWh) - gleitendes Zeitfenster"
+      }
+    },
+    "utilization": {
+      "description": "Momentanbelastung ($UTILIZATION). CURRENT=aktueller max. Belastungswert aller Achsen (Maximum aus Getriebe-, Antriebs-, Temperaturbelastung). Auch bei stehendem Roboter kann hohe Grundbelastung angezeigt werden.",
+      "aliases": ["Auslastung", "Belastung", "Last", "Getriebebelastung"],
+      "unit": "%",
+      "keys": {
+        "utilization_current": "Aktuelle Momentanbelastung - max. Belastungswert aller Achsen",
+        "utilization_moving_max": "Gleitender Maximalwert über konfigurierbaren Zeitraum"
+      }
+    },
+    "program_state": {
+      "description": "Programmzustand. $PRO_STATE=Interpreterstatus. $OV_PRO=Programm-Override (0-100%), Reduzierfaktor für Geschwindigkeit - bei 50% halbe programmierte Geschwindigkeit.",
+      "aliases": ["Status", "Programm", "Override"],
+      "keys": {
+        "pro_state": "Programmstatus des Interpreters",
+        "override_pct": "Programm-Override (0-100%) - Geschwindigkeitsreduktion, Default=100%"
+      }
+    }
+  }
+}

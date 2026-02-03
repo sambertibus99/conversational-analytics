@@ -15,6 +15,9 @@ WICHTIG (DEC-013):
 DEC-017: Graph Best Practices
 - error_count: Zählt Fehler für Retry-Logik
 - max_steps: Cycle Guard gegen Endlosschleifen
+
+DEC-023: Query-Typ-basierte Datenstrategie
+- data_retrieval_mode: "raw" für Stats, "aggregated" für Viz
 """
 
 from typing import Any, Annotated
@@ -83,6 +86,10 @@ class AgentState(MessagesState):
     plan: list[str] | None = None
     current_step: int = 0
     reasoning: str | None = None
+
+    # === Daten-Retrieval-Modus (DEC-023) ===
+    # "raw" für Stats/Korrelation (mehr Punkte), "aggregated" für Viz (Standard)
+    data_retrieval_mode: str = "aggregated"
     
     # === Daten (vom Data Agent) ===
     # AKKUMULIERT über Turns via merge_datasets Reducer

@@ -1,17 +1,26 @@
 """
 Stats Agent für statistische Analysen von IIoT-Daten.
 
-Nutzt den Stats MCP Server für Berechnungen wie:
-- Deskriptive Statistik (mean, std, min_max, percentiles)
-- Korrelationsanalyse
-- Trendanalyse
-- Anomalieerkennung
+DESIGN:
+- LLM wählt Analyse-Typ und Parameter (welche Keys)
+- Daten kommen via InjectedState, NICHT durch LLM-Prompt
+- Konsistent mit Viz Agent Pattern (DEC-003)
 
 DESIGN-ENTSCHEIDUNGEN:
+- DEC-003: InjectedState für Daten-Übergabe
 - DEC-013: Multi-Turn Support mit datasets
-- DEC-016: Strukturiertes Logging, Retry-Mechanismus
+- DEC-016: Strukturiertes Logging
+- DEC-024: Timeseries Korrelation mit merge_asof
 
-FALLBACK: Wenn MCP Server nicht erreichbar, werden die Stats direkt berechnet.
+VERFÜGBARE TOOLS (8):
+- mean_tool: Durchschnitt
+- std_tool: Standardabweichung
+- min_max_tool: Minimum/Maximum
+- correlation_tool: Korrelation zwischen zwei Keys (DEC-024)
+- trend_tool: Linearer Trend
+- percentiles_tool: Perzentile/Quartile
+- anomaly_tool: Ausreißererkennung
+- summary_tool: Komplette Statistik-Übersicht
 """
 
 import sys
@@ -23,12 +32,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import json
 import asyncio
 import logging
-from typing import Any, Optional
-from contextlib import asynccontextmanager, AsyncExitStack
+from typing import Any, Annotated
 
-from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
-from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedState
 
 from agents.state import AgentState
 from agents.utils import (
@@ -37,17 +45,16 @@ from agents.utils import (
     extract_timestamps_from_data,
     extract_user_query,
 )
-from prompts.stats_agent_prompt import STATS_AGENT_SYSTEM_PROMPT
-from config.settings import DEFAULT_MODEL, PROJECT_ROOT as CONFIG_PROJECT_ROOT, api_key_rotator, create_anthropic_client, create_cached_system_message
+from prompts.stats_agent_prompt import get_stats_agent_prompt
+from config.settings import create_anthropic_client, create_cached_system_message
 
-# Direkte Stats-Funktionen als Fallback
+# Stats-Funktionen
 from tools.stats_functions import (
     calculate_mean,
     calculate_std,
     calculate_min_max,
-    calculate_correlation,
+    calculate_correlation_timeseries,
     calculate_linear_trend,
-    calculate_moving_average,
     calculate_percentiles,
     detect_anomalies,
 )
@@ -59,416 +66,466 @@ from tools.stats_functions import (
 
 logger = logging.getLogger(__name__)
 
-# Pfad zum Stats MCP Server
-STATS_MCP_SERVER_PATH = PROJECT_ROOT / "mcp_servers" / "stats_server.py"
-
-# Retry-Konfiguration
-MAX_RETRIES = 3
-RETRY_DELAY_BASE = 2
-MCP_TIMEOUT = 30
-
-
-# =============================================================================
-# MCP TOOLS PROVIDER (DEC-005 - Persistent Session)
-# =============================================================================
-
-class StatsMCPToolsProvider:
-    """
-    Verwaltet Stats MCP Tools mit Caching und sauberem Lifecycle.
-
-    Gleiche Pattern wie MCPToolsProvider in data_agent.py:
-    - Server wird EINMAL gestartet und wiederverwendet
-    - Spart 1-3 Sekunden pro Stats-Aufruf
-    """
-
-    def __init__(self, server_path: Path = STATS_MCP_SERVER_PATH):
-        self._tools: list | None = None
-        self._exit_stack: AsyncExitStack | None = None
-        self._lock = asyncio.Lock()
-        self._server_path = server_path
-
-    async def get_tools(self) -> list:
-        """Holt Stats MCP Tools - startet Server nur beim ersten Aufruf."""
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-        from langchain_mcp_adapters.tools import load_mcp_tools
-
-        # Schneller Check ohne Lock
-        if self._tools is not None:
-            logger.debug("Stats MCP Tools aus Cache")
-            return self._tools
-
-        # Mit Lock für Thread-Safety
-        async with self._lock:
-            # Double-Check nach Lock
-            if self._tools is not None:
-                return self._tools
-
-            logger.info("Starte Stats MCP Server (einmalig)...")
-
-            server_params = StdioServerParameters(
-                command="python",
-                args=[str(self._server_path)],
-                env=None,
-            )
-
-            self._exit_stack = AsyncExitStack()
-
-            streams = await self._exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
-            read_stream, write_stream = streams
-
-            session = await self._exit_stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
-            )
-            await asyncio.wait_for(session.initialize(), timeout=MCP_TIMEOUT)
-
-            self._tools = await asyncio.wait_for(load_mcp_tools(session), timeout=MCP_TIMEOUT)
-
-            logger.info(f"Stats MCP Server gestartet, {len(self._tools)} Tools geladen")
-
-            return self._tools
-
-    async def cleanup(self):
-        """Räumt MCP Session auf."""
-        if self._exit_stack:
-            await self._exit_stack.aclose()
-            self._exit_stack = None
-        self._tools = None
-        logger.debug("Stats MCP Session aufgeräumt")
-
-    def is_initialized(self) -> bool:
-        """Prüft ob Tools geladen sind."""
-        return self._tools is not None
-
-
-# Globale Instanz (kann in Tests ersetzt werden)
-_stats_mcp_provider = StatsMCPToolsProvider()
-
-
-async def get_stats_mcp_tools() -> list:
-    """Wrapper für Warmup und Rückwärtskompatibilität."""
-    return await _stats_mcp_provider.get_tools()
-
-
-async def cleanup_stats_mcp():
-    """Wrapper für Cleanup."""
-    await _stats_mcp_provider.cleanup()
-
 
 # =============================================================================
 # HILFSFUNKTIONEN
 # =============================================================================
 
-def create_stats_agent(tools: list):
-    """Erstellt den Stats Agent mit aktuellem API Key (DEC-018)."""
-    llm = create_anthropic_client()
-    return create_react_agent(llm, tools)
+def get_available_keys(state: dict) -> list[str]:
+    """Extrahiert verfügbare Keys aus dem State."""
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    return list(data.keys())
 
+
+def format_result(result: dict, tool_name: str) -> str:
+    """Formatiert ein Ergebnis als lesbaren String."""
+    if "error" in result:
+        return f"Fehler: {result['error']}"
+
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+# =============================================================================
+# STATS TOOLS MIT INJECTEDSTATE (DEC-003)
+# =============================================================================
+
+@tool
+def mean_tool(
+    key: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Berechnet den Durchschnitt für einen Telemetrie-Key.
+
+    WANN BENUTZEN:
+    - "Durchschnitt", "Mittelwert", "average", "im Schnitt"
+    - "durchschnittliche Temperatur/Drehmoment"
+
+    Args:
+        key: Der Telemetrie-Key, z.B. "torque_act_a1_nm"
+    """
+    logger.debug(f"mean_tool: key={key}")
+
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+
+    if key not in data:
+        available = list(data.keys())
+        return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
+
+    values = extract_values_from_data(data, key)
+    if not values:
+        return f"Keine gültigen Werte für Key '{key}'"
+
+    result = calculate_mean(values)
+    result["key"] = key
+    return format_result(result, "mean")
+
+
+@tool
+def std_tool(
+    key: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Berechnet die Standardabweichung (Streuung) für einen Key.
+
+    WANN BENUTZEN:
+    - "Streuung", "Standardabweichung", "wie stark schwanken"
+    - "Stabilität" der Messwerte
+
+    Args:
+        key: Der Telemetrie-Key
+    """
+    logger.debug(f"std_tool: key={key}")
+
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+
+    if key not in data:
+        available = list(data.keys())
+        return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
+
+    values = extract_values_from_data(data, key)
+    if not values:
+        return f"Keine gültigen Werte für Key '{key}'"
+
+    result = calculate_std(values)
+    result["key"] = key
+    return format_result(result, "std")
+
+
+@tool
+def min_max_tool(
+    key: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Gibt Minimum, Maximum und Spannweite für einen Key.
+
+    WANN BENUTZEN:
+    - "Minimum", "Maximum", "höchster/niedrigster Wert"
+    - "Bereich", "Spanne", "Extremwerte"
+
+    Args:
+        key: Der Telemetrie-Key
+    """
+    logger.debug(f"min_max_tool: key={key}")
+
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+
+    if key not in data:
+        available = list(data.keys())
+        return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
+
+    values = extract_values_from_data(data, key)
+    if not values:
+        return f"Keine gültigen Werte für Key '{key}'"
+
+    result = calculate_min_max(values)
+    result["key"] = key
+    return format_result(result, "min_max")
+
+
+@tool
+def correlation_tool(
+    key_x: str,
+    key_y: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Berechnet die Korrelation zwischen zwei Telemetrie-Keys (DEC-024).
+
+    Nutzt merge_asof für Timestamp-Alignment - funktioniert auch bei
+    unterschiedlichen Datenlängen (typisch für IoT-Sensoren).
+
+    WANN BENUTZEN:
+    - "Korrelation", "Zusammenhang", "Beziehung zwischen"
+    - "hängt X mit Y zusammen?"
+
+    INTERPRETATION:
+    - r > 0.7: stark positiv
+    - r < -0.7: stark negativ
+    - |r| < 0.3: kein/schwacher Zusammenhang
+
+    Args:
+        key_x: Erster Telemetrie-Key, z.B. "torque_act_a1_nm"
+        key_y: Zweiter Telemetrie-Key, z.B. "axis_act_a1_deg"
+    """
+    logger.debug(f"correlation_tool: key_x={key_x}, key_y={key_y}")
+
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+
+    # Prüfe ob Keys existieren
+    available = list(data.keys())
+    if key_x not in data:
+        return f"Key '{key_x}' nicht gefunden. Verfügbar: {available[:5]}"
+    if key_y not in data:
+        return f"Key '{key_y}' nicht gefunden. Verfügbar: {available[:5]}"
+
+    # Extrahiere Werte und Timestamps
+    x_values = extract_values_from_data(data, key_x)
+    x_timestamps = extract_timestamps_from_data(data, key_x)
+    y_values = extract_values_from_data(data, key_y)
+    y_timestamps = extract_timestamps_from_data(data, key_y)
+
+    if not x_values or not y_values:
+        return "Keine gültigen Werte für einen der Keys"
+
+    if not x_timestamps or not y_timestamps:
+        return "Keine Timestamps vorhanden - Korrelation benötigt Zeitreihen"
+
+    # Berechne Korrelation mit Timestamp-Alignment (DEC-024)
+    result = calculate_correlation_timeseries(
+        x_timestamps, x_values,
+        y_timestamps, y_values,
+        tolerance_ms=1000,
+    )
+
+    result["key_x"] = key_x
+    result["key_y"] = key_y
+
+    logger.info(f"Korrelation {key_x} ↔ {key_y}: r={result.get('r')}, n_matched={result.get('n_matched')}")
+
+    return format_result(result, "correlation")
+
+
+@tool
+def trend_tool(
+    key: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Berechnet den linearen Trend für einen Key.
+
+    WANN BENUTZEN:
+    - "Trend", "Tendenz", "Entwicklung"
+    - "steigend/fallend/stabil?"
+
+    Args:
+        key: Der Telemetrie-Key
+    """
+    logger.debug(f"trend_tool: key={key}")
+
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+
+    if key not in data:
+        available = list(data.keys())
+        return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
+
+    values = extract_values_from_data(data, key)
+    timestamps = extract_timestamps_from_data(data, key)
+
+    if not values:
+        return f"Keine gültigen Werte für Key '{key}'"
+
+    result = calculate_linear_trend(values, timestamps if timestamps else None)
+    result["key"] = key
+    return format_result(result, "trend")
+
+
+@tool
+def percentiles_tool(
+    key: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Berechnet Perzentile (Quartile: 25%, 50%, 75%) für einen Key.
+
+    WANN BENUTZEN:
+    - "Perzentil", "Median", "Quartil"
+    - "Verteilung der Werte"
+
+    Args:
+        key: Der Telemetrie-Key
+    """
+    logger.debug(f"percentiles_tool: key={key}")
+
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+
+    if key not in data:
+        available = list(data.keys())
+        return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
+
+    values = extract_values_from_data(data, key)
+    if not values:
+        return f"Keine gültigen Werte für Key '{key}'"
+
+    result = calculate_percentiles(values)
+    result["key"] = key
+    return format_result(result, "percentiles")
+
+
+@tool
+def anomaly_tool(
+    key: str,
+    sigma_threshold: float = 2.0,
+    state: Annotated[dict, InjectedState] = None,
+) -> str:
+    """
+    Erkennt Ausreißer/Anomalien mittels Z-Score.
+
+    WANN BENUTZEN:
+    - "Ausreißer", "Anomalie", "ungewöhnlich"
+    - "Spitzen", "extreme Werte"
+
+    Args:
+        key: Der Telemetrie-Key
+        sigma_threshold: Ab wieviel σ gilt als Ausreißer (default: 2.0)
+    """
+    logger.debug(f"anomaly_tool: key={key}, sigma={sigma_threshold}")
+
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+
+    if key not in data:
+        available = list(data.keys())
+        return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
+
+    values = extract_values_from_data(data, key)
+    if not values:
+        return f"Keine gültigen Werte für Key '{key}'"
+
+    result = detect_anomalies(values, sigma_threshold)
+    result["key"] = key
+    return format_result(result, "anomaly")
+
+
+@tool
+def summary_tool(
+    key: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Gibt eine komplette Statistik-Übersicht für einen Key.
+
+    Berechnet: Durchschnitt, Std, Min, Max, Median, Trend
+
+    WANN BENUTZEN:
+    - "Statistik-Übersicht", "alle Kennzahlen"
+    - "Zusammenfassung der Daten"
+
+    Args:
+        key: Der Telemetrie-Key
+    """
+    logger.debug(f"summary_tool: key={key}")
+
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+
+    if key not in data:
+        available = list(data.keys())
+        return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
+
+    values = extract_values_from_data(data, key)
+    timestamps = extract_timestamps_from_data(data, key)
+
+    if not values:
+        return f"Keine gültigen Werte für Key '{key}'"
+
+    # Alle Statistiken berechnen
+    mean_result = calculate_mean(values)
+    std_result = calculate_std(values)
+    minmax_result = calculate_min_max(values)
+    percentiles_result = calculate_percentiles(values)
+    trend_result = calculate_linear_trend(values, timestamps if timestamps else None)
+
+    summary = {
+        "key": key,
+        "count": len(values),
+        "mean": mean_result.get("mean"),
+        "std": std_result.get("std"),
+        "min": minmax_result.get("min"),
+        "max": minmax_result.get("max"),
+        "range": minmax_result.get("range"),
+        "median": percentiles_result.get("p50"),
+        "p25": percentiles_result.get("p25"),
+        "p75": percentiles_result.get("p75"),
+        "trend": trend_result.get("trend"),
+        "trend_slope": trend_result.get("slope"),
+    }
+
+    return format_result(summary, "summary")
+
+
+# =============================================================================
+# TOOL LISTE
+# =============================================================================
+
+STATS_TOOLS = [
+    mean_tool,
+    std_tool,
+    min_max_tool,
+    correlation_tool,
+    trend_tool,
+    percentiles_tool,
+    anomaly_tool,
+    summary_tool,
+]
+
+
+async def get_stats_tools() -> list:
+    """
+    Gibt die Stats Tools zurück (für Warmup/Kompatibilität).
+
+    Hinweis: Stats Agent nutzt kein MCP mehr (DEC-024 Refactoring).
+    Diese Funktion existiert für Kompatibilität mit app.py Warmup.
+    """
+    logger.debug("Stats Tools bereit (kein MCP mehr)")
+    return STATS_TOOLS
+
+
+# =============================================================================
+# CONTEXT VORBEREITUNG (NUR METADATEN!)
+# =============================================================================
 
 def prepare_stats_context(state: AgentState) -> str:
-    """Bereitet den Daten-Kontext für den Stats Agent vor."""
+    """
+    Bereitet den Daten-Kontext für den Stats Agent vor.
+
+    WICHTIG: Nur Metadaten, KEINE Werte! (DEC-003/DEC-004)
+    Das LLM soll nur wissen welche Keys verfügbar sind.
+    """
     context_parts = []
-    
-    # User-Query
-    user_query = extract_user_query(state["messages"])
-    if user_query:
-        context_parts.append(f"User-Anfrage: {user_query}")
-    
+
     # Data Summary
     if state.get("data_summary"):
         context_parts.append(f"Geladene Daten: {state['data_summary']}")
-    
-    # Daten aus datasets extrahieren
+
+    # Verfügbare Keys aus datasets
     datasets = state.get("datasets", {})
     data = extract_data_from_datasets(datasets)
-    
+
     if data:
-        context_parts.append("\n## VERFÜGBARE DATEN")
-        context_parts.append(f"Datasets: {', '.join(datasets.keys())}")
-        
-        for key in list(data.keys())[:5]:  # Max 5 Keys
+        context_parts.append("\n## VERFÜGBARE KEYS")
+
+        for key in data.keys():
             values = extract_values_from_data(data, key)
             timestamps = extract_timestamps_from_data(data, key)
-            
+
             if values:
-                context_parts.append(f"\n### {key}")
-                context_parts.append(f"- Anzahl Werte: {len(values)}")
-                context_parts.append(f"- Beispielwerte: {values[:5]}...")
-                context_parts.append(f"- Werte als Liste für Tools: {json.dumps(values[:100])}")
-                
-                if timestamps:
-                    context_parts.append(f"- Timestamps vorhanden: Ja ({len(timestamps)} Stück)")
-    
+                context_parts.append(f"- {key}: {len(values)} Werte" +
+                                   (" (mit Timestamps)" if timestamps else ""))
+    else:
+        context_parts.append("Keine Daten geladen.")
+
     return "\n".join(context_parts)
 
 
-def extract_statistics_from_messages(messages: list) -> Optional[dict[str, Any]]:
-    """Extrahiert Statistik-Ergebnisse aus den Agent-Messages."""
-    statistics = {}
-    
-    for msg in messages:
-        if isinstance(msg, ToolMessage):
-            content = msg.content
-            
-            # Content kann String oder Liste sein
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        content = block.get("text", "")
-                        break
-                    elif isinstance(block, str):
-                        content = block
-                        break
-            
-            if isinstance(content, str):
-                try:
-                    parsed = json.loads(content)
-                    if isinstance(parsed, dict):
-                        tool_name = getattr(msg, 'name', 'unknown')
-                        statistics[tool_name] = parsed
-                except json.JSONDecodeError:
-                    pass
-    
-    return statistics if statistics else None
-
-
-def generate_statistics_summary(statistics: Optional[dict[str, Any]]) -> str:
-    """Generiert eine Zusammenfassung der berechneten Statistiken."""
-    if not statistics:
-        return "Keine Statistiken berechnet."
-    
-    summaries = []
-    
-    for tool_name, result in statistics.items():
-        if isinstance(result, dict):
-            if "error" in result:
-                summaries.append(f"{tool_name}: Fehler - {result['error']}")
-            elif "mean" in result:
-                summaries.append(f"Durchschnitt: {result['mean']:.4f}")
-            elif "r" in result:
-                summaries.append(f"Korrelation: r={result['r']:.3f} ({result.get('interpretation', '')})")
-            elif "slope" in result:
-                summaries.append(f"Trend: {result.get('trend', '')} (slope={result['slope']:.4f})")
-            elif "anomalies_count" in result:
-                summaries.append(f"Anomalien: {result['anomalies_count']} gefunden")
-    
-    return "; ".join(summaries) if summaries else "Statistiken berechnet."
-
-
 # =============================================================================
-# FALLBACK: Direkte Stats-Berechnung
+# TOOL AUSFÜHRUNG (wie Viz Agent)
 # =============================================================================
 
-def compute_stats_directly(state: AgentState, query: str) -> dict[str, Any]:
+async def select_and_execute_tool(
+    llm_with_tools,
+    user_query: str,
+    data_context: str,
+    tool_state: dict,
+) -> tuple[dict | None, str]:
     """
-    Berechnet Statistiken direkt ohne MCP Server.
-    FALLBACK wenn MCP nicht funktioniert.
+    Lässt LLM Tool auswählen und führt es aus.
+    Pattern: Wie Viz Agent - manuelles State-Injection.
     """
-    logger.debug("Fallback: Direkte Stats-Berechnung")
-    
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-    
-    if not data:
-        logger.debug("Keine Daten im State")
-        return {
-            "statistics": None,
-            "statistics_summary": "Keine Daten vorhanden.",
-            "error": "no_data",
-        }
-    
-    logger.debug(f"Daten-Keys: {list(data.keys())}")
-    
-    query_lower = query.lower()
-    statistics = {}
-    summaries = []
-    
-    # Keyword-Gruppen
-    keyword_groups = {
-        "mean": ["durchschnitt", "mittelwert", "average", "mean", "schnitt"],
-        "sum": ["verbrauch", "summe", "gesamt", "total", "energie", "energy", "wieviel", "wie viel"],
-        "std": ["streuung", "standardabweichung", "std", "varianz", "schwank"],
-        "minmax": ["min", "max", "bereich", "spanne", "range", "extrem"],
-        "anomaly": ["anomalie", "ausreißer", "spitze", "ungewöhnlich", "auffällig"],
-        "trend": ["trend", "entwicklung", "steig", "fall", "verlauf"],
-    }
-    
-    # Prüfe welche Berechnungen gebraucht werden
-    needs = {k: any(kw in query_lower for kw in kws) for k, kws in keyword_groups.items()}
-    
-    logger.debug(f"Query-Analyse: {needs}")
-    
-    # Für jeden Key in den Daten
-    for key in data.keys():
-        values = extract_values_from_data(data, key)
-        if not values:
-            continue
-        
-        logger.debug(f"Key {key}: {len(values)} Werte")
-        is_energy_key = "energy" in key.lower() or "energie" in key.lower()
-        
-        # Summe
-        if needs["sum"] or is_energy_key:
-            total = sum(values)
-            statistics[f"sum_{key}"] = {"sum": total, "count": len(values)}
-            unit = "kWh" if is_energy_key else ""
-            summaries.append(f"{key}: Summe = {total:.4f} {unit}".strip())
-        
-        # Durchschnitt
-        if needs["mean"] or needs["sum"]:
-            result = calculate_mean(values)
-            if "mean" in result:
-                statistics[f"mean_{key}"] = result
-                summaries.append(f"{key}: Durchschnitt = {result['mean']:.4f} (n={result['count']})")
-        
-        # Standardabweichung
-        if needs["std"]:
-            result = calculate_std(values)
-            if "std" in result and result["std"] is not None:
-                statistics[f"std_{key}"] = result
-                summaries.append(f"{key}: Std = {result['std']:.4f}")
-        
-        # Min/Max
-        if needs["minmax"]:
-            result = calculate_min_max(values)
-            if "min" in result and result["min"] is not None:
-                statistics[f"minmax_{key}"] = result
-                summaries.append(f"{key}: Min={result['min']:.2f}, Max={result['max']:.2f}")
-        
-        # Anomalien
-        if needs["anomaly"]:
-            result = detect_anomalies(values)
-            statistics[f"anomalies_{key}"] = result
-            summaries.append(f"{key}: {result['anomalies_count']} Anomalien ({result.get('anomaly_percentage', 0):.1f}%)")
-        
-        # Trend
-        if needs["trend"]:
-            timestamps = extract_timestamps_from_data(data, key)
-            result = calculate_linear_trend(values, timestamps if timestamps else None)
-            if "slope" in result and result["slope"] is not None:
-                statistics[f"trend_{key}"] = result
-                summaries.append(f"{key}: {result['trend']} (R²={result['r_squared']:.3f})")
-    
-    # Fallback: Basis-Stats für alle Keys
-    if not statistics:
-        logger.debug("Kein Keyword-Match - berechne Basis-Stats")
-        for key in list(data.keys())[:5]:
-            values = extract_values_from_data(data, key)
-            if not values:
-                continue
-            
-            mean_result = calculate_mean(values)
-            total = sum(values)
-            
-            statistics[f"mean_{key}"] = mean_result
-            statistics[f"sum_{key}"] = {"sum": total, "count": len(values)}
-            
-            is_energy = "energy" in key.lower()
-            unit = " kWh" if is_energy else ""
-            summaries.append(f"{key}: Summe = {total:.4f}{unit}, Durchschnitt = {mean_result['mean']:.4f}")
-    
-    logger.debug(f"Ergebnis: {len(statistics)} Stats")
-    
-    return {
-        "statistics": statistics if statistics else None,
-        "statistics_summary": "; ".join(summaries) if summaries else "Keine Statistiken berechnet.",
-    }
+    system_prompt = get_stats_agent_prompt()
+    system_content = f"{system_prompt}\n\n## AKTUELLE DATEN\n\n{data_context}"
 
-
-# =============================================================================
-# MCP-BASIERTE AUSFÜHRUNG
-# =============================================================================
-
-async def run_stats_agent_with_mcp(state: AgentState) -> dict[str, Any]:
-    """Führt den Stats Agent mit MCP Server aus (nutzt gecachte Session)."""
-    tools = await get_stats_mcp_tools()
-    logger.debug(f"Stats MCP Tools bereit: {len(tools)} Tools")
-
-    agent = create_stats_agent(tools)
-    data_context = prepare_stats_context(state)
-
-    system_content = f"{STATS_AGENT_SYSTEM_PROMPT}\n\n## AKTUELLE DATEN\n\n{data_context}"
-
-    # SystemMessages filtern (DEC-014)
-    filtered_messages = [
-        msg for msg in state["messages"]
-        if not isinstance(msg, SystemMessage)
-    ]
-
-    # DEC-021: SystemMessage mit cache_control für Prompt Caching
-    messages_with_system = [
+    messages = [
         create_cached_system_message(system_content),
-        *filtered_messages
+        HumanMessage(content=user_query),
     ]
 
-    logger.debug("Starte Agent-Ausführung...")
-    result = await asyncio.wait_for(
-        agent.ainvoke({"messages": messages_with_system}),
-        timeout=120  # Erhöht von 60s, da Agent mehrere Tool-Calls machen kann
-    )
-    logger.debug(f"Agent fertig, {len(result.get('messages', []))} Messages")
+    logger.debug("LLM wählt Stats Tool...")
+    response = await llm_with_tools.ainvoke(messages)
 
-    statistics = extract_statistics_from_messages(result.get("messages", []))
-    stats_summary = generate_statistics_summary(statistics)
+    if not response.tool_calls:
+        logger.debug("Kein Tool-Call vom LLM")
+        return None, "Keine Analyse angefordert"
 
-    return {
-        "messages": result.get("messages", []),
-        "statistics": statistics,
-        "statistics_summary": stats_summary,
-    }
+    # Alle Tool-Calls ausführen
+    results = []
+    tool_map = {t.name: t for t in STATS_TOOLS}
 
+    for tool_call in response.tool_calls:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
 
-async def execute_stats_with_retry(state: AgentState, max_retries: int = MAX_RETRIES) -> Optional[dict]:
-    """
-    Versucht MCP-Ausführung mit Retry.
-    Gibt None zurück wenn alle Versuche fehlschlagen.
+        logger.debug(f"Tool gewählt: {tool_name}, args={tool_args}")
 
-    DEC-018: Bei Rate Limit (429) wird der API Key rotiert.
-    """
-    for attempt in range(max_retries):
-        try:
-            result = await run_stats_agent_with_mcp(state)
-            if result.get("statistics"):
-                logger.debug(f"MCP erfolgreich (Versuch {attempt + 1}, {api_key_rotator.get_key_info()})")
-                return result
-            else:
-                logger.debug(f"MCP lief, aber keine Statistics (Versuch {attempt + 1})")
-                return None
+        # State manuell injizieren (wie Viz Agent)
+        tool_args["state"] = tool_state
 
-        except asyncio.TimeoutError:
-            delay = RETRY_DELAY_BASE * (2 ** attempt)
-            logger.warning(f"MCP Timeout (Versuch {attempt + 1}/{max_retries}): Agent-Ausführung dauerte länger als 120s")
+        if tool_name in tool_map:
+            result = tool_map[tool_name].invoke(tool_args)
+            results.append({"tool": tool_name, "result": result})
+        else:
+            results.append({"tool": tool_name, "result": f"Unbekanntes Tool: {tool_name}"})
 
-            if attempt < max_retries - 1:
-                await asyncio.sleep(delay)
-
-        except ConnectionError as e:
-            delay = RETRY_DELAY_BASE * (2 ** attempt)
-            logger.warning(f"MCP Verbindungsfehler (Versuch {attempt + 1}/{max_retries}): {e or 'Keine Details'}")
-
-            if attempt < max_retries - 1:
-                await asyncio.sleep(delay)
-
-        except Exception as e:
-            error_str = str(e).lower()
-
-            # Rate Limit Error - Key rotieren (DEC-018)
-            if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
-                logger.warning(f"Rate Limit mit {api_key_rotator.get_key_info()} (Versuch {attempt + 1}/{max_retries})")
-
-                if attempt < max_retries - 1:
-                    api_key_rotator.rotate()
-                    delay = RETRY_DELAY_BASE * (2 ** attempt)
-                    logger.info(f"Neuer Key: {api_key_rotator.get_key_info()}, warte {delay}s...")
-                    await asyncio.sleep(delay)
-                    continue
-
-            logger.warning(f"MCP unerwarteter Fehler: {e}")
-            return None
-
-    return None
+    return results, response.content if hasattr(response, 'content') else ""
 
 
 # =============================================================================
@@ -478,53 +535,94 @@ async def execute_stats_with_retry(state: AgentState, max_retries: int = MAX_RET
 async def run_stats_agent(state: AgentState) -> dict[str, Any]:
     """
     Führt den Stats Agent aus.
-    
-    Strategie:
-    1. Versuche MCP-basierte Ausführung
-    2. Bei Fehler oder leeren Stats → Fallback auf direkte Berechnung
+
+    Pattern: InjectedState (DEC-003) - wie Viz Agent
+    - LLM sieht nur Metadaten (welche Keys verfügbar)
+    - LLM wählt Tool und Parameter (welche Keys analysieren)
+    - State wird manuell in Tool-Args injiziert
     """
     try:
-        logger.debug("Starte Stats Agent")
-        
+        logger.debug("Starte Stats Agent (InjectedState Pattern)")
+
         # Prüfe ob Daten vorhanden
         datasets = state.get("datasets", {})
         data = extract_data_from_datasets(datasets)
-        
+
         if not data:
             return {
                 "messages": [AIMessage(content="Keine Daten für statistische Analyse vorhanden. Bitte erst Daten laden.")],
                 "error": "no_data",
             }
-        
-        # Query für Fallback extrahieren
-        query = extract_user_query(state["messages"])
-        logger.debug(f"Query: {query}")
-        
-        # 1. Versuche MCP
-        mcp_result = await execute_stats_with_retry(state)
-        
-        if mcp_result:
-            logger.info(f"Stats berechnet (MCP): {mcp_result.get('statistics_summary', '')[:100]}")
-            return mcp_result
-        
-        # 2. Fallback: Direkte Berechnung
-        logger.debug("Verwende Fallback: Direkte Berechnung")
-        fallback_result = compute_stats_directly(state, query)
-        
-        if fallback_result.get("statistics"):
-            stats_summary = fallback_result['statistics_summary']
-            response_text = f"Statistische Analyse:\n\n{stats_summary}"
-            logger.info(f"Stats berechnet (Fallback): {stats_summary[:100]}")
-        else:
-            response_text = "Konnte keine Statistiken berechnen."
-            logger.warning("Keine Stats berechnet (weder MCP noch Fallback)")
-        
+
+        # Context mit nur Metadaten
+        data_context = prepare_stats_context(state)
+
+        # User Query extrahieren
+        user_query = extract_user_query(state["messages"])
+        logger.debug(f"Query: {user_query}")
+        logger.debug(f"Verfügbare Keys: {list(data.keys())}")
+
+        # LLM mit Tools
+        llm = create_anthropic_client()
+        llm_with_tools = llm.bind_tools(STATS_TOOLS)
+
+        # Tool State vorbereiten (das was die Tools sehen)
+        tool_state = {
+            "datasets": datasets,
+            "data_summary": state.get("data_summary", ""),
+        }
+
+        # Tool auswählen und ausführen
+        results, llm_response = await select_and_execute_tool(
+            llm_with_tools, user_query, data_context, tool_state
+        )
+
+        if not results:
+            return {
+                "messages": [AIMessage(content=llm_response or "Keine statistische Analyse durchgeführt.")],
+                "statistics": None,
+                "statistics_summary": "",
+            }
+
+        # Statistiken aus Ergebnissen extrahieren
+        statistics = {}
+        summaries = []
+
+        for r in results:
+            tool_name = r["tool"]
+            result_str = r["result"]
+
+            try:
+                parsed = json.loads(result_str)
+                statistics[tool_name] = parsed
+
+                # Summary generieren
+                if "error" in parsed:
+                    summaries.append(f"{tool_name}: {parsed['error']}")
+                elif "r" in parsed:
+                    key_info = f"{parsed.get('key_x', '?')} ↔ {parsed.get('key_y', '?')}"
+                    summaries.append(f"Korrelation {key_info}: r={parsed['r']:.3f} ({parsed.get('interpretation', '')})")
+                elif "mean" in parsed:
+                    summaries.append(f"{parsed.get('key', '?')}: Durchschnitt = {parsed['mean']:.4f}")
+                elif "slope" in parsed:
+                    summaries.append(f"{parsed.get('key', '?')}: {parsed.get('trend', '')} (slope={parsed['slope']:.4f})")
+                elif "anomalies_count" in parsed:
+                    summaries.append(f"{parsed.get('key', '?')}: {parsed['anomalies_count']} Anomalien")
+            except json.JSONDecodeError:
+                summaries.append(result_str)
+
+        stats_summary = "; ".join(summaries)
+        logger.info(f"Stats berechnet: {stats_summary[:100]}")
+
+        # Antwort generieren
+        response_text = f"Statistische Analyse:\n\n{stats_summary}"
+
         return {
             "messages": [AIMessage(content=response_text)],
-            "statistics": fallback_result.get("statistics"),
-            "statistics_summary": fallback_result.get("statistics_summary"),
+            "statistics": statistics,
+            "statistics_summary": stats_summary,
         }
-    
+
     except Exception as e:
         error_msg = f"Fehler bei der statistischen Analyse: {str(e)}"
         logger.error(error_msg, exc_info=True)
@@ -540,47 +638,53 @@ async def stats_agent_node(state: AgentState) -> dict[str, Any]:
 
 
 # =============================================================================
-# TESTS
+# TEST
 # =============================================================================
 
 async def test_stats_agent():
     """Test des Stats Agents."""
     from datetime import datetime, timedelta
     import random
-    
+
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    
+
     print("\n" + "="*60)
-    print("🧪 Stats Agent Test")
+    print("🧪 Stats Agent Test (InjectedState Pattern)")
     print("="*60)
-    
+
     now = datetime.now()
-    base_values = [25.0 + random.gauss(0, 2) for _ in range(50)]
-    base_values[10] = 45.0  # Ausreißer
-    base_values[30] = 5.0   # Ausreißer
-    
+
+    # Testdaten: Zwei Keys mit leicht unterschiedlichen Timestamps
     test_datasets = {
-        "temperature": {
+        "test": {
             "data": {
-                "temperature": [
-                    {"value": str(val), "timestamp": int((now - timedelta(minutes=50-i)).timestamp() * 1000)}
-                    for i, val in enumerate(base_values)
-                ]
+                "torque_a1": [
+                    {"value": str(25.0 + random.gauss(0, 2)), "timestamp": int((now - timedelta(minutes=50-i)).timestamp() * 1000)}
+                    for i in range(50)
+                ],
+                "position_a1": [
+                    {"value": str(45.0 + random.gauss(0, 3)), "timestamp": int((now - timedelta(minutes=50-i)).timestamp() * 1000 + random.randint(-100, 100))}
+                    for i in range(48)  # Absichtlich 2 weniger!
+                ],
             },
             "meta": {},
         }
     }
-    
-    print(f"📊 Test-Daten: {len(base_values)} Punkte (inkl. 2 Ausreißer)")
-    
+
+    print(f"📊 Test-Daten: torque_a1 (50 Punkte), position_a1 (48 Punkte)")
+
     state = AgentState(
-        messages=[HumanMessage(content="Was ist die Durchschnittstemperatur?")],
+        messages=[HumanMessage(content="Gibt es eine Korrelation zwischen torque_a1 und position_a1?")],
         datasets=test_datasets,
-        data_summary="50 Temperaturwerte",
+        data_summary="50 Drehmoment-Werte, 48 Position-Werte",
     )
-    
+
     result = await run_stats_agent(state)
-    print(f"📈 Statistics: {result.get('statistics_summary', 'N/A')}")
+
+    print(f"\n📈 Statistics Summary: {result.get('statistics_summary', 'N/A')}")
+
+    if result.get("statistics"):
+        print(f"📊 Statistics: {json.dumps(result['statistics'], indent=2)}")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ Er führt selbst KEINE Aktionen aus – er plant nur!
 DESIGN-ENTSCHEIDUNGEN:
 - DEC-013: Multi-Turn Support (berücksichtigt vorhandene Datasets)
 - DEC-016: Strukturiertes Logging
+- DEC-023: Query-Typ-basierte Datenstrategie (raw vs aggregated)
 """
 
 import sys
@@ -58,15 +59,15 @@ def create_supervisor_llm():
 def parse_supervisor_response(response: str) -> dict[str, Any]:
     """
     Parst die Supervisor-Antwort zu einem Plan-Dict.
-    
-    Erwartet JSON: {"plan": [...], "reasoning": "..."}
+
+    Erwartet JSON: {"plan": [...], "reasoning": "...", "data_mode": "..."}
     Ist robust gegen Markdown-Codeblöcke.
     """
     if not response:
-        return {"plan": [], "reasoning": "Keine Antwort vom Supervisor"}
-    
+        return {"plan": [], "reasoning": "Keine Antwort vom Supervisor", "data_mode": "aggregated"}
+
     cleaned = response.strip()
-    
+
     # Markdown Codeblöcke entfernen
     if "```" in cleaned:
         match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', cleaned, re.DOTALL)
@@ -74,33 +75,40 @@ def parse_supervisor_response(response: str) -> dict[str, Any]:
             cleaned = match.group(1)
         else:
             cleaned = re.sub(r'```(?:json)?', '', cleaned).strip()
-    
+
     try:
         result = json.loads(cleaned)
-        
+
         if not isinstance(result, dict):
-            return {"plan": [], "reasoning": f"Ungültiges Format: {type(result)}"}
-        
+            return {"plan": [], "reasoning": f"Ungültiges Format: {type(result)}", "data_mode": "aggregated"}
+
         if "plan" not in result:
-            return {"plan": [], "reasoning": "Kein 'plan' Feld in Antwort"}
-        
+            return {"plan": [], "reasoning": "Kein 'plan' Feld in Antwort", "data_mode": "aggregated"}
+
         if not isinstance(result["plan"], list):
-            return {"plan": [], "reasoning": f"'plan' ist keine Liste: {type(result['plan'])}"}
-        
+            return {"plan": [], "reasoning": f"'plan' ist keine Liste: {type(result['plan'])}", "data_mode": "aggregated"}
+
         # Validiere Agent-Namen
         for agent in result["plan"]:
             if agent not in VALID_AGENTS:
                 logger.warning(f"Unbekannter Agent '{agent}' im Plan")
-        
+
+        # DEC-023: Data Mode validieren
+        data_mode = result.get("data_mode", "aggregated")
+        if data_mode not in ("raw", "aggregated"):
+            logger.warning(f"Ungültiger data_mode '{data_mode}', verwende 'aggregated'")
+            data_mode = "aggregated"
+
         return {
             "plan": result["plan"],
             "reasoning": result.get("reasoning", "Keine Begründung"),
+            "data_mode": data_mode,
         }
-    
+
     except json.JSONDecodeError as e:
         logger.warning(f"JSON Parse Error: {e}")
         logger.debug(f"Response war: {cleaned[:200]}")
-        return {"plan": [], "reasoning": f"JSON Parse Error: {str(e)}"}
+        return {"plan": [], "reasoning": f"JSON Parse Error: {str(e)}", "data_mode": "aggregated"}
 
 
 def validate_plan(plan: list[str], has_datasets: bool) -> Tuple[bool, str, list[str]]:
@@ -274,13 +282,15 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
             }
         
         final_plan = repaired_plan if repaired_plan != result["plan"] else result["plan"]
-        
-        logger.info(f"Plan erstellt: {final_plan}")
-        
+        data_mode = result.get("data_mode", "aggregated")
+
+        logger.info(f"Plan erstellt: {final_plan}, data_mode: {data_mode}")
+
         return {
             "plan": final_plan,
             "reasoning": result["reasoning"],
             "current_step": 0,  # Step zurücksetzen für neuen Plan
+            "data_retrieval_mode": data_mode,  # DEC-023
             "messages": [AIMessage(content=f"Plan erstellt: {final_plan}")],
         }
     

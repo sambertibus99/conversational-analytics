@@ -5,7 +5,7 @@ Bietet 8 statistische Tools:
 1. mean - Durchschnitt
 2. std - Standardabweichung
 3. min_max - Minimum/Maximum
-4. correlation - Pearson-Korrelation
+4. correlation_timeseries - Korrelation für IoT-Zeitreihen (DEC-024)
 5. linear_trend - Lineare Regression/Trend
 6. moving_average - Gleitender Durchschnitt
 7. percentiles - Perzentile (Quartile)
@@ -27,7 +27,7 @@ from tools.stats_functions import (
     calculate_mean,
     calculate_std,
     calculate_min_max,
-    calculate_correlation,
+    calculate_correlation_timeseries,  # DEC-024
     calculate_linear_trend,
     calculate_moving_average,
     calculate_percentiles,
@@ -114,33 +114,63 @@ def min_max(values: list[float]) -> dict:
 
 
 @mcp.tool()
-def correlation(x_values: list[float], y_values: list[float]) -> dict:
+def correlation_timeseries(
+    x_timestamps: list[int],
+    x_values: list[float],
+    y_timestamps: list[int],
+    y_values: list[float],
+    tolerance_ms: int = 1000,
+) -> dict:
     """
-    Berechnet den Pearson-Korrelationskoeffizienten zwischen zwei Variablen.
-    
+    Berechnet Korrelation für IoT-Zeitreihen mit UNTERSCHIEDLICHEN Timestamps (DEC-024).
+
     WANN NUTZEN:
-    - "Korrelation", "Zusammenhang", "Beziehung zwischen"
-    - "hängt X mit Y zusammen?"
-    - "Abhängigkeit zwischen zwei Größen"
-    
+    - IoT-Sensordaten mit unterschiedlichen Abtastraten
+    - Wenn x und y UNTERSCHIEDLICHE LÄNGEN haben
+    - Zeitreihen mit Timing-Jitter (±10-50ms)
+    - "Korrelation zwischen Drehmoment und Position"
+
+    NICHT NUTZEN:
+    - Wenn beide Arrays bereits gleiche Länge haben → nutze correlation()
+
+    METHODE:
+    Nutzt pd.merge_asof um Datenpunkte anhand der nächsten Timestamps zu matchen.
+    Nur Punkte innerhalb der Toleranz werden gematcht.
+
     INTERPRETATION:
-    - r ≈ 0: kein linearer Zusammenhang
-    - r > 0.7: starker positiver Zusammenhang (wenn X steigt, steigt Y)
-    - r < -0.7: starker negativer Zusammenhang (wenn X steigt, fällt Y)
-    - 0.3 < |r| < 0.7: moderater Zusammenhang
-    - |r| < 0.3: schwacher/kein Zusammenhang
-    
+    - r > 0.7: starker positiver Zusammenhang
+    - r < -0.7: starker negativer Zusammenhang
+    - n_matched: Anzahl erfolgreich gematchter Punktepaare
+    - match_rate: Prozentsatz erfolgreicher Matches
+
     Args:
-        x_values: Erste Variable (z.B. Temperatur)
-        y_values: Zweite Variable (z.B. Druck) - MUSS gleiche Länge haben!
-    
+        x_timestamps: Timestamps der ersten Variable (Millisekunden)
+        x_values: Werte der ersten Variable
+        y_timestamps: Timestamps der zweiten Variable (Millisekunden)
+        y_values: Werte der zweiten Variable
+        tolerance_ms: Maximale erlaubte Zeitdifferenz für Match (default: 1000ms)
+
     Returns:
-        {"r": 0.85, "p_value": 0.001, "interpretation": "stark positiv", ...}
-    
+        {
+            "r": 0.85, "p_value": 0.001, "interpretation": "stark positiv",
+            "n_matched": 98, "n_dropped": 2, "n_x": 100, "n_y": 98,
+            "match_rate": 98.0, "tolerance_ms": 1000
+        }
+
     BEISPIEL:
-        correlation([1,2,3,4,5], [2,4,5,4,5]) → {"r": 0.83, "interpretation": "stark positiv"}
+        # Sensor X: 5 Punkte, Sensor Y: nur 4 Punkte (1 fehlt)
+        correlation_timeseries(
+            x_timestamps=[1000, 2000, 3000, 4000, 5000],
+            x_values=[10.0, 20.0, 30.0, 40.0, 50.0],
+            y_timestamps=[1010, 2005, 3020, 4002],  # leicht versetzt, 1 fehlt!
+            y_values=[11.0, 19.0, 31.0, 39.0]
+        ) → {"r": 0.96, "n_matched": 5, "interpretation": "stark positiv"}
     """
-    return calculate_correlation(x_values, y_values)
+    return calculate_correlation_timeseries(
+        x_timestamps, x_values,
+        y_timestamps, y_values,
+        tolerance_ms,
+    )
 
 
 @mcp.tool()
@@ -273,6 +303,6 @@ def anomaly_detection(values: list[float], sigma_threshold: float = 2.0) -> dict
 
 if __name__ == "__main__":
     print("🚀 Starting IIoT Statistics MCP Server...")
-    print("   Tools: mean, std, min_max, correlation, linear_trend,")
-    print("          moving_average, percentiles, anomaly_detection")
+    print("   Tools: mean, std, min_max, correlation_timeseries,")
+    print("          linear_trend, moving_average, percentiles, anomaly_detection")
     mcp.run()

@@ -11,27 +11,64 @@ DESIGN-ENTSCHEIDUNGEN:
 - DEC-002: LLM parst Zeitangaben → Tool bekommt ISO-Format
 - DEC-011: Literal Types für interval/aggregation
 - DEC-015: XML-Tags für Prompt-Struktur (Anthropic Best Practice)
+- DEC-023: Raw vs Aggregated Modus basierend auf Query-Typ
 """
 
 from datetime import datetime, timedelta
 
 
-def get_data_agent_prompt() -> str:
+def get_data_agent_prompt(data_mode: str = "aggregated") -> str:
     """
     Generiert den System Prompt mit aktuellem Datum.
-    
+
+    Args:
+        data_mode: "raw" für Statistik/Korrelation, "aggregated" für Visualisierungen (DEC-023)
+
     WICHTIG: Diese Funktion muss bei jedem Request aufgerufen werden,
     damit das Datum aktuell ist!
     """
     now = datetime.now()
     current_date = now.strftime("%Y-%m-%d")
-    current_weekday = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"][now.weekday()]
+    current_year = now.year
+    weekday_names = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+    current_weekday = weekday_names[now.weekday()]
     current_time = now.strftime("%H:%M")
-    
+
     # Beispiel-Daten für den Prompt
     yesterday = (now - timedelta(days=1)).strftime('%Y-%m-%d')
     one_hour_ago = (now - timedelta(hours=1)).strftime('%H:%M')
-    
+
+    # Dynamische Beispiel-Daten (DEC-022: Konsistente Jahreszahlen in Few-Shot Examples)
+    # "16. Dezember" → letztes Jahr wenn wir noch nicht im Dezember sind, sonst aktuelles Jahr
+    if now.month >= 12 and now.day >= 16:
+        example_dec_16 = f"{current_year}-12-16"
+    else:
+        example_dec_16 = f"{current_year - 1}-12-16"
+    example_dec_16_human = datetime.strptime(example_dec_16, "%Y-%m-%d").strftime("%d.%m.%Y")
+
+    # Letzter Dienstag für Wochentag-Beispiel
+    days_since_tuesday = (now.weekday() - 1) % 7  # 1 = Dienstag
+    if days_since_tuesday == 0:
+        days_since_tuesday = 7  # Wenn heute Dienstag ist, nimm letzten Dienstag
+    last_tuesday = now - timedelta(days=days_since_tuesday)
+    last_tuesday_date = last_tuesday.strftime('%Y-%m-%d')
+
+    # Beispiel-Arbeitstag für Multi-Turn Examples (5 Tage zurück)
+    example_workday = now - timedelta(days=5)
+    example_workday_date = example_workday.strftime('%Y-%m-%d')
+    example_workday_day = example_workday.strftime('%d.%m.')
+
+    # DEC-023: Data Mode Text
+    if data_mode == "raw":
+        data_mode_text = """- Setze raw=True bei get_telemetry!
+- Wichtig für: Korrelation, Statistik, Vergleiche
+- Holt Rohdaten ohne Aggregation (mehr Punkte = genauere Berechnungen)
+- Bei Zeiträumen >24h: Automatischer Fallback auf 1-Minuten-Aggregation"""
+    else:
+        data_mode_text = """- Standard-Aggregation wird verwendet
+- Gut für: Visualisierungen, Trends, Charts
+- Geglättete Daten mit automatischem Intervall"""
+
     return f"""<role>
 Du bist ein IIoT-Datenexperte der Sensordaten von einem KUKA KRC5 Roboter abruft.
 </role>
@@ -44,12 +81,18 @@ Heute ist {current_weekday}, {current_date}. Aktuelle Uhrzeit: {current_time}.
 Analysiere die Nutzeranfrage, berechne konkrete Datums-/Zeitangaben und hole die passenden Daten.
 </task>
 
+<data_mode>
+Aktueller Modus: {data_mode}
+
+{data_mode_text}
+</data_mode>
+
 <instructions>
 
 ## Zeitangaben berechnen
 
 Wandle natürliche Zeitangaben in ISO-Format um:
-- Datum: YYYY-MM-DD (z.B. "2025-12-16")
+- Datum: YYYY-MM-DD (z.B. "{current_year}-12-16")
 - Zeit: HH:MM (z.B. "14:30")
 
 Wochentage beziehen sich immer auf den LETZTEN (nie zukünftig).
@@ -85,7 +128,8 @@ Gültige Werte:
 
 | Tool | Wann benutzen |
 |------|---------------|
-| get_data_availability | Zuerst, wenn unklar ob Daten existieren |
+| search_telemetry_keys | IMMER ZUERST wenn User Messwerte mit natürlicher Sprache anfragt |
+| get_data_availability | Wenn unklar ob Daten existieren |
 | list_devices | User fragt "Welche Geräte gibt es?" |
 | get_device_info | User fragt nach Geräte-Details |
 | list_telemetry_keys | User fragt "Welche Messwerte gibt es?" |
@@ -100,30 +144,36 @@ get_telemetry Response enthält:
 
 </tools>
 
-<telemetry_keys>
+<key_lookup>
 
-Kartesische Position (TCP):
-- pos_act_x_mm, pos_act_y_mm, pos_act_z_mm (Position in mm)
-- pos_act_a_deg, pos_act_b_deg, pos_act_c_deg (Orientierung in Grad)
+## Telemetrie-Keys finden
 
-Achspositionen (6 Achsen):
-- axis_act_a1_deg bis axis_act_a6_deg (Achsposition in Grad)
+Nutze search_telemetry_keys um die passenden Keys für get_telemetry zu finden:
+→ search_telemetry_keys(query="Gelenkwinkel") → liefert exakte Key-Namen
 
-Geschwindigkeiten:
-- vel_act_m_per_s (Bahngeschwindigkeit in m/s)
+## Ablauf
 
-Drehmomente (6 Achsen):
-- torque_act_a1_nm bis torque_act_a6_nm (Ist-Drehmoment in Nm)
+1. search_telemetry_keys(query="...") → Passende Keys finden
+2. get_telemetry(keys="...", ...) → Daten holen
 
-Energie und Status:
-- energy_period_kwh (Energieverbrauch pro Periode)
-- override_pct (Override in %)
+Bei "kein Match" bekommst du eine Übersicht aller Gruppen mit Aliases.
+Versuche es dann mit einem der angezeigten Aliases.
 
-Schreibe Keys exakt wie hier angegeben.
-Rufe maximal 6-10 Keys pro Abfrage ab.
-Bei "alle Daten" frage: "Es gibt 51 Messwerte. Welche Gruppe interessiert dich?"
+## Beispiele
 
-</telemetry_keys>
+User: "Zeig mir die Drehmomente"
+→ search_telemetry_keys(query="Drehmoment")
+→ Ergebnis: keys=["torque_act_a1_nm", ...], unit="Nm"
+→ get_telemetry(keys="torque_act_a1_nm,torque_act_a2_nm,...")
+
+User: "Wie schnell ist der Roboter?"
+→ search_telemetry_keys(query="Geschwindigkeit")
+→ Ergebnis: keys=["vel_act_m_per_s"], unit="m/s"
+→ get_telemetry(keys="vel_act_m_per_s", ...)
+
+Bei "alle Daten" frage nach welche Gruppe interessiert.
+
+</key_lookup>
 
 <examples>
 
@@ -134,13 +184,49 @@ Zeitangaben-Umrechnung (heute ist {current_weekday}, {current_date}):
 | "gestern" | {yesterday} | {yesterday} | 00:00 | 23:59 |
 | "letzte Stunde" | {current_date} | {current_date} | {one_hour_ago} | {current_time} |
 | "heute" | {current_date} | {current_date} | 00:00 | 23:59 |
-| "16. Dezember" | 2025-12-16 | 2025-12-16 | 00:00 | 23:59 |
-| "Dienstag 13-16 Uhr" | (letzter Di) | (letzter Di) | 13:00 | 16:00 |
+| "16. Dezember" | {example_dec_16} | {example_dec_16} | 00:00 | 23:59 |
+| "Dienstag 13-16 Uhr" | {last_tuesday_date} | {last_tuesday_date} | 13:00 | 16:00 |
 
 Beispiel-Antwort nach Datenabruf:
-"Ich habe die Drehmomente für Dienstag, 16.12.2025 geladen.
+"Ich habe die Drehmomente für Dienstag, {example_dec_16_human} geladen.
 📊 Einstellungen: Durchschnitt alle 10 Minuten (automatisch für Tagesdaten)
 💡 Du kannst anpassen: 'zeig Maximum' oder 'mit 5-Minuten-Intervall'"
+
+## Multi-Turn Beispiele
+
+Beispiel 1 - Daten schon geladen:
+<loaded_data>
+## torque
+keys: torque_act_a1_nm, torque_act_a2_nm
+zeitraum: {example_workday_date}T08:00 - {example_workday_date}T17:00
+einstellungen: Durchschnitt alle 10 Minuten
+preview (torque_act_a1_nm): 54 Punkte, min=-2.5, max=12.3, avg=4.8
+</loaded_data>
+
+User: "Zeig die Drehmomente nochmal"
+→ Keine API-Abfrage nötig! Daten sind bereits in <loaded_data>.
+→ Antworte: "Die Drehmoment-Daten vom {example_workday_day} sind bereits geladen (54 Punkte pro Key). Möchtest du sie visualisieren?"
+
+Beispiel 2 - Korrelation, eine Seite fehlt:
+<loaded_data>
+## torque
+keys: torque_act_a1_nm, torque_act_a2_nm
+zeitraum: {example_workday_date}T08:00 - {example_workday_date}T17:00
+</loaded_data>
+
+User: "Gibt es einen Zusammenhang zwischen Position und Moment?"
+→ torque ist schon geladen (siehe <loaded_data>)
+→ Lade NUR axis_act_* für denselben Zeitraum
+→ get_telemetry(keys="axis_act_a1_deg,axis_act_a2_deg", start_date="{example_workday_date}", start_time="08:00", end_date="{example_workday_date}", end_time="17:00")
+
+Beispiel 3 - Beide Datentypen fehlen:
+<loaded_data>
+(leer)
+</loaded_data>
+
+User: "Vergleiche Position und Geschwindigkeit von gestern"
+→ Keine Daten geladen, lade beide auf einmal
+→ get_telemetry(keys="axis_act_a1_deg,axis_act_a2_deg,vel_act_m_per_s", start_date="{yesterday}", ...)
 
 </examples>
 

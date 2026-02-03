@@ -65,37 +65,37 @@ Erstellt Visualisierungen aus vorhandenen Daten.
 ### Neue Anfragen (keine Daten geladen)
 
 Anfrage: "Zeig mir die Temperatur von Roboter 1"
-{"plan": ["data_agent", "viz_agent"], "reasoning": "Daten laden + Visualisierung"}
+{"plan": ["data_agent", "viz_agent"], "reasoning": "Daten laden + Visualisierung", "data_mode": "aggregated"}
 
 Anfrage: "Wie ist die aktuelle Position von Achse 1?"
-{"plan": ["data_agent"], "reasoning": "Nur Datenabruf"}
+{"plan": ["data_agent"], "reasoning": "Nur Datenabruf", "data_mode": "aggregated"}
 
 Anfrage: "Was ist die Durchschnittstemperatur?"
-{"plan": ["data_agent", "stats_agent"], "reasoning": "Daten laden + Statistik"}
+{"plan": ["data_agent", "stats_agent"], "reasoning": "Daten laden + Statistik", "data_mode": "raw"}
 
 Anfrage: "Gibt es Korrelation zwischen Drehmoment und Geschwindigkeit? Zeig als Chart."
-{"plan": ["data_agent", "stats_agent", "viz_agent"], "reasoning": "Daten + Statistik + Visualisierung"}
+{"plan": ["data_agent", "stats_agent", "viz_agent"], "reasoning": "Daten + Korrelation + Visualisierung", "data_mode": "raw"}
 
 Anfrage: "Wie wird das Wetter morgen?"
-{"plan": [], "reasoning": "Keine IIoT-Anfrage"}
+{"plan": [], "reasoning": "Keine IIoT-Anfrage", "data_mode": "aggregated"}
 
 ### Multi-Turn (Daten bereits geladen)
 
 Anfrage: "Gibt es Zusammenhang mit der Geschwindigkeit?"
 Geladene Daten: torque_act_a1_nm, torque_act_a2_nm (Geschwindigkeit NICHT geladen)
-{"plan": ["data_agent", "stats_agent"], "reasoning": "Geschwindigkeit laden + Korrelation"}
+{"plan": ["data_agent", "stats_agent"], "reasoning": "Geschwindigkeit laden + Korrelation", "data_mode": "raw"}
 
 Anfrage: "Zeig das als Balkendiagramm"
 Geladene Daten: torque_act_a1_nm, torque_act_a2_nm
-{"plan": ["viz_agent"], "reasoning": "Daten vorhanden, nur Visualisierung"}
+{"plan": ["viz_agent"], "reasoning": "Daten vorhanden, nur Visualisierung", "data_mode": "aggregated"}
 
 Anfrage: "Berechne den Durchschnitt"
 Geladene Daten: temperature_sensor
-{"plan": ["stats_agent"], "reasoning": "Daten vorhanden, nur Statistik"}
+{"plan": ["stats_agent"], "reasoning": "Daten vorhanden, nur Statistik", "data_mode": "raw"}
 
 Anfrage: "Was sind die Werte?" / "Zeig mir die Zahlenwerte"
 Geladene Daten: axis_act_a1_deg, axis_act_a2_deg
-{"plan": [], "reasoning": "Daten vorhanden, können direkt angezeigt werden"}
+{"plan": [], "reasoning": "Daten vorhanden, können direkt angezeigt werden", "data_mode": "aggregated"}
 
 </examples>
 
@@ -103,7 +103,11 @@ Geladene Daten: axis_act_a1_deg, axis_act_a2_deg
 
 Antworte NUR mit einem JSON-Objekt. Kein Markdown, keine Codeblöcke:
 
-{"plan": ["agent1", "agent2"], "reasoning": "Kurze Begründung"}
+{"plan": ["agent1", "agent2"], "reasoning": "Kurze Begründung", "data_mode": "aggregated"}
+
+data_mode bestimmt wie Daten abgerufen werden (DEC-023):
+- "raw": Für Statistik, Korrelation, Vergleich - mehr Datenpunkte für genaue Berechnungen
+- "aggregated": Für Charts, Trends, Visualisierungen - geglättete Daten (Standard)
 
 </output_format>
 

@@ -22,7 +22,7 @@ from tools.stats_functions import (
     calculate_mean,
     calculate_std,
     calculate_min_max,
-    calculate_correlation,
+    calculate_correlation_timeseries,  # DEC-024
     calculate_linear_trend,
     calculate_moving_average,
     calculate_percentiles,
@@ -69,33 +69,45 @@ class TestStatsFunctions:
         assert result["range"] == 8
     
     def test_correlation_positive(self):
-        """Positive Korrelation."""
+        """Positive Korrelation (DEC-024: mit Timestamps)."""
+        x_ts = [1000, 2000, 3000, 4000, 5000]
         x = [1, 2, 3, 4, 5]
+        y_ts = [1000, 2000, 3000, 4000, 5000]
         y = [2, 4, 6, 8, 10]  # Perfekt korreliert
-        result = calculate_correlation(x, y)
+        result = calculate_correlation_timeseries(x_ts, x, y_ts, y)
         assert result["r"] == pytest.approx(1.0, abs=0.001)
         assert result["strength"] == "stark"
         assert result["direction"] == "positiv"
-    
+
     def test_correlation_negative(self):
-        """Negative Korrelation."""
+        """Negative Korrelation (DEC-024: mit Timestamps)."""
+        x_ts = [1000, 2000, 3000, 4000, 5000]
         x = [1, 2, 3, 4, 5]
+        y_ts = [1000, 2000, 3000, 4000, 5000]
         y = [10, 8, 6, 4, 2]  # Perfekt negativ korreliert
-        result = calculate_correlation(x, y)
+        result = calculate_correlation_timeseries(x_ts, x, y_ts, y)
         assert result["r"] == pytest.approx(-1.0, abs=0.001)
         assert result["direction"] == "negativ"
-    
+
     def test_correlation_no_correlation(self):
-        """Keine Korrelation."""
+        """Keine Korrelation (DEC-024: mit Timestamps)."""
+        x_ts = [1000, 2000, 3000, 4000, 5000]
         x = [1, 2, 3, 4, 5]
+        y_ts = [1000, 2000, 3000, 4000, 5000]
         y = [5, 2, 8, 1, 9]  # Zufällig
-        result = calculate_correlation(x, y)
+        result = calculate_correlation_timeseries(x_ts, x, y_ts, y)
         assert abs(result["r"]) < 0.7  # Nicht stark korreliert
-    
+
     def test_correlation_unequal_length(self):
-        """Korrelation mit ungleichen Längen."""
-        result = calculate_correlation([1, 2, 3], [1, 2])
-        assert "error" in result
+        """Korrelation mit ungleichen Längen - DEC-024 merge_asof macht das möglich!"""
+        x_ts = [1000, 2000, 3000]
+        x = [1, 2, 3]
+        y_ts = [1010, 2005]  # Nur 2 Punkte, leicht versetzt
+        y = [1.1, 2.0]
+        result = calculate_correlation_timeseries(x_ts, x, y_ts, y, tolerance_ms=100)
+        # Sollte 3 Matches finden (alle x-Punkte matchen zu nächstem y)
+        assert result.get("n_matched") >= 2
+        assert result.get("r") is not None  # Kein Error mehr!
     
     def test_linear_trend_rising(self):
         """Steigender Trend."""
@@ -194,13 +206,13 @@ class TestStatsMCPServer:
                 print(f"Verfügbare Tools: {tool_names}")
                 
                 expected_tools = [
-                    "mean", "std", "min_max", "correlation",
+                    "mean", "std", "min_max", "correlation_timeseries",
                     "linear_trend", "moving_average", "percentiles", "anomaly_detection"
                 ]
-                
+
                 for tool in expected_tools:
                     assert tool in tool_names, f"Tool '{tool}' fehlt!"
-                
+
                 assert len(tool_names) == 8, f"Erwartet 8 Tools, gefunden: {len(tool_names)}"
     
     @pytest.mark.asyncio

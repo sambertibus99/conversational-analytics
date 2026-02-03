@@ -31,6 +31,9 @@
 | DEC-019 | Beispiel-basierte State-Awareness | Agent ignoriert geladene Daten | Beispiele im Prompt statt Tool | Multi-Turn Konversationen |
 | DEC-020 | Komprimierter Telemetry Lookup | Catalog ~10k Tokens im LLM-Context | Substring-Match in MCP Tool | Telemetrie-Key-Auflösung |
 | DEC-021 | Prompt Caching (Rate Limit) | 30k ITPM bei Multi-Agent Pipeline | cache_control auf System Prompts | Alle LLM-Aufrufe |
+| DEC-022 | Dynamische Few-Shot Dates | Falsches Jahr in Beispielen | Datums-Beispiele dynamisch generieren | Prompts mit Datumsangaben |
+| DEC-023 | Query-Typ-basierte Daten | Zu wenig Punkte für Statistik | Raw für Stats, Aggregated für Viz | Korrelation, Statistik-Queries |
+| DEC-024 | Timeseries Korrelation | IoT-Sensoren mit unterschiedlichen Timestamps | pd.merge_asof für Alignment | Korrelation zwischen Sensoren |
 
 ---
 
@@ -930,7 +933,7 @@ STOP-REGEL 1: Bei status="no_data"
 | Vorher | Nachher | Grund |
 |--------|---------|-------|
 | Unicode-Boxen `╔═══╗` | `<critical_rules>` | Claude versteht XML besser |
-| "NIEMALS alle Keys abrufen!" | "Rufe maximal 6-10 Keys ab" | Positive Anweisung |
+| "NIEMALS alle Keys abrufen!" | ~~"Rufe maximal 6-10 Keys ab"~~ ENTFERNT (03.02.2026) | Key-Limit unnötig: Agent sieht nur Statistics, Rohdaten gehen via DEC-004 in Datei |
 | Redundante Aggregations-Erklärungen | Einmal erklärt | Kürzer, klarer |
 | ~180 Zeilen | ~130 Zeilen | ~28% kürzer |
 | Gemischte Struktur | Klare Sektionen | Besser parsbar |
@@ -1557,6 +1560,437 @@ def create_anthropic_client(model=DEFAULT_MODEL, temperature=0, enable_caching=T
 
 ---
 
+## DEC-022: Dynamische Datumsangaben in Few-Shot Examples
+
+> **Status:** ✅ IMPLEMENTIERT
+> **Datum:** 03. Februar 2026
+> **Auslöser:** LLM verwendete falsches Jahr (2025 statt 2026) bei Datumsberechnungen
+
+### Problem/Kontext
+
+Bei der Anfrage "Gibt es eine Korrelation zwischen Drehmoment und Position" verwendete der Data Agent das falsche Jahr:
+
+```
+Erster Versuch: 2025-01-29 12:00 → 0 Datenpunkte (falsches Jahr!)
+Zweiter Versuch: 2026-01-29 12:00 → 72 Datenpunkte (korrekt)
+```
+
+**Ursache:** Der Prompt injizierte das aktuelle Datum korrekt in `<context>`, aber die Few-Shot Examples enthielten hardcoded Jahreszahlen von 2025. Das LLM folgte dem Muster aus den Beispielen statt dem aktuellen Jahr.
+
+**Recherche-Ergebnisse:**
+
+| Quelle | Empfehlung |
+|--------|-----------|
+| [OpenAI Community](https://community.openai.com/t/how-do-we-make-llm-understand-the-context-of-time/328978) | "Inject the current date into prompts programmatically" |
+| [Anthropic Docs](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/multishot-prompting) | "Match **every detail** in examples to desired output - Claude replicates patterns" |
+| [Lakera Guide](https://www.lakera.ai/blog/prompt-engineering-guide) | "Ambiguity is the most common cause of poor LLM output" |
+
+### Entscheidung
+
+**Alle Datumsangaben in Few-Shot Examples dynamisch generieren**
+
+### Pattern
+
+```python
+def get_data_agent_prompt() -> str:
+    now = datetime.now()
+    current_year = now.year
+
+    # "16. Dezember" → korrektes Jahr basierend auf aktuellem Datum
+    if now.month >= 12 and now.day >= 16:
+        example_dec_16 = f"{current_year}-12-16"
+    else:
+        example_dec_16 = f"{current_year - 1}-12-16"
+
+    # Letzter Dienstag für Wochentag-Beispiel
+    days_since_tuesday = (now.weekday() - 1) % 7
+    if days_since_tuesday == 0:
+        days_since_tuesday = 7
+    last_tuesday = now - timedelta(days=days_since_tuesday)
+    last_tuesday_date = last_tuesday.strftime('%Y-%m-%d')
+
+    # Beispiel-Arbeitstag für Multi-Turn Examples
+    example_workday = now - timedelta(days=5)
+    example_workday_date = example_workday.strftime('%Y-%m-%d')
+
+    return f"""
+    ...
+    | "16. Dezember" | {example_dec_16} | {example_dec_16} | 00:00 | 23:59 |
+    | "Dienstag 13-16 Uhr" | {last_tuesday_date} | {last_tuesday_date} | 13:00 | 16:00 |
+    ...
+    zeitraum: {example_workday_date}T08:00 - {example_workday_date}T17:00
+    """
+```
+
+### Geänderte Stellen
+
+| Zeile (vorher) | Hardcoded | Dynamisch |
+|----------------|-----------|-----------|
+| "16. Dezember" Beispiel | `2025-12-16` | `{example_dec_16}` |
+| Dienstag-Beispiel | `(letzter Di)` | `{last_tuesday_date}` |
+| Multi-Turn zeitraum | `2025-01-22T08:00` | `{example_workday_date}T08:00` |
+| Beispiel-Antwort Datum | `16.12.2025` | `{example_dec_16_human}` |
+
+### Begründung
+
+- **Anthropic Best Practice**: "Claude replicates naming conventions, code style, formatting" - das gilt auch für Datumsformate
+- **Konsistenz**: Alle Beispiele zeigen nun das korrekte Jahr, das mit dem `<context>` übereinstimmt
+- **Keine Ambiguität**: LLM muss nicht zwischen Context und Examples "wählen"
+- **Robust**: Funktioniert auch am Jahreswechsel korrekt
+
+### Anwenden bei
+
+- Alle Prompts mit Few-Shot Examples die Datumsangaben enthalten
+- Prompts mit temporalen Berechnungen
+- Generell: Wenn Examples mit dynamischem Context konsistent sein müssen
+
+### Referenz
+
+- `prompts/data_agent_prompt.py` - Zeilen 37-55 (dynamische Variablen), Examples-Sektion
+- [Anthropic Multishot Prompting Docs](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/multishot-prompting)
+
+---
+
+## DEC-023: Query-Typ-basierte Datenstrategie (Raw vs. Aggregated)
+
+> **Status:** ✅ IMPLEMENTIERT
+> **Datum:** 03. Februar 2026
+> **Auslöser:** Korrelationsanalyse mit nur 24 Datenpunkten statistisch unzuverlässig
+
+### Problem/Kontext
+
+Bei einer 4-Stunden-Abfrage für Korrelationsanalyse werden nur **24 Datenpunkte** pro Key geliefert (10-Minuten-Aggregation). Das ist statistisch zu wenig:
+
+```
+Query: "Gibt es Korrelation zwischen Drehmoment und Position?"
+Zeitraum: 4 Stunden (12:00 - 16:00)
+Ergebnis: 24 Punkte pro Key → r=0.446 (unsicher!)
+```
+
+**Statistische Anforderungen (Forschung):**
+
+| Ziel-Korrelation | Min. Sample Size (α=0.05, Power=80%) |
+|------------------|--------------------------------------|
+| r = 0.5 | 29-37 Punkte |
+| r = 0.3 | **84 Punkte** |
+| r = 0.1 | 782 Punkte |
+
+**Quellen:**
+- [PMC - Sample Size for Correlation Analysis](https://pmc.ncbi.nlm.nih.gov/articles/PMC11148401/)
+- [ResearchGate - Sample Size Guideline](https://www.researchgate.net/publication/310735983_Sample_Size_Guideline_for_Correlation_Analysis)
+
+### Recherche: Industry Best Practice
+
+**InfluxDB/TimescaleDB Tiered Approach:**
+> "Keep recent data in **high granularity** for detailed analysis, while storing older data in **aggregated form** to save space."
+
+**Wann Raw vs. Aggregated:**
+
+| Use Case | Empfehlung | Grund |
+|----------|------------|-------|
+| Korrelation/Statistik | **Raw** | Braucht echte Varianz, nicht geglättete Werte |
+| Trend-Visualisierung | Aggregated | Glättet Noise, bessere Lesbarkeit |
+| Anomalie-Erkennung | Raw | Details wichtig |
+| Langzeit-Dashboard | Aggregated | Performance |
+
+**Quellen:**
+- [InfluxDB - Downsample and Retain](https://docs.influxdata.com/influxdb/v1/guides/downsample_and_retain/)
+- [Quix - Downsampling Data Processing](https://quix.io/glossary/downsampling-data-processing)
+- [TechTarget - IoT Data Collection](https://www.techtarget.com/iotagenda/post/IoT-data-collection-When-time-is-of-the-essence)
+
+### Entscheidung
+
+**Query-Typ-basierte Datenstrategie:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Supervisor: Query-Typ                    │
+│                                                             │
+│  Stats-Query? (Korrelation, Statistik, Vergleich)           │
+│     → data_retrieval_mode: "raw"                            │
+│                                                             │
+│  Viz-Query? (Chart, Trend, Verlauf)                         │
+│     → data_retrieval_mode: "aggregated"                     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 Data Agent: Strategie-Auswahl               │
+│                                                             │
+│  mode="raw" + Zeitraum ≤ 24h:                               │
+│     → get_telemetry() mit limit=10000                       │
+│                                                             │
+│  mode="raw" + Zeitraum > 24h:                               │
+│     → Feinere Aggregation (1m statt 10m)                    │
+│                                                             │
+│  mode="aggregated":                                         │
+│     → Wie bisher (DEC-006 Auto-Aggregation)                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Implementierungsplan
+
+#### Task 1: State erweitern
+**Datei:** `agents/state.py`
+
+```python
+class AgentState(MessagesState):
+    # ... existing fields ...
+    data_retrieval_mode: str = "aggregated"  # "raw" | "aggregated"
+```
+
+#### Task 2: Supervisor Query-Typ-Erkennung
+**Datei:** `agents/supervisor.py` + `prompts/supervisor_prompt.py`
+
+Supervisor setzt `data_retrieval_mode` basierend auf Query-Analyse:
+- Keywords: "Korrelation", "Zusammenhang", "Statistik", "Vergleich" → `"raw"`
+- Keywords: "zeig", "Chart", "Verlauf", "Trend" → `"aggregated"`
+- Default: `"aggregated"`
+
+#### Task 3: ThingsBoard Client - Raw Data Support
+**Datei:** `mcp_servers/thingsboard_server.py`
+
+Neuer Parameter `raw: bool = False` für `get_telemetry`:
+
+```python
+@mcp.tool()
+async def get_telemetry(
+    keys: str,
+    start_date: str,
+    end_date: str,
+    # ... existing params ...
+    raw: bool = False,  # NEU: Rohdaten ohne Aggregation
+) -> str:
+    if raw:
+        # Berechne erwartete Punkte
+        expected_points = calculate_raw_points(start_dt, end_dt, sampling_rate=1)
+
+        if expected_points <= 10000:
+            # Rohdaten holen
+            data = await client.get_telemetry(device_id, key_list, start_ts, end_ts, limit=10000)
+        else:
+            # Fallback: Feinste mögliche Aggregation
+            interval_ms = calculate_min_interval_for_limit(start_dt, end_dt, limit=10000)
+            data = await client.get_telemetry_aggregated(...)
+    else:
+        # Wie bisher (DEC-006)
+        data = await client.get_telemetry_aggregated(...)
+```
+
+#### Task 4: Data Agent - Mode-Awareness
+**Datei:** `agents/data_agent.py` + `prompts/data_agent_prompt.py`
+
+Data Agent liest `data_retrieval_mode` aus State und setzt `raw=True/False`:
+
+```python
+async def run_data_agent(state: AgentState):
+    mode = state.get("data_retrieval_mode", "aggregated")
+    # ... pass mode to tool selection logic ...
+```
+
+Prompt-Erweiterung:
+```xml
+<data_mode>
+Aktueller Modus: {data_retrieval_mode}
+
+Bei mode="raw":
+- Setze raw=True bei get_telemetry
+- Wichtig für statistische Analysen (Korrelation, Regression)
+- Mehr Datenpunkte = genauere Ergebnisse
+
+Bei mode="aggregated":
+- Nutze Auto-Aggregation (Standard)
+- Gut für Visualisierungen und Trends
+</data_mode>
+```
+
+#### Task 5: Response-Anpassung
+**Datei:** `mcp_servers/thingsboard_server.py`
+
+Erweiterte Response mit Info über Datenmodus:
+
+```python
+summary = {
+    "status": "success",
+    "data_mode": "raw" if raw else "aggregated",
+    "data_points": {...},
+    "statistics": stats,
+    # Bei raw: Info über tatsächliche Sampling-Rate
+    "sampling_info": {
+        "mode": "raw",
+        "actual_points": total_points,
+        "time_resolution": "~1 Sekunde" if raw else interval_human,
+    },
+}
+```
+
+### Erwartete Ergebnisse
+
+| Metrik | Vorher | Nachher |
+|--------|--------|---------|
+| Punkte für 4h Stats-Query | 24 | **bis 10.000** |
+| Korrelations-Zuverlässigkeit | Gering | **Hoch** |
+| Viz-Query Performance | ✅ | ✅ (unverändert) |
+
+### Betroffene Komponenten
+
+| Datei | Änderung |
+|-------|----------|
+| `agents/state.py` | `data_retrieval_mode` Field |
+| `agents/supervisor.py` | Query-Typ-Erkennung |
+| `prompts/supervisor_prompt.py` | Mode-Selection Instructions |
+| `mcp_servers/thingsboard_server.py` | `raw` Parameter + Logik |
+| `agents/data_agent.py` | Mode aus State lesen |
+| `prompts/data_agent_prompt.py` | Mode-Awareness |
+
+### Rückwärtskompatibilität
+
+- Default `data_retrieval_mode="aggregated"` → Verhalten wie bisher
+- Bestehende Viz-Queries unverändert
+- Nur Stats-Queries bekommen mehr Daten
+
+### Anwenden bei
+
+- Korrelationsanalysen
+- Statistische Vergleiche
+- Regressionsanalysen
+- Anomalie-Erkennung (zukünftig)
+
+---
+
+## DEC-024: Timeseries Korrelation mit merge_asof
+
+> **Status:** ✅ IMPLEMENTIERT
+> **Datum:** 03. Februar 2026
+> **Auslöser:** DEC-023 liefert nun >10k Datenpunkte, aber Arrays haben unterschiedliche Längen (x=100, y=98)
+
+### Problem/Kontext
+
+Nach Implementierung von DEC-023 (Raw Mode) liefert der Data Agent nun >10.000 Datenpunkte für Korrelationsanalysen. Allerdings haben IoT-Sensoren unterschiedliche Abtastfrequenzen und Timing-Jitter:
+
+```
+torque_act_a1_nm: 100 Datenpunkte bei t=[1000, 2001, 3002, ...]
+axis_act_a1_deg:   98 Datenpunkte bei t=[1010, 2005, 3008, ...]
+```
+
+**Fehler:** `calculate_correlation()` erforderte gleiche Array-Längen:
+```python
+if len(x_values) != len(y_values):
+    return {"error": f"Ungleiche Längen: x={len(x_values)}, y={len(y_values)}"}
+```
+
+### Recherche: Best Practice für IoT Time Series Alignment
+
+**pandas merge_asof:**
+> "Perform an asof merge. This is similar to a left-join except that we match on nearest key rather than equal keys."
+
+**Warum ideal für IoT-Daten:**
+1. **Toleranz-basiert** - Matcht nur wenn Timestamps innerhalb Schwelle
+2. **Nearest Match** - Findet nächsten Zeitpunkt (vor oder nach)
+3. **Kein Interpolieren** - Verwendet echte Sensorwerte
+4. **Effizient** - O(n log n) für sortierte Daten
+
+**Alternativen (verworfen):**
+| Ansatz | Problem |
+|--------|---------|
+| Resample + Interpolation | Verändert echte Messwerte |
+| Index-Alignment | Funktioniert nur bei gleicher Länge |
+| Zeitbereich-Buckets | Verliert Präzision |
+
+### Entscheidung
+
+**Neue Funktion `calculate_correlation_timeseries()` mit pd.merge_asof:**
+
+```python
+def calculate_correlation_timeseries(
+    x_timestamps: list[int], x_values: list[float],
+    y_timestamps: list[int], y_values: list[float],
+    tolerance_ms: int = 1000,
+) -> dict[str, Any]:
+    """
+    Korrelation für Zeitreihen mit unterschiedlichen Timestamps.
+    Nutzt pd.merge_asof für Alignment innerhalb tolerance_ms.
+    """
+    df_x = pd.DataFrame({"ts": x_timestamps, "x": x_values}).sort_values("ts")
+    df_y = pd.DataFrame({"ts": y_timestamps, "y": y_values}).sort_values("ts")
+
+    merged = pd.merge_asof(
+        df_x, df_y, on="ts",
+        tolerance=tolerance_ms,
+        direction="nearest",
+    )
+
+    merged_clean = merged.dropna()  # Entferne ungematchte Punkte
+
+    if len(merged_clean) < 3:
+        return {"error": "Zu wenige überlappende Datenpunkte", ...}
+
+    r, p = pearsonr(merged_clean["x"], merged_clean["y"])
+    return {
+        "r": r, "p_value": p,
+        "n_matched": len(merged_clean),
+        "n_dropped": len(df_x) - len(merged_clean),
+        ...
+    }
+```
+
+### Wie es funktioniert
+
+```
+Sensor X: ts=[1000, 2000, 3000, 4000]  → 4 Punkte
+Sensor Y: ts=[1010, 2005, 3020]        → 3 Punkte (1 fehlt!)
+
+merge_asof mit tolerance=1000ms:
+- x@1000 → y@1010 (diff=10ms) ✓
+- x@2000 → y@2005 (diff=5ms) ✓
+- x@3000 → y@3020 (diff=20ms) ✓
+- x@4000 → kein y in Nähe → NaN (wird entfernt)
+
+Ergebnis: 3 gematchte Paare für Korrelation
+```
+
+### Implementierung
+
+**Datei:** `tools/stats_functions.py`
+- `calculate_correlation_timeseries()` ersetzt das alte `calculate_correlation()`
+- Alte Funktion wurde entfernt (keine Rückwärtskompatibilität nötig)
+
+**Datei:** `agents/stats_agent.py`
+- Komplett umgebaut auf InjectedState Pattern (wie Viz Agent)
+- `correlation_tool(key_x, key_y, state)` mit manuellem State-Injection
+- MCP Server wird nicht mehr verwendet
+
+### Parameter
+
+| Parameter | Default | Beschreibung |
+|-----------|---------|--------------|
+| `tolerance_ms` | 1000 | Max. erlaubte Zeitdifferenz für Match |
+
+### Response-Format
+
+```python
+{
+    "r": 0.847,
+    "r_squared": 0.717,
+    "p_value": 0.0001,
+    "interpretation": "stark positiv",
+    "n_matched": 98,      # Erfolgreich gematchte Paare
+    "n_dropped": 2,       # Punkte ohne Match
+    "n_x": 100,           # Original X-Länge
+    "n_y": 98,            # Original Y-Länge
+    "match_rate": 98.0,   # Prozent erfolgreich
+    "tolerance_ms": 1000,
+}
+```
+
+### Anwenden bei
+
+- Korrelation zwischen verschiedenen Sensor-Typen
+- IoT-Daten mit unterschiedlichen Abtastraten
+- Zeitreihen mit Timing-Jitter (±10-50ms)
+
+---
+
 ## 💡 IDEEN (noch nicht umgesetzt)
 
 ### IDEE-001: Dynamic Telemetry Key Discovery
@@ -1603,3 +2037,9 @@ Wenn der User nach Daten fragt, die du nicht in TELEMETRIE-KEYS findest:
 | 2026-01-28 | DEC-019 (Beispiel-basierte State-Awareness) - AP7.1 abgeschlossen |
 | 2026-02-02 | DEC-020 (Komprimierter Telemetry Lookup) - Token-Verbrauch von ~10k auf ~200 reduziert |
 | 2026-02-03 | DEC-021 (Prompt Caching) - IMPLEMENTIERT: Alle Agents mit list[dict] content Format (LangChain Issue #26701) |
+| 2026-02-03 | DEC-022 (Dynamische Few-Shot Dates) - Alle Datumsbeispiele im Prompt dynamisch generiert |
+| 2026-02-03 | DEC-015 Update: Key-Limit (6-10) entfernt - unnötig da Agent nur Statistics sieht (DEC-004) |
+| 2026-02-03 | DEC-020 Update: usage_hint in search_telemetry_keys Response - skalierbare Lösung statt hardcoded Limits |
+| 2026-02-03 | DEC-023 (Query-Typ-basierte Datenstrategie) - IMPLEMENTIERT: Raw vs. Aggregated basierend auf Use Case |
+| 2026-02-03 | DEC-024 (Timeseries Korrelation) - IMPLEMENTIERT: pd.merge_asof für IoT-Sensoren mit unterschiedlichen Timestamps |
+| 2026-02-03 | Stats Agent Refactoring - Auf InjectedState Pattern umgebaut (wie Viz Agent), MCP Server entfernt |

@@ -14,6 +14,8 @@ DESIGN-ENTSCHEIDUNGEN:
 5. Tool-Descriptions optimiert für LLM-Auswahl [19.12.2025]
 6. Error Handling: Custom Exceptions + ToolError für User-Feedback [20.12.2025]
 7. Datenpunkt-Limit: Warnung bei >1000, Fehler bei >10000 Punkten [20.12.2025]
+8. DEC-020: Komprimierter Lookup statt vollständigem Catalog im LLM-Context [02.02.2026]
+9. DEC-023: Raw-Modus für Statistik/Korrelation (ohne Aggregation) [03.02.2026]
 """
 
 import sys
@@ -404,8 +406,138 @@ def format_thingsboard_error(error: ThingsBoardError) -> dict:
 
 
 # =============================================================================
+# TELEMETRY LOOKUP INDEX (DEC-020)
+# =============================================================================
+
+# Pfad zur Lookup-Datei
+LOOKUP_FILE = PROJECT_ROOT / "config" / "telemetry_lookup.json"
+
+
+def load_telemetry_lookup() -> dict:
+    """Lädt den komprimierten Telemetrie-Lookup-Index.
+    
+    DEC-020: Statt den vollen Catalog (~10.000 Tokens) ins LLM-Context zu laden,
+    wird ein komprimierter Index für Substring-Matching verwendet.
+    """
+    try:
+        with open(LOOKUP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        logger.info(f"Telemetry Lookup geladen: {len(data.get('groups', {}))} Gruppen")
+        return data.get("groups", {})
+    except Exception as e:
+        logger.error(f"Fehler beim Laden des Telemetry Lookup: {e}")
+        return {}
+
+
+# Lookup beim Server-Start einmalig laden
+_telemetry_lookup: dict = load_telemetry_lookup()
+
+
+def search_lookup(query: str) -> list[dict]:
+    """Durchsucht den Lookup-Index per Substring-Match.
+    
+    Matching-Strategie (DEC-020, Option B: Substring-Match):
+    - query in alias ODER alias in query (case-insensitive)
+    - Ermöglicht: "Gelenkwinkel" matcht "gelenkwinkel"
+    - Ermöglicht: "gelenk" matcht "gelenkwinkel" (Substring)
+    
+    Returns:
+        Liste von Matches mit group, name, keys, unit, description
+    """
+    query_lower = query.lower().strip()
+    
+    if not query_lower:
+        return []
+    
+    matches = []
+    
+    for group_id, group_data in _telemetry_lookup.items():
+        aliases = group_data.get("aliases", [])
+        
+        # Substring-Match: query in alias ODER alias in query
+        matched = any(
+            query_lower in alias or alias in query_lower
+            for alias in aliases
+        )
+        
+        if matched:
+            matches.append({
+                "group": group_id,
+                "name": group_data.get("name", group_id),
+                "keys": group_data.get("keys", []),
+                "unit": group_data.get("unit", ""),
+                "description": group_data.get("description", ""),
+            })
+    
+    return matches
+
+
+def get_available_groups_overview() -> list[dict]:
+    """Gibt eine kompakte Übersicht aller Gruppen zurück (Fallback bei kein Match).
+    
+    DEC-020, Option 3B-minimal: Nur Gruppen + Aliases + Unit.
+    Enthält KEINE Keys - der LLM soll nochmal mit besserem Begriff suchen.
+    """
+    overview = []
+    for group_id, group_data in _telemetry_lookup.items():
+        overview.append({
+            "group": group_id,
+            "aliases": group_data.get("aliases", []),
+            "unit": group_data.get("unit", ""),
+        })
+    return overview
+
+
+# =============================================================================
 # MCP TOOLS
 # =============================================================================
+
+@mcp.tool()
+async def search_telemetry_keys(query: str) -> str:
+    """
+    Findet passende Telemetrie-Keys basierend auf einem Suchbegriff.
+    
+    WANN BENUTZEN:
+    - IMMER VOR get_telemetry, wenn der User natürlichsprachliche Begriffe verwendet
+    - User sagt "Gelenkwinkel", "Drehmoment", "Geschwindigkeit" etc.
+    - Du brauchst die exakten Key-Namen für get_telemetry
+    
+    NICHT BENUTZEN:
+    - Du hast die Keys bereits aus einem früheren search_telemetry_keys Aufruf
+    - Du kennst die exakten Key-Namen bereits
+    
+    Args:
+        query: Suchbegriff, z.B. "Gelenkwinkel", "Drehmoment", "Geschwindigkeit", "Energie"
+               Kann deutsch oder englisch sein. Einzelne Begriffe funktionieren am besten.
+    
+    Returns:
+        Bei Match: Liste passender Gruppen mit Keys zum direkten Verwenden in get_telemetry
+        Kein Match: Übersicht aller verfügbaren Gruppen mit Aliases zur Orientierung
+    """
+    logger.info(f"Tool aufgerufen: search_telemetry_keys(query={query})")
+    
+    matches = search_lookup(query)
+    
+    if matches:
+        # Zähle alle Keys über alle Matches
+        total_keys = sum(len(m.get("keys", [])) for m in matches)
+        logger.info(f"Gefunden: {len(matches)} Gruppen, {total_keys} Keys für '{query}'")
+        return json.dumps({
+            "status": "found",
+            "query": query,
+            "matches": matches,
+            "total_keys": total_keys,
+            "usage_hint": "Verwende ALLE Keys aus den Matches für vollständige Analyse - keine Teilmenge auswählen.",
+        }, indent=2, ensure_ascii=False)
+    else:
+        logger.info(f"Kein Match für '{query}', sende Übersicht")
+        return json.dumps({
+            "status": "no_match",
+            "query": query,
+            "hint": "Kein direkter Treffer. Hier sind alle verfügbaren Gruppen - versuche es mit einem der Aliases.",
+            "available_groups": get_available_groups_overview(),
+        }, indent=2, ensure_ascii=False)
+
 
 @mcp.tool()
 async def list_devices() -> str:
@@ -643,28 +775,36 @@ async def get_telemetry(
     interval: Literal["1m", "5m", "10m", "30m", "1h", "6h", "1d"] | None = None,
     aggregation: Literal["AVG", "MIN", "MAX", "SUM", "COUNT"] | None = None,
     device_name: str = "KRC5",
+    raw: bool = False,
 ) -> str:
     """
     Holt Telemetrie-ZEITREIHEN für einen definierten Zeitraum. Das HAUPTTOOL für Datenabfragen!
-    
+
     WANN BENUTZEN:
     - User fragt nach VERLAUF/TREND: "Zeig Position von gestern"
     - User nennt ZEITRAUM: "Drehmomente vom Dienstag", "letzte Stunde"
     - User will VISUALISIEREN: "Zeig mir ein Diagramm der Geschwindigkeit"
     - User will MEHRERE DATENPUNKTE über Zeit analysieren
-    
+
     NICHT BENUTZEN:
     - User fragt nur nach AKTUELLEM Wert → get_latest_telemetry
     - User fragt ob Daten existieren → get_data_availability
     - User fragt nach statischen Attributen (Masse, Energie gesamt) → get_attributes
-    
-    AUTOMATISCHE AGGREGATION:
+
+    AUTOMATISCHE AGGREGATION (wenn raw=False):
     Wenn interval=None, wird automatisch berechnet:
     - ≤ 1 Stunde → 1m (1 Minute)
     - ≤ 1 Tag → 10m (10 Minuten)
     - ≤ 1 Woche → 1h (1 Stunde)
     - > 1 Woche → 1d (1 Tag)
-    
+
+    RAW MODUS (DEC-023):
+    Bei raw=True werden Rohdaten OHNE Aggregation geholt - wichtig für:
+    - Korrelationsanalysen (braucht echte Varianz)
+    - Statistische Berechnungen (braucht viele Punkte)
+    - Zeitreihen ≤24h: Max 10.000 Punkte
+    - Zeitreihen >24h: Fallback auf feinste Aggregation (1m)
+
     Args:
         keys: Komma-separierte Keys, z.B. "axis_act_a1_deg,torque_act_a1_nm"
         start_date: Startdatum YYYY-MM-DD (z.B. "2025-12-16") - PFLICHT
@@ -674,14 +814,15 @@ async def get_telemetry(
         interval: OPTIONAL - "1m", "5m", "10m", "30m", "1h", "6h", "1d" (sonst auto)
         aggregation: OPTIONAL - "AVG", "MIN", "MAX", "SUM", "COUNT" (default: AVG)
         device_name: Gerätename (default: "KRC5")
-        
+        raw: OPTIONAL - True für Rohdaten ohne Aggregation (für Statistik/Korrelation)
+
     Returns:
         Zusammenfassung mit Statistiken + Dateipfad zu den Rohdaten
     """
     logger.info(
         f"Tool aufgerufen: get_telemetry(keys={keys}, "
         f"start={start_date} {start_time}, end={end_date} {end_time}, "
-        f"interval={interval}, aggregation={aggregation})"
+        f"interval={interval}, aggregation={aggregation}, raw={raw})"
     )
     
     try:
@@ -712,36 +853,71 @@ async def get_telemetry(
             interval_reason = f"Vom User angegeben: {interval}"
         
         # =====================================================================
-        # DATENPUNKT-LIMIT CHECK (DEC-009)
+        # DATENPUNKT-LIMIT CHECK (DEC-009) - nicht im Raw-Modus (DEC-023)
         # =====================================================================
-        limit_check = check_datapoint_limit(
-            start_dt, end_dt, interval_ms, interval_human, len(key_list)
-        )
-        
-        if limit_check:
-            if limit_check.get("status") == "error_too_many_datapoints":
-                # Fehler - User muss anpassen
-                logger.warning(f"Datenpunkt-Limit erreicht: {limit_check}")
-                return json.dumps(limit_check, indent=2)
-            
-            elif limit_check.get("status") == "warning_many_datapoints":
-                # Warnung - trotzdem weitermachen, aber User informieren
-                logger.info(f"Datenpunkt-Warnung: {limit_check}")
-                # Warnung wird später in Response integriert
+        limit_check = None
+        if not raw:
+            limit_check = check_datapoint_limit(
+                start_dt, end_dt, interval_ms, interval_human, len(key_list)
+            )
+
+            if limit_check:
+                if limit_check.get("status") == "error_too_many_datapoints":
+                    # Fehler - User muss anpassen
+                    logger.warning(f"Datenpunkt-Limit erreicht: {limit_check}")
+                    return json.dumps(limit_check, indent=2)
+
+                elif limit_check.get("status") == "warning_many_datapoints":
+                    # Warnung - trotzdem weitermachen, aber User informieren
+                    logger.info(f"Datenpunkt-Warnung: {limit_check}")
         
         # Aggregation holen
         tb_aggregation, aggregation_human = get_aggregation(aggregation)
-        
+
         # Menschenlesbare Zeit
         start_human = start_dt.strftime("%d.%m.%Y %H:%M")
         end_human = end_dt.strftime("%d.%m.%Y %H:%M")
         start_weekday = WEEKDAY_NAMES[start_dt.weekday()]
-        
-        # Daten holen (IMMER aggregiert!)
+
+        # DEC-023: Raw vs Aggregated Modus
         client = await get_client()
-        data = await client.get_telemetry_aggregated(
-            device_id, key_list, start_ts, end_ts, interval_ms, tb_aggregation
-        )
+        data_mode_used = "aggregated"
+        sampling_info = None
+
+        if raw:
+            # Raw-Modus: Rohdaten ohne Aggregation
+            duration_hours = (end_dt - start_dt).total_seconds() / 3600
+
+            if duration_hours <= 24:
+                # ≤24h: Echte Rohdaten mit Limit
+                logger.info(f"Raw-Modus: Hole Rohdaten für {duration_hours:.1f}h Zeitraum")
+                data = await client.get_telemetry(
+                    device_id, key_list, start_ts, end_ts, limit=10000
+                )
+                data_mode_used = "raw"
+                sampling_info = {
+                    "mode": "raw",
+                    "limit": 10000,
+                    "time_resolution": "Original-Sampling (~1s)",
+                }
+            else:
+                # >24h: Fallback auf feinste Aggregation (1 Minute)
+                logger.info(f"Raw-Modus mit Fallback: {duration_hours:.1f}h > 24h, verwende 1m Aggregation")
+                data = await client.get_telemetry_aggregated(
+                    device_id, key_list, start_ts, end_ts, 60000, tb_aggregation  # 1 Minute
+                )
+                data_mode_used = "raw_fallback"
+                sampling_info = {
+                    "mode": "raw_fallback",
+                    "reason": f"Zeitraum {duration_hours:.0f}h zu lang für echte Rohdaten",
+                    "time_resolution": "1 Minute Aggregation",
+                }
+                interval_human = "1 Minute"
+        else:
+            # Standard: Aggregierte Daten
+            data = await client.get_telemetry_aggregated(
+                device_id, key_list, start_ts, end_ts, interval_ms, tb_aggregation
+            )
         
         # Prüfe ob Daten vorhanden
         total_points = sum(len(values) for values in data.values())
@@ -776,15 +952,19 @@ async def get_telemetry(
                 "weekday": start_weekday,
             },
             "settings": {
-                "interval_ms": interval_ms,
-                "interval_human": interval_human,
-                "aggregation": tb_aggregation,
-                "aggregation_human": aggregation_human,
+                "interval_ms": interval_ms if not raw else None,
+                "interval_human": interval_human if not raw else None,
+                "aggregation": tb_aggregation if not raw else None,
+                "aggregation_human": aggregation_human if not raw else None,
                 "auto_interval": auto_interval,
+                "data_mode": data_mode_used,  # DEC-023
             },
             "keys": key_list,
             "data": data,
         }
+        # DEC-023: Sampling-Info für Raw-Modus
+        if sampling_info:
+            full_data["sampling_info"] = sampling_info
         data_file = save_data_to_file(full_data, "telemetry")
         
         # Settings für User-Info aufbereiten
@@ -810,11 +990,16 @@ async def get_telemetry(
             },
             "settings": settings_info,
             "settings_text": settings_text,
+            "data_mode": data_mode_used,  # DEC-023
             "data_points": {key: len(values) for key, values in data.items()},
             "statistics": stats,
             "data_file": data_file,
             "user_hint": "Du kannst die Einstellungen anpassen: 'zeig Maximum statt Durchschnitt' oder 'mit 5-Minuten-Intervall'",
         }
+
+        # DEC-023: Sampling-Info für Raw-Modus
+        if sampling_info:
+            summary["sampling_info"] = sampling_info
         
         # Warnung hinzufügen falls vorhanden
         if limit_check and limit_check.get("status") == "warning_many_datapoints":
