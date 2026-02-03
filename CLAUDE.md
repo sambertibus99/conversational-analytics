@@ -20,6 +20,9 @@ python -m pytest tests/test_data_agent.py::test_latest_telemetry -v  # Single te
 # Test individual agents
 python agents/viz_agent.py
 python agents/graph.py
+
+# Git (uses SSH)
+git push origin master
 ```
 
 ## Architecture
