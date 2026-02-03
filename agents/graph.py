@@ -37,7 +37,7 @@ from agents.data_agent import data_agent_node
 from agents.stats_agent import stats_agent_node
 from agents.viz_agent import viz_agent_node
 from prompts.respond_prompt import RESPOND_SYSTEM_PROMPT
-from config.settings import ANTHROPIC_API_KEY, DEFAULT_MODEL
+from config.settings import DEFAULT_MODEL, api_key_rotator, create_anthropic_client, create_cached_system_message
 
 
 # =============================================================================
@@ -180,21 +180,17 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
     context = "\n".join(context_parts)
     logger.debug(f"Context für LLM: {context[:300]}...")
     
-    # LLM für Response
-    llm = ChatAnthropic(
-        model=DEFAULT_MODEL,
-        api_key=ANTHROPIC_API_KEY,
-        temperature=0.3,
-    )
-    
+    # LLM für Response (DEC-018: API Key Rotation, DEC-021: Prompt Caching)
+    llm = create_anthropic_client(temperature=0.3)
+
     llm_messages = [
-        SystemMessage(content=RESPOND_SYSTEM_PROMPT),
+        create_cached_system_message(RESPOND_SYSTEM_PROMPT),
         HumanMessage(content=f"Erstelle eine Antwort basierend auf:\n\n{context}"),
     ]
-    
+
     response = await llm.ainvoke(llm_messages)
     logger.debug(f"Response generiert: {response.content[:100]}...")
-    
+
     return {
         "messages": [AIMessage(content=response.content)],
     }

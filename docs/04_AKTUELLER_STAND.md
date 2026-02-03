@@ -1,119 +1,256 @@
 # AKTUELLER STAND
 
-> **Letzte Aktualisierung:** 23. Dezember 2025, 10:30 Uhr
+> **Letzte Aktualisierung:** 03. Februar 2026 (DEC-021 Prompt Caching)
 
 ---
 
-## 🎯 Aktuelle Session: Multi-Turn Bug-Fixes
+## 🎯 Projekt-Status: Production-Ready + AP7 in Planung
 
-### ✅ Erledigt (23.12.2025)
+Das System ist funktionsfähig und getestet:
 
-**Bug 1: current_step Persistenz**
-- Problem: `current_step` wurde vom Checkpointer persistiert, aber bei neuem Plan nicht zurückgesetzt
-- Turn 1 endete mit `current_step=2`, Turn 2 startete mit Step 2 statt 0
-- Fix: `current_step: 0` im Supervisor-Return bei neuem Plan
-
-**Bug 2: Multiple SystemMessages (Anthropic API)**
-- Problem: Messages aus Checkpoint enthielten alte SystemMessages
-- `ValueError: Received multiple non-consecutive system messages`
-- Fix: SystemMessages filtern in `data_agent.py` und `stats_agent.py`
-
-**Bug 3: Respond-Node zeigt keine Datenwerte**
-- Problem: User fragte "zeig die Werte", aber Respond sah nur "6 Keys" nicht die Werte
-- Fix: `respond_node` extrahiert jetzt tatsächliche Werte aus `datasets`
-
-**Bug 4: Unnötiger Viz-Agent bei Textanfragen**
-- Problem: "Zeig mir die Zahlenwerte" triggerte Viz-Agent statt direkte Antwort
-- Fix: Supervisor-Prompt erweitert mit Beispiel für leeren Plan bei vorhandenen Daten
-
-### Geänderte Dateien
 ```
-agents/supervisor.py      # current_step Reset + Datasets-Kontext für LLM
-agents/data_agent.py      # SystemMessage Filter
-agents/stats_agent.py     # SystemMessage Filter  
-agents/graph.py           # Respond-Node zeigt Datenwerte
-prompts/supervisor_prompt.py  # Multi-Turn Beispiele
-```
-
-### Neue Entscheidung
-**DEC-014: SystemMessage-Handling bei Multi-Turn**
-- Anthropic erlaubt nur eine SystemMessage am Anfang
-- Best Practice: Messages aus State filtern, frische SystemMessage prependen
-
----
-
-## 📚 Best Practices aus Recherche (23.12.2025)
-
-### LangGraph Multi-Turn mit Anthropic
-
-**Problem:** Bei Multi-Turn akkumulieren SystemMessages im State → API-Fehler
-
-**Lösung 1: Filter (unser Ansatz)**
-```python
-filtered_messages = [msg for msg in state["messages"] if not isinstance(msg, SystemMessage)]
-messages = [SystemMessage(content=prompt), *filtered_messages]
-```
-
-**Lösung 2: create_react_agent mit prompt Parameter**
-```python
-agent = create_react_agent(model=llm, tools=tools, prompt="System prompt...")
-```
-
-**Lösung 3: Custom call_model Node (offizielle Docs)**
-```python
-def call_model(state, config):
-    system_prompt = SystemMessage("...")
-    return model.invoke([system_prompt] + state["messages"])
+✅ "Zeig mir die Drehmomente der letzten 5 Minuten" → Chart
+✅ "Was ist der Durchschnitt?" → Multi-Turn Stats
+✅ "Wie wird das Wetter?" → Höfliche Absage
+✅ "Zeig die Verteilung als Boxplot" → Statistik-Chart
 ```
 
 ---
 
-## 🧪 Test-Szenario für Multi-Turn
+## ✅ Abgeschlossene Sessions
 
+### Session 7: Prompt Caching DEC-021 (03.02.2026)
+
+**Problem:** Trotz DEC-020 (Lookup-Optimierung) noch 429-Errors bei Multi-Agent Pipelines wegen wiederholter System Prompts.
+
+**Lösung:** Anthropic Prompt Caching aktiviert für **alle Agents**.
+
+**Wichtig (Gotcha):** LangChain propagiert `additional_kwargs={"cache_control": ...}` NICHT zur Anthropic API. Die Lösung ist, den `content` als `list[dict]` zu formatieren mit `cache_control` im Content-Block. Siehe [GitHub Issue #26701](https://github.com/langchain-ai/langchain/issues/26701).
+
+**Änderungen:**
+- `config/settings.py` — `create_cached_system_message()` Hilfsfunktion, `PROMPT_CACHING_HEADERS`
+- `agents/supervisor.py` — Nutzt `create_cached_system_message()`
+- `agents/graph.py` — respond_node nutzt `create_cached_system_message()`
+- `agents/data_agent.py` — `prepare_messages()` nutzt `create_cached_system_message()`
+- `agents/stats_agent.py` — Nutzt `create_cached_system_message()`
+- `agents/viz_agent.py` — `select_and_execute_tool()` nutzt `create_cached_system_message()`
+
+**Erwartete Auswirkung:**
+- Cache-Read-Tokens zählen NICHT gegen ITPM Rate Limit
+- ~80% Reduktion der effektiven Input-Tokens bei wiederholten Calls
+
+---
+
+### Session 6: Token-Optimierung DEC-020 (02.02.2026)
+
+**Problem:** Telemetrie-Catalog (~10.000 Tokens) wurde bei jeder Anfrage komplett ins LLM-Context geladen. Bei 30k Tokens/Min Rate Limit führte das zu 429-Errors nach 2-3 Calls.
+
+**Lösung:** Neues MCP-Tool `search_telemetry_keys` mit komprimiertem Lookup-Index.
+
+| Metrik | Vorher | Nachher |
+|--------|--------|--------|
+| Tokens pro Key-Lookup | ~10.000 | ~200 |
+| LLM-Calls bis Rate Limit | 2-3 | 10+ |
+| Prompt `<semantic_catalog>` | ~600 Tokens | ~300 Tokens (`<key_lookup>`) |
+
+**Evaluierte Alternativen:**
+- Neo4j Graph-DB → Overkill für 54 Keys, als Ausblick notiert
+- Embedding-Suche → Extra Dependency, nicht nötig bei 13 Gruppen
+- Komprimierter JSON + Substring-Match → **Gewählt** (pragmatisch, sofort wirksam)
+
+**Geänderte Dateien:**
+- `config/telemetry_lookup.json` — **NEU** — Komprimierter Index (13 Gruppen, Aliases, Keys)
+- `mcp_servers/thingsboard_server.py` — Neues Tool + Lookup-Funktionen
+- `prompts/data_agent_prompt.py` — `<semantic_catalog>` → `<key_lookup>`
+- `docs/DECISIONS.md` — DEC-020 dokumentiert
+
+**Test-Ergebnis:**
 ```
-1. "Welche Position haben die Achsen des Roboters?"
-   → Plan: ['data_agent']
-   → Lädt axis Dataset (6 Keys)
-   
-2. "Zeig mir die Zahlenwerte"
-   → Plan: [] (leerer Plan - Daten sind schon da!)
-   → Respond zeigt: axis_act_a1_deg: 45.2, axis_act_a2_deg: -12.8, ...
-
-3. "Gibt es einen Zusammenhang mit dem Drehmoment?"
-   → Supervisor sieht: datasets=['axis'], keys nicht torque
-   → Plan: ['data_agent', 'stats_agent']
-   → Lädt torque, berechnet Korrelation
+✅ "Was sind die Drehmomente der letzten 30 min"
+   → search_telemetry_keys(query=Drehmoment) → 1 Gruppe gefunden
+   → get_telemetry(keys=torque_act_a1_nm,...) → 180 Punkte
+✅ "Kannst du sie mir in einem Grafen anzeigen"
+   → Supervisor plant nur viz_agent (kein erneuter Datenabruf)
+   → Line Chart generiert
 ```
 
 ---
 
-## 📋 Review-Status Gesamt
+### Session 4: Viz Agent Erweiterung (AP3)
 
-| Komponente | Status | Offene Punkte |
-|------------|--------|---------------|
-| ThingsBoard MCP | ✅ Fertig | - |
-| Data Agent Prompt | ✅ AP2.1 | - |
-| Data Agent Code | ✅ AP2.2 | Multi-Turn Fix (DEC-013, DEC-014) |
-| Data Graph | ✅ AP2.3 | Respond-Node zeigt Werte |
-| Viz Agent | 🔄 3/4 | Error Handling |
-| Stats Agent | 🔄 | SystemMessage Fix |
-| Supervisor | ✅ | Multi-Turn Kontext |
+**Chart-Typen erweitert von 3 auf 10:**
+
+| Kategorie | Charts | Status |
+|-----------|--------|--------|
+| Zeitreihen | Line, Area | ✅ |
+| Vergleiche | Column, Bar | ✅ |
+| Korrelationen | Scatter | ✅ |
+| Statistik | Boxplot, Violin, Histogram | ✅ NEU |
+| Anteile | Pie, Radar | ✅ NEU |
+
+**Änderungen:**
+- 7 neue Chart-Tools mit InjectedState (DEC-003)
+- Transformations-Funktionen für jedes Datenformat
+- Prompt aus `prompts/viz_agent_prompt.py` importiert (kein Inline-Prompt mehr)
+- Tool-Descriptions mit "WANN BENUTZEN" (DEC-001)
+
+**Test-Ergebnisse:**
+```
+✅ "Zeig mir den Verlauf" → Line Chart (19s cold, 5s warm)
+✅ "Vergleiche die Achsen" → Column Chart
+✅ "Zeig die Verteilung als Boxplot" → Boxplot
+✅ "Erstelle ein Histogramm" → Histogram
+✅ "Zeig alle Achsen im Radar-Chart" → Radar
+```
+
+**Geänderte Dateien:**
+- `agents/viz_agent.py` - 7 neue Tools, Prompt-Import
+- `prompts/viz_agent_prompt.py` - Synchronisiert, 10 Tools dokumentiert
 
 ---
 
-## 📁 Dokumentations-Struktur
+### Session 3: Graph Best Practices (DEC-017)
+
+**AP 2.3 - LangGraph Review:**
+
+| Verbesserung | Beschreibung |
+|--------------|--------------|
+| `max_steps` Guard | Verhindert Endlosschleifen (default: 10) |
+| `error_handler_node` | Graceful Failure bei Agent-Exceptions |
+| State-Validierung | `respond_node` prüft auf fehlende Messages |
+| DRY Routing | Eine Schleife statt 4x Copy-Paste |
+| Agent Wrapper Factory | `make_agent_wrapper()` für Step-Increment |
+| Thread-Safe Singleton | `_graph_lock` für Graph-Instanz |
+| Strukturiertes Logging | `logger` statt `debug_print()` |
+| Prompt ausgelagert | `prompts/respond_prompt.py` |
+
+---
+
+### Session 2: Production Code Quality (DEC-016)
+
+**Alle Agents refactored:**
+
+| Agent | Änderungen |
+|-------|------------|
+| `data_agent.py` | Logging, SRP, Retry, MCPToolsProvider |
+| `viz_agent.py` | Logging, SRP, Retry, AntVSessionProvider |
+| `stats_agent.py` | Logging, SRP, Retry mit Fallback |
+| `supervisor.py` | Logging, Retry, validate_plan aufgeteilt |
+| `utils.py` | **NEU** - Gemeinsame Hilfsfunktionen |
+
+---
+
+### Session 1: Prompt-Optimierung (DEC-015)
+
+**Anthropic Best Practices angewendet:**
+- XML-Tags für Struktur (`<role>`, `<task>`, `<instructions>`)
+- Positive Anweisungen statt Verbote
+- Redundanzen entfernt (~28% kürzer)
+
+---
+
+## 📋 Review-Status
+
+| Komponente | Status | Letzte Änderung | Offen |
+|------------|--------|-----------------|-------|
+| ThingsBoard MCP | ✅ Fertig | AP1 | - |
+| Data Agent | ✅ Fertig | DEC-016 | - |
+| Viz Agent | ✅ Fertig | Session 4 | - |
+| Stats Agent | ✅ Fertig | DEC-016 | - |
+| Supervisor | ✅ Fertig | DEC-016 | - |
+| Graph | ✅ Fertig | DEC-017 | - |
+| Prompts | ✅ Fertig | DEC-015 | - |
+| **CLAUDE.md** | ⚠️ Review | - | Siehe unten |
+
+---
+
+## 🔧 Offene Verbesserungen
+
+### CLAUDE.md Refactoring (Prio: Hoch)
+
+**Problem:** Aktuelle CLAUDE.md folgt nicht Best Practices:
+
+| Best Practice | Aktuell | Soll |
+|--------------|---------|------|
+| Länge | ~200 Zeilen | ~60 Zeilen |
+| Struktur | Gemischt | WHAT/WHY/HOW |
+| Session-Log | Inline | → 04_AKTUELLER_STAND.md |
+| Workflow | Narrativ | Nummerierte Schritte |
+
+**Neuer Workflow (aus Best Practices Recherche):**
 
 ```
-docs/
-├── DECISIONS.md              # ⭐ Entscheidungs-Datenbank (14 Patterns)
-├── 04_AKTUELLER_STAND.md     # Diese Datei
-├── 05_ARCHITEKTUR.md         # Systemübersicht
-├── 07_ERROR_HANDLING.md      # Fehler & Fixes
-├── 08_TESTFRAGEN.md          # Evaluation
-├── 09_THINGSBOARD_SETUP.md   # Setup-Referenz
-├── design/                   # Komponenten-Details
-└── archive/                  # Alte Dokumente
+Session-Typ A: Review (KEIN Code)
+1. AP-Komponenten identifizieren
+2. DECISIONS.md lesen
+3. Code analysieren (3 Perspektiven):
+   - 🏗️ Senior Dev: Stabilität, Wartbarkeit
+   - 🤖 KI-Experte: LLM-Umgang, Prompts, Tokens
+   - 📋 DECs: Konsistenz mit Entscheidungen
+4. Verbesserungen dokumentieren
+5. User priorisiert für Phase B
+
+Session-Typ B: Implementierung
+1. Pro Änderung (max 50 Zeilen):
+   - Ankündigen mit Vorher/Nachher
+   - User bestätigt
+   - Änderung machen
+   - Testen
+2. Am Ende: Dokumentation aktualisieren
 ```
+
+### AP7: Agent-Intelligenz
+
+**Siehe:** `docs/AP7_AGENT_INTELLIGENCE.md`
+
+**Problem:** Bei Korrelations-Anfragen funktioniert die Agent-Pipeline nicht optimal:
+- Data Agent lädt Daten doppelt (ignoriert State)
+- Stats Agent nutzt Keyword-Mapping statt LLM-Intelligenz
+
+**Lösung:** Agents treffen eigenständige Entscheidungen basierend auf LLM-Verständnis.
+
+| AP | Beschreibung | Status |
+|----|--------------|--------|
+| AP7.1 | Data Agent State-Awareness | ✅ |
+| AP7.2 | Data Agent Query-Interpretation | ⬜ |
+| AP7.3 | Stats Agent Metadaten-Schema | ⬜ |
+| AP7.4 | Stats Agent LLM-Tool-Selection | ⬜ |
+| AP7.5 | Integration & Dokumentation | ⬜ |
+
+**AP7.1 abgeschlossen (28.01.2026):**
+- `format_existing_datasets_hint()` verbessert mit XML-Format und Statistik-Preview
+- Multi-Turn Beispiele im Prompt statt hardcoded Instruktionen
+- Designentscheidung: Beispiele skalieren besser als dedizierte Tools
+
+---
+
+### Kleinere offene Punkte
+
+| Komponente | Issue | Prio |
+|------------|-------|------|
+| `viz_agent.py` | `extract_chart_url()` - Status-First fehlt (DEC-008) | 🟡 |
+| Allgemein | ~~Rate Limiter einbauen~~ | ✅ DEC-020 |
+| Allgemein | ~~Prompt Caching~~ | ✅ DEC-021 |
+| Allgemein | Production Checkpointer (SQLite) | 🟢 |
+
+---
+
+## 🧠 Entscheidungs-Patterns (21 total)
+
+| ID | Pattern | Anwenden bei | Status |
+|----|---------|--------------|--------|
+| DEC-001 | Tool-Descriptions | Alle Tools | ✅ |
+| DEC-003 | InjectedState | Große Daten | ✅ |
+| DEC-008 | Status-First | Response-Parsing | ✅ |
+| DEC-013 | Multi-Turn Persistenz | Checkpointer | ✅ |
+| DEC-015 | XML-Tag Prompts | Alle Prompts | ✅ |
+| DEC-016 | Production Quality | Alle Agents | ✅ |
+| DEC-017 | Graph Best Practices | LangGraph | ✅ |
+| DEC-018 | API Key Rotation | Rate Limit Handling | ✅ |
+| DEC-020 | Komprimierter Lookup | Telemetrie-Key-Auflösung | ✅ |
+| DEC-021 | Prompt Caching | Alle Agents | ✅ |
+
+**Vollständige Liste:** `docs/DECISIONS.md`
 
 ---
 
@@ -127,4 +264,7 @@ chainlit run app.py
 # Tests
 python -m pytest tests/ -m "not integration" -v  # Schnell
 python -m pytest tests/ -m integration -v         # Mit ThingsBoard
+
+# Viz Agent testen
+python agents/viz_agent.py
 ```

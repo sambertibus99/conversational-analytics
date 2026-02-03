@@ -38,7 +38,7 @@ from agents.utils import (
     extract_user_query,
 )
 from prompts.stats_agent_prompt import STATS_AGENT_SYSTEM_PROMPT
-from config.settings import DEFAULT_MODEL, PROJECT_ROOT as CONFIG_PROJECT_ROOT, api_key_rotator, create_anthropic_client
+from config.settings import DEFAULT_MODEL, PROJECT_ROOT as CONFIG_PROJECT_ROOT, api_key_rotator, create_anthropic_client, create_cached_system_message
 
 # Direkte Stats-Funktionen als Fallback
 from tools.stats_functions import (
@@ -397,15 +397,16 @@ async def run_stats_agent_with_mcp(state: AgentState) -> dict[str, Any]:
         if not isinstance(msg, SystemMessage)
     ]
 
+    # DEC-021: SystemMessage mit cache_control für Prompt Caching
     messages_with_system = [
-        SystemMessage(content=system_content),
+        create_cached_system_message(system_content),
         *filtered_messages
     ]
 
     logger.debug("Starte Agent-Ausführung...")
     result = await asyncio.wait_for(
         agent.ainvoke({"messages": messages_with_system}),
-        timeout=60
+        timeout=120  # Erhöht von 60s, da Agent mehrere Tool-Calls machen kann
     )
     logger.debug(f"Agent fertig, {len(result.get('messages', []))} Messages")
 
@@ -423,28 +424,50 @@ async def execute_stats_with_retry(state: AgentState, max_retries: int = MAX_RET
     """
     Versucht MCP-Ausführung mit Retry.
     Gibt None zurück wenn alle Versuche fehlschlagen.
+
+    DEC-018: Bei Rate Limit (429) wird der API Key rotiert.
     """
     for attempt in range(max_retries):
         try:
             result = await run_stats_agent_with_mcp(state)
             if result.get("statistics"):
-                logger.debug(f"MCP erfolgreich (Versuch {attempt + 1})")
+                logger.debug(f"MCP erfolgreich (Versuch {attempt + 1}, {api_key_rotator.get_key_info()})")
                 return result
             else:
                 logger.debug(f"MCP lief, aber keine Statistics (Versuch {attempt + 1})")
                 return None
-        
-        except (asyncio.TimeoutError, ConnectionError) as e:
+
+        except asyncio.TimeoutError:
             delay = RETRY_DELAY_BASE * (2 ** attempt)
-            logger.warning(f"MCP Fehler (Versuch {attempt + 1}/{max_retries}): {e}")
-            
+            logger.warning(f"MCP Timeout (Versuch {attempt + 1}/{max_retries}): Agent-Ausführung dauerte länger als 120s")
+
             if attempt < max_retries - 1:
                 await asyncio.sleep(delay)
-        
+
+        except ConnectionError as e:
+            delay = RETRY_DELAY_BASE * (2 ** attempt)
+            logger.warning(f"MCP Verbindungsfehler (Versuch {attempt + 1}/{max_retries}): {e or 'Keine Details'}")
+
+            if attempt < max_retries - 1:
+                await asyncio.sleep(delay)
+
         except Exception as e:
+            error_str = str(e).lower()
+
+            # Rate Limit Error - Key rotieren (DEC-018)
+            if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+                logger.warning(f"Rate Limit mit {api_key_rotator.get_key_info()} (Versuch {attempt + 1}/{max_retries})")
+
+                if attempt < max_retries - 1:
+                    api_key_rotator.rotate()
+                    delay = RETRY_DELAY_BASE * (2 ** attempt)
+                    logger.info(f"Neuer Key: {api_key_rotator.get_key_info()}, warte {delay}s...")
+                    await asyncio.sleep(delay)
+                    continue
+
             logger.warning(f"MCP unerwarteter Fehler: {e}")
             return None
-    
+
     return None
 
 

@@ -7,8 +7,17 @@ DESIGN:
 - Best Practice nach LangGraph Dokumentation
 
 DESIGN-ENTSCHEIDUNGEN:
+- DEC-003: InjectedState für Daten-Übergabe
 - DEC-013: Multi-Turn Support mit datasets
 - DEC-016: Strukturiertes Logging, Retry-Mechanismus
+
+VERFÜGBARE CHARTS (10):
+- Line, Area (Zeitreihen)
+- Column, Bar (Vergleiche)
+- Scatter (Korrelationen)
+- Boxplot, Violin, Histogram (Verteilungen/Statistik)
+- Pie (Anteile)
+- Radar (Multidimensional)
 """
 
 import sys
@@ -17,12 +26,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import json
 import asyncio
 import logging
 from contextlib import AsyncExitStack
 from datetime import datetime
-from typing import Any, Annotated, Optional, Tuple
+from typing import Any, Annotated, Tuple
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -34,7 +42,8 @@ from mcp.client.stdio import stdio_client
 
 from agents.state import AgentState
 from agents.utils import extract_data_from_datasets, get_dataset_meta, get_y_label, extract_user_query
-from config.settings import ANTHROPIC_API_KEY, DEFAULT_MODEL
+from config.settings import DEFAULT_MODEL, api_key_rotator, create_anthropic_client, create_cached_system_message
+from prompts.viz_agent_prompt import VIZ_AGENT_SYSTEM_PROMPT
 
 
 # =============================================================================
@@ -43,7 +52,6 @@ from config.settings import ANTHROPIC_API_KEY, DEFAULT_MODEL
 
 logger = logging.getLogger(__name__)
 
-# Retry-Konfiguration
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2
 
@@ -53,10 +61,7 @@ RETRY_DELAY_BASE = 2
 # =============================================================================
 
 class AntVSessionProvider:
-    """
-    Verwaltet AntV MCP Session mit Caching.
-    Analog zu MCPToolsProvider in data_agent.py
-    """
+    """Verwaltet AntV MCP Session mit Caching."""
     
     def __init__(self):
         self._session: ClientSession | None = None
@@ -105,7 +110,6 @@ class AntVSessionProvider:
         return self._session is not None
 
 
-# Globale Instanz
 _antv_provider = AntVSessionProvider()
 
 
@@ -122,7 +126,7 @@ async def get_antv_tools() -> list:
 
 
 # =============================================================================
-# DATEN-TRANSFORMATION
+# DATEN-TRANSFORMATION HELPERS
 # =============================================================================
 
 def timestamp_to_time_string(ts: int) -> str:
@@ -145,8 +149,34 @@ def shorten_key_name(key: str) -> str:
         .replace("acc_axis_", "Acc"))
 
 
+def extract_numeric_values(values: list) -> list[float]:
+    """Extrahiert numerische Werte aus ThingsBoard-Format."""
+    result = []
+    for point in values:
+        if isinstance(point, dict):
+            try:
+                result.append(float(point.get("value", 0)))
+            except (ValueError, TypeError):
+                continue
+        elif isinstance(point, (int, float)):
+            result.append(float(point))
+    return result
+
+
+def sample_data(data: list, max_points: int = 500) -> list:
+    """Reduziert Datenpunkte durch Sampling."""
+    if len(data) <= max_points:
+        return data
+    step = len(data) // max_points
+    return data[::step][:max_points]
+
+
+# =============================================================================
+# TRANSFORMATION FUNCTIONS (Für jeden Chart-Typ)
+# =============================================================================
+
 def transform_for_line_chart(data: dict[str, list], multi_key: bool = False) -> list[dict]:
-    """Transformiert Daten für Line/Area Chart."""
+    """Transformiert Daten für Line/Area Chart: [{time, value, group?}]"""
     result = []
     
     for key, values in data.items():
@@ -172,18 +202,18 @@ def transform_for_line_chart(data: dict[str, list], multi_key: bool = False) -> 
             break
     
     result.sort(key=lambda x: (x["time"], x.get("group", "")))
-    return result
+    return sample_data(result)
 
 
-def transform_for_column_chart(data: dict[str, list]) -> list[dict]:
-    """Transformiert Daten für Column/Bar Chart."""
+def transform_for_category_chart(data: dict[str, list]) -> list[dict]:
+    """Transformiert Daten für Column/Bar/Pie Chart: [{category, value}]"""
     result = []
     
     for key, values in data.items():
         if not isinstance(values, list) or not values:
             continue
         
-        nums = [float(p.get("value", 0)) for p in values if isinstance(p, dict)]
+        nums = extract_numeric_values(values)
         if nums:
             avg = sum(nums) / len(nums)
             result.append({"category": shorten_key_name(key), "value": round(avg, 2)})
@@ -192,7 +222,7 @@ def transform_for_column_chart(data: dict[str, list]) -> list[dict]:
 
 
 def transform_for_scatter_chart(data: dict[str, list]) -> list[dict]:
-    """Transformiert Daten für Scatter Chart (Korrelation)."""
+    """Transformiert Daten für Scatter Chart: [{x, y}]"""
     keys = list(data.keys())
     if len(keys) < 2:
         return []
@@ -215,11 +245,78 @@ def transform_for_scatter_chart(data: dict[str, list]) -> list[dict]:
             except (ValueError, TypeError):
                 pass
     
-    return [{"x": x_vals[ts], "y": y_vals[ts]} for ts in x_vals if ts in y_vals]
+    result = [{"x": x_vals[ts], "y": y_vals[ts]} for ts in x_vals if ts in y_vals]
+    return sample_data(result)
+
+
+def transform_for_distribution_chart(data: dict[str, list]) -> list[dict]:
+    """Transformiert Daten für Boxplot/Violin Chart: [{category, value}]"""
+    result = []
+    
+    for key, values in data.items():
+        if not isinstance(values, list) or not values:
+            continue
+        
+        nums = extract_numeric_values(values)
+        short_key = shorten_key_name(key)
+        
+        # Jeder Einzelwert wird ein Datenpunkt
+        for val in nums:
+            result.append({"category": short_key, "value": round(val, 4)})
+    
+    return sample_data(result, max_points=1000)
+
+
+def transform_for_histogram_chart(data: dict[str, list]) -> list[float]:
+    """Transformiert Daten für Histogram Chart: [number, number, ...]"""
+    all_values = []
+    
+    for key, values in data.items():
+        if not isinstance(values, list):
+            continue
+        nums = extract_numeric_values(values)
+        all_values.extend(nums)
+    
+    return sample_data(all_values, max_points=1000)
+
+
+def transform_for_radar_chart(data: dict[str, list]) -> list[dict]:
+    """Transformiert Daten für Radar Chart: [{name, value}]"""
+    result = []
+    
+    for key, values in data.items():
+        if not isinstance(values, list) or not values:
+            continue
+        
+        nums = extract_numeric_values(values)
+        if nums:
+            avg = sum(nums) / len(nums)
+            result.append({"name": shorten_key_name(key), "value": round(avg, 2)})
+    
+    return result
 
 
 # =============================================================================
-# CHART-TOOLS MIT INJECTEDSTATE
+# CHART URL EXTRACTION
+# =============================================================================
+
+def extract_chart_url(result) -> str:
+    """Extrahiert URL aus MCP-Tool-Ergebnis."""
+    if hasattr(result, 'content') and result.content:
+        for block in result.content:
+            if hasattr(block, 'text'):
+                text = block.text.strip()
+                if text.startswith("http"):
+                    return text
+                # Prüfe auf Fehler
+                if "error" in text.lower():
+                    logger.warning(f"Chart-Fehler: {text[:100]}")
+                    return f"Fehler: {text[:200]}"
+    return "Fehler: Keine URL vom Chart-Server"
+
+
+# =============================================================================
+# CHART TOOLS MIT INJECTEDSTATE
 # =============================================================================
 
 @tool
@@ -229,10 +326,13 @@ async def generate_line_chart_tool(
 ) -> str:
     """
     Erstellt ein Liniendiagramm für Zeitreihen-Daten.
-    Nutze dieses Tool für: Verlauf, Trend, Historie, Zeitreihen.
+    
+    WANN BENUTZEN:
+    - Verlauf über Zeit, Trends, Historie
+    - Kontinuierliche Messwerte
     
     Args:
-        title: Titel des Charts, z.B. "Drehmomente - Dienstag 16.12."
+        title: Beschreibender Titel, z.B. "Drehmomente - 16.12.2025"
     """
     logger.debug(f"generate_line_chart_tool: title={title}")
     
@@ -248,13 +348,6 @@ async def generate_line_chart_tool(
     
     if not transformed:
         return "Fehler: Keine gültigen Datenpunkte"
-    
-    # Sampling bei zu vielen Punkten
-    if len(transformed) > 500:
-        step = len(transformed) // 500
-        transformed = transformed[::step][:500]
-    
-    logger.debug(f"Daten transformiert: {len(transformed)} Punkte")
     
     session = await get_antv_session()
     result = await session.call_tool(
@@ -273,16 +366,67 @@ async def generate_line_chart_tool(
 
 
 @tool
+async def generate_area_chart_tool(
+    title: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Erstellt ein Flächendiagramm für kumulative Zeitreihen.
+    
+    WANN BENUTZEN:
+    - Kumulative Daten über Zeit
+    - Betonung der Gesamtmenge
+    - Gestapelte Vergleiche mehrerer Serien
+    
+    Args:
+        title: Beschreibender Titel
+    """
+    logger.debug(f"generate_area_chart_tool: title={title}")
+    
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    
+    if not data:
+        return "Fehler: Keine Daten im State"
+    
+    keys = list(data.keys())
+    multi_key = len(keys) > 1
+    transformed = transform_for_line_chart(data, multi_key)
+    
+    if not transformed:
+        return "Fehler: Keine gültigen Datenpunkte"
+    
+    session = await get_antv_session()
+    result = await session.call_tool(
+        "generate_area_chart",
+        arguments={
+            "data": transformed,
+            "title": title,
+            "axisXTitle": "Zeit",
+            "axisYTitle": get_y_label(keys),
+            "stack": multi_key,
+            "width": 800,
+            "height": 500,
+        }
+    )
+    
+    return extract_chart_url(result)
+
+
+@tool
 async def generate_column_chart_tool(
     title: str,
     state: Annotated[dict, InjectedState],
 ) -> str:
     """
-    Erstellt ein Säulendiagramm zum Vergleich von Durchschnittswerten.
-    Nutze dieses Tool für: Vergleich, vs, gegenüberstellen.
+    Erstellt ein vertikales Säulendiagramm zum Vergleich.
+    
+    WANN BENUTZEN:
+    - Vergleich zwischen Kategorien
+    - Durchschnittswerte nebeneinander
     
     Args:
-        title: Titel des Charts, z.B. "Vergleich der Achsen-Drehmomente"
+        title: Beschreibender Titel
     """
     logger.debug(f"generate_column_chart_tool: title={title}")
     
@@ -292,7 +436,7 @@ async def generate_column_chart_tool(
     if not data:
         return "Fehler: Keine Daten im State"
     
-    transformed = transform_for_column_chart(data)
+    transformed = transform_for_category_chart(data)
     
     if not transformed:
         return "Fehler: Keine gültigen Datenpunkte"
@@ -314,16 +458,65 @@ async def generate_column_chart_tool(
 
 
 @tool
+async def generate_bar_chart_tool(
+    title: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Erstellt ein horizontales Balkendiagramm zum Vergleich.
+    
+    WANN BENUTZEN:
+    - Horizontaler Vergleich
+    - Lange Kategorie-Namen
+    - Ranking-Darstellung
+    
+    Args:
+        title: Beschreibender Titel
+    """
+    logger.debug(f"generate_bar_chart_tool: title={title}")
+    
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    
+    if not data:
+        return "Fehler: Keine Daten im State"
+    
+    transformed = transform_for_category_chart(data)
+    
+    if not transformed:
+        return "Fehler: Keine gültigen Datenpunkte"
+    
+    session = await get_antv_session()
+    result = await session.call_tool(
+        "generate_bar_chart",
+        arguments={
+            "data": transformed,
+            "title": title,
+            "axisXTitle": get_y_label(list(data.keys())),
+            "axisYTitle": "Kategorie",
+            "width": 800,
+            "height": 500,
+        }
+    )
+    
+    return extract_chart_url(result)
+
+
+@tool
 async def generate_scatter_chart_tool(
     title: str,
     state: Annotated[dict, InjectedState],
 ) -> str:
     """
-    Erstellt ein Streudiagramm für Korrelationen zwischen zwei Variablen.
-    Nutze dieses Tool für: Korrelation, Zusammenhang, Beziehung.
+    Erstellt ein Streudiagramm für Korrelationen.
+    
+    WANN BENUTZEN:
+    - Korrelation zwischen zwei Variablen
+    - Zusammenhang, Beziehung
+    - Mindestens 2 Daten-Keys erforderlich
     
     Args:
-        title: Titel des Charts, z.B. "Korrelation Achse 1 vs Achse 2"
+        title: Beschreibender Titel
     """
     logger.debug(f"generate_scatter_chart_tool: title={title}")
     
@@ -345,8 +538,8 @@ async def generate_scatter_chart_tool(
         arguments={
             "data": transformed,
             "title": title,
-            "axisXTitle": keys[0],
-            "axisYTitle": keys[1],
+            "axisXTitle": shorten_key_name(keys[0]),
+            "axisYTitle": shorten_key_name(keys[1]),
             "width": 800,
             "height": 500,
         }
@@ -355,50 +548,251 @@ async def generate_scatter_chart_tool(
     return extract_chart_url(result)
 
 
-def extract_chart_url(result) -> str:
-    """Extrahiert URL aus MCP-Tool-Ergebnis."""
-    if hasattr(result, 'content') and result.content:
-        for block in result.content:
-            if hasattr(block, 'text') and block.text.startswith("http"):
-                return block.text.strip()
-    return "Fehler: Keine URL vom Chart-Server"
+@tool
+async def generate_boxplot_chart_tool(
+    title: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Erstellt ein Boxplot für statistische Verteilung.
+    
+    WANN BENUTZEN:
+    - Verteilung der Werte anzeigen
+    - Median, Quartile, Ausreißer sichtbar
+    - Vergleich mehrerer Kategorien
+    
+    Args:
+        title: Beschreibender Titel
+    """
+    logger.debug(f"generate_boxplot_chart_tool: title={title}")
+    
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    
+    if not data:
+        return "Fehler: Keine Daten im State"
+    
+    transformed = transform_for_distribution_chart(data)
+    
+    if not transformed:
+        return "Fehler: Keine gültigen Datenpunkte"
+    
+    session = await get_antv_session()
+    result = await session.call_tool(
+        "generate_boxplot_chart",
+        arguments={
+            "data": transformed,
+            "title": title,
+            "axisXTitle": "Kategorie",
+            "axisYTitle": get_y_label(list(data.keys())),
+            "width": 800,
+            "height": 500,
+        }
+    )
+    
+    return extract_chart_url(result)
 
 
-# Tool-Liste
+@tool
+async def generate_violin_chart_tool(
+    title: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Erstellt ein Violin-Chart für Dichteverteilung.
+    
+    WANN BENUTZEN:
+    - Verteilung mit Dichtekurve
+    - Detaillierter als Boxplot
+    - Vergleich von Verteilungen
+    
+    Args:
+        title: Beschreibender Titel
+    """
+    logger.debug(f"generate_violin_chart_tool: title={title}")
+    
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    
+    if not data:
+        return "Fehler: Keine Daten im State"
+    
+    transformed = transform_for_distribution_chart(data)
+    
+    if not transformed:
+        return "Fehler: Keine gültigen Datenpunkte"
+    
+    session = await get_antv_session()
+    result = await session.call_tool(
+        "generate_violin_chart",
+        arguments={
+            "data": transformed,
+            "title": title,
+            "axisXTitle": "Kategorie",
+            "axisYTitle": get_y_label(list(data.keys())),
+            "width": 800,
+            "height": 500,
+        }
+    )
+    
+    return extract_chart_url(result)
+
+
+@tool
+async def generate_histogram_chart_tool(
+    title: str,
+    state: Annotated[dict, InjectedState],
+    bin_number: int = 10,
+) -> str:
+    """
+    Erstellt ein Histogramm für Häufigkeitsverteilung.
+    
+    WANN BENUTZEN:
+    - Wie oft kommen bestimmte Werte vor?
+    - Normalverteilung prüfen
+    - Datenkonzentration erkennen
+    
+    Args:
+        title: Beschreibender Titel
+        bin_number: Anzahl der Intervalle (default: 10)
+    """
+    logger.debug(f"generate_histogram_chart_tool: title={title}, bins={bin_number}")
+    
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    
+    if not data:
+        return "Fehler: Keine Daten im State"
+    
+    transformed = transform_for_histogram_chart(data)
+    
+    if not transformed:
+        return "Fehler: Keine gültigen Datenpunkte"
+    
+    session = await get_antv_session()
+    result = await session.call_tool(
+        "generate_histogram_chart",
+        arguments={
+            "data": transformed,
+            "title": title,
+            "binNumber": bin_number,
+            "axisXTitle": get_y_label(list(data.keys())),
+            "axisYTitle": "Häufigkeit",
+            "width": 800,
+            "height": 500,
+        }
+    )
+    
+    return extract_chart_url(result)
+
+
+@tool
+async def generate_pie_chart_tool(
+    title: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Erstellt ein Kreisdiagramm für Anteile.
+    
+    WANN BENUTZEN:
+    - Anteil am Ganzen zeigen
+    - Prozentuale Verteilung
+    - Wenige Kategorien (max 6-8)
+    
+    Args:
+        title: Beschreibender Titel
+    """
+    logger.debug(f"generate_pie_chart_tool: title={title}")
+    
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    
+    if not data:
+        return "Fehler: Keine Daten im State"
+    
+    transformed = transform_for_category_chart(data)
+    
+    if not transformed:
+        return "Fehler: Keine gültigen Datenpunkte"
+    
+    session = await get_antv_session()
+    result = await session.call_tool(
+        "generate_pie_chart",
+        arguments={
+            "data": transformed,
+            "title": title,
+            "width": 600,
+            "height": 500,
+        }
+    )
+    
+    return extract_chart_url(result)
+
+
+@tool
+async def generate_radar_chart_tool(
+    title: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """
+    Erstellt ein Radar-/Spinnennetz-Diagramm für Mehrfachvergleich.
+    
+    WANN BENUTZEN:
+    - Mehrere Dimensionen gleichzeitig vergleichen
+    - Stärken/Schwächen-Profil
+    - Mindestens 3 Kategorien sinnvoll
+    
+    Args:
+        title: Beschreibender Titel
+    """
+    logger.debug(f"generate_radar_chart_tool: title={title}")
+    
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    
+    if not data:
+        return "Fehler: Keine Daten im State"
+    
+    transformed = transform_for_radar_chart(data)
+    
+    if len(transformed) < 3:
+        return "Fehler: Radar-Chart braucht mindestens 3 Dimensionen"
+    
+    session = await get_antv_session()
+    result = await session.call_tool(
+        "generate_radar_chart",
+        arguments={
+            "data": transformed,
+            "title": title,
+            "width": 600,
+            "height": 500,
+        }
+    )
+    
+    return extract_chart_url(result)
+
+
+# =============================================================================
+# TOOL-LISTE
+# =============================================================================
+
 CHART_TOOLS = [
+    # Zeitreihen
     generate_line_chart_tool,
+    generate_area_chart_tool,
+    # Vergleiche
     generate_column_chart_tool,
+    generate_bar_chart_tool,
+    # Korrelationen
     generate_scatter_chart_tool,
+    # Statistik/Verteilung
+    generate_boxplot_chart_tool,
+    generate_violin_chart_tool,
+    generate_histogram_chart_tool,
+    # Anteile/Dimensional
+    generate_pie_chart_tool,
+    generate_radar_chart_tool,
 ]
-
-
-# =============================================================================
-# VIZ AGENT PROMPT
-# =============================================================================
-
-VIZ_AGENT_PROMPT = """Du bist ein Visualisierungs-Agent für IIoT-Daten.
-
-## VERFÜGBARE TOOLS
-
-1. **generate_line_chart_tool** - Für Zeitreihen, Verläufe, Trends
-2. **generate_column_chart_tool** - Für Vergleiche zwischen Kategorien
-3. **generate_scatter_chart_tool** - Für Korrelationen zwischen 2 Variablen
-
-## ENTSCHEIDUNGSREGELN
-
-| User sagt | Tool |
-|-----------|------|
-| "Verlauf", "Trend", "Historie", "über Zeit" | generate_line_chart_tool |
-| "Vergleich", "vs", "gegenüber" | generate_column_chart_tool |
-| "Korrelation", "Zusammenhang" | generate_scatter_chart_tool |
-| (Standard für Zeitreihen) | generate_line_chart_tool |
-
-## WICHTIG
-
-- Wähle EIN Tool und rufe es auf
-- Der Titel sollte beschreibend sein (inkl. Zeitraum wenn bekannt)
-- Die Daten werden automatisch aus dem System geladen
-"""
 
 
 # =============================================================================
@@ -406,12 +800,7 @@ VIZ_AGENT_PROMPT = """Du bist ein Visualisierungs-Agent für IIoT-Daten.
 # =============================================================================
 
 def prepare_viz_context(state: AgentState) -> Tuple[dict, str]:
-    """
-    Bereitet Kontext für LLM vor.
-    
-    Returns:
-        Tuple von (data, meta_info_string)
-    """
+    """Bereitet Kontext für LLM vor."""
     datasets = state.get("datasets", {})
     data = extract_data_from_datasets(datasets)
     
@@ -436,14 +825,10 @@ async def select_and_execute_tool(
     meta_info: str,
     tool_state: dict
 ) -> Tuple[str, str]:
-    """
-    Lässt LLM Tool auswählen und führt es aus.
-    
-    Returns:
-        Tuple von (chart_url, tool_name)
-    """
+    """Lässt LLM Tool auswählen und führt es aus."""
+    # DEC-021: SystemMessage mit cache_control für Prompt Caching
     messages = [
-        SystemMessage(content=VIZ_AGENT_PROMPT),
+        create_cached_system_message(VIZ_AGENT_SYSTEM_PROMPT),
         HumanMessage(content=f"User-Anfrage: {user_query}\n\n{meta_info}\n\nWähle das passende Chart-Tool und erstelle einen guten Titel."),
     ]
     
@@ -467,11 +852,7 @@ async def select_and_execute_tool(
     
     tool_args["state"] = tool_state
     
-    tool_map = {
-        "generate_line_chart_tool": generate_line_chart_tool,
-        "generate_column_chart_tool": generate_column_chart_tool,
-        "generate_scatter_chart_tool": generate_scatter_chart_tool,
-    }
+    tool_map = {t.name: t for t in CHART_TOOLS}
     
     if tool_name in tool_map:
         chart_url = await tool_map[tool_name].ainvoke(tool_args)
@@ -482,7 +863,6 @@ async def select_and_execute_tool(
 
 
 async def execute_viz_with_retry(
-    llm_with_tools,
     user_query: str,
     meta_info: str,
     tool_state: dict,
@@ -490,33 +870,46 @@ async def execute_viz_with_retry(
 ) -> Tuple[str, str]:
     """
     Führt Visualisierung mit Retry aus.
+
+    DEC-018: Bei Rate Limit (429) wird der API Key rotiert und
+    ein neuer LLM-Client erstellt.
     """
     last_exception = None
-    
+
+    # LLM mit Tools erstellen (wird bei Key-Rotation neu erstellt)
+    llm = create_anthropic_client()
+    llm_with_tools = llm.bind_tools(CHART_TOOLS)
+
     for attempt in range(max_retries):
         try:
             return await select_and_execute_tool(llm_with_tools, user_query, meta_info, tool_state)
-        
+
         except (ConnectionError, TimeoutError) as e:
             last_exception = e
             delay = RETRY_DELAY_BASE * (2 ** attempt)
             logger.warning(f"Transienter Fehler (Versuch {attempt + 1}/{max_retries}): {e}")
-            
+
             if attempt < max_retries - 1:
                 await asyncio.sleep(delay)
-        
+
         except Exception as e:
             error_str = str(e).lower()
             if "429" in error_str or "rate limit" in error_str:
                 last_exception = e
-                delay = RETRY_DELAY_BASE * (2 ** attempt)
-                logger.warning(f"Rate Limit (Versuch {attempt + 1}/{max_retries})")
-                
+                logger.warning(f"Rate Limit mit {api_key_rotator.get_key_info()} (Versuch {attempt + 1}/{max_retries})")
+
                 if attempt < max_retries - 1:
+                    # Key rotieren und neuen Client erstellen (DEC-018)
+                    api_key_rotator.rotate()
+                    llm = create_anthropic_client()
+                    llm_with_tools = llm.bind_tools(CHART_TOOLS)
+
+                    delay = RETRY_DELAY_BASE * (2 ** attempt)
+                    logger.info(f"Neuer Key: {api_key_rotator.get_key_info()}, warte {delay}s...")
                     await asyncio.sleep(delay)
             else:
                 raise
-    
+
     raise last_exception or Exception("Viz execution failed after retries")
 
 
@@ -552,19 +945,10 @@ def build_viz_error_result(error: Exception) -> dict[str, Any]:
 # =============================================================================
 
 async def run_viz_agent(state: AgentState) -> dict[str, Any]:
-    """
-    Führt den Viz Agent aus.
-    
-    Orchestriert:
-    1. Daten-Extraktion
-    2. Kontext-Vorbereitung
-    3. Tool-Auswahl (LLM)
-    4. Chart-Generierung (MCP)
-    """
+    """Führt den Viz Agent aus."""
     try:
         logger.debug("Starte Viz Agent")
         
-        # 1. Daten und Kontext vorbereiten
         data, meta_info = prepare_viz_context(state)
         
         if not data:
@@ -573,27 +957,16 @@ async def run_viz_agent(state: AgentState) -> dict[str, Any]:
                 "error": "no_data",
             }
         
-        # 2. User-Query extrahieren
         user_query = extract_user_query(state["messages"])
-        
-        # 3. LLM vorbereiten
-        llm = ChatAnthropic(
-            model=DEFAULT_MODEL,
-            api_key=ANTHROPIC_API_KEY,
-            temperature=0,
-        )
-        llm_with_tools = llm.bind_tools(CHART_TOOLS)
-        
-        # 4. Tool-State vorbereiten
+
         tool_state = dict(state)
         tool_state["datasets"] = state.get("datasets", {})
-        
-        # 5. Ausführen mit Retry
+
+        # DEC-018: LLM-Erstellung und Key-Rotation passiert in execute_viz_with_retry
         chart_url, tool_name = await execute_viz_with_retry(
-            llm_with_tools, user_query, meta_info, tool_state
+            user_query, meta_info, tool_state
         )
         
-        # 6. Ergebnis
         return build_viz_result(chart_url, tool_name)
     
     except Exception as e:
@@ -610,45 +983,71 @@ async def viz_agent_node(state: AgentState) -> dict[str, Any]:
 # =============================================================================
 
 async def test_viz_agent():
+    """Testet alle Chart-Typen."""
     import time
     from datetime import timedelta
+    import random
     
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     
     print("\n" + "="*60)
-    print("🧪 Viz Agent Test")
+    print("🧪 Viz Agent Test - Alle 10 Chart-Typen")
     print("="*60)
     
     now = datetime.now()
     
+    # Test-Daten mit mehreren Keys
     test_datasets = {
-        "torque": {
+        "roboter": {
             "data": {
                 "torque_act_a1_nm": [
-                    {"value": str(25 + i), "timestamp": int((now - timedelta(minutes=10-i)).timestamp() * 1000)}
-                    for i in range(10)
+                    {"value": str(25 + random.gauss(0, 5)), "timestamp": int((now - timedelta(minutes=20-i)).timestamp() * 1000)}
+                    for i in range(20)
                 ],
                 "torque_act_a2_nm": [
-                    {"value": str(15 + i), "timestamp": int((now - timedelta(minutes=10-i)).timestamp() * 1000)}
-                    for i in range(10)
+                    {"value": str(15 + random.gauss(0, 3)), "timestamp": int((now - timedelta(minutes=20-i)).timestamp() * 1000)}
+                    for i in range(20)
+                ],
+                "torque_act_a3_nm": [
+                    {"value": str(20 + random.gauss(0, 4)), "timestamp": int((now - timedelta(minutes=20-i)).timestamp() * 1000)}
+                    for i in range(20)
                 ],
             },
-            "meta": {"timerange": {"weekday": "Dienstag", "start": "10:00", "end": "10:10"}},
+            "meta": {"timerange": {"weekday": "Montag", "start": "10:00", "end": "10:20"}},
         },
     }
     
-    state = AgentState(
-        messages=[HumanMessage(content="Zeig mir den Verlauf der Drehmomente")],
-        datasets=test_datasets,
-    )
+    # Teste verschiedene Anfragen
+    test_queries = [
+        ("Zeig mir den Verlauf der Drehmomente", "line"),
+        ("Vergleiche die Achsen", "column"),
+        ("Zeig die Verteilung als Boxplot", "boxplot"),
+        ("Erstelle ein Histogramm", "histogram"),
+        ("Zeig alle Achsen im Radar-Chart", "radar"),
+    ]
     
-    start = time.time()
-    result = await run_viz_agent(state)
-    duration = time.time() - start
-    
-    print(f"⏱️ Dauer: {duration:.1f}s")
-    print(f"📊 Typ: {result.get('chart_type')}")
-    print(f"🔗 URL: {result.get('chart_url', 'FEHLER')}")
+    for query, expected_type in test_queries:
+        print(f"\n{'='*40}")
+        print(f"📝 Query: {query}")
+        print(f"   Erwarteter Typ: {expected_type}")
+        
+        state = AgentState(
+            messages=[HumanMessage(content=query)],
+            datasets=test_datasets,
+        )
+        
+        start = time.time()
+        result = await run_viz_agent(state)
+        duration = time.time() - start
+        
+        print(f"⏱️ Dauer: {duration:.1f}s")
+        print(f"📊 Typ: {result.get('chart_type', 'N/A')}")
+        
+        url = result.get('chart_url', '')
+        if url.startswith("http"):
+            print(f"✅ URL: {url[:60]}...")
+        else:
+            print(f"❌ Fehler: {url[:100]}")
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from agents.state import AgentState
 from agents.utils import extract_user_query
 from prompts.supervisor_prompt import SUPERVISOR_SYSTEM_PROMPT
-from config.settings import ANTHROPIC_API_KEY, DEFAULT_MODEL
+from config.settings import DEFAULT_MODEL, api_key_rotator, create_anthropic_client, create_cached_system_message
 
 
 # =============================================================================
@@ -51,12 +51,8 @@ VALID_AGENTS = {"data_agent", "stats_agent", "viz_agent"}
 # =============================================================================
 
 def create_supervisor_llm():
-    """Erstellt das LLM für den Supervisor."""
-    return ChatAnthropic(
-        model=DEFAULT_MODEL,
-        api_key=ANTHROPIC_API_KEY,
-        temperature=0,
-    )
+    """Erstellt das LLM für den Supervisor mit aktuellem API Key (DEC-018)."""
+    return create_anthropic_client()
 
 
 def parse_supervisor_response(response: str) -> dict[str, Any]:
@@ -246,16 +242,16 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
         if datasets:
             logger.debug(f"Datasets vorhanden: {list(datasets.keys())}")
         
-        # 3. LLM aufrufen
+        # 3. LLM aufrufen (DEC-021: Prompt Caching via list[dict] content)
         llm = create_supervisor_llm()
         enhanced_prompt = SUPERVISOR_SYSTEM_PROMPT + context_info
-        
+
         messages = [
-            SystemMessage(content=enhanced_prompt),
+            create_cached_system_message(enhanced_prompt),
             HumanMessage(content=user_query),
         ]
-        
-        logger.debug("Rufe LLM auf...")
+
+        logger.debug("Rufe LLM auf mit Prompt Caching...")
         response_content = await invoke_llm_with_retry(llm, messages)
         logger.debug(f"LLM Response: {response_content[:200]}...")
         

@@ -32,7 +32,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 
 from agents.state import AgentState
 from prompts.data_agent_prompt import get_data_agent_prompt
-from config.settings import ANTHROPIC_API_KEY, DEFAULT_MODEL, PROJECT_ROOT
+from config.settings import DEFAULT_MODEL, PROJECT_ROOT, api_key_rotator, create_anthropic_client, create_cached_system_message
 
 
 # =============================================================================
@@ -481,36 +481,56 @@ def generate_data_summary(
 
 
 def format_existing_datasets_hint(datasets: dict[str, Any]) -> str:
-    """Formatiert einen Hinweis über bereits geladene Datasets für den Prompt."""
+    """
+    Formatiert Hinweis über bereits geladene Datasets für den Prompt.
+    
+    AP7.1: Reichere Infos mit XML-Format für bessere State-Awareness.
+    Enthält: Keys, Zeitraum, Intervall, Aggregation, Statistik-Preview.
+    """
     if not datasets:
         return ""
     
-    lines = ["## BEREITS GELADENE DATEN", ""]
-    lines.append("Folgende Datensätze sind bereits im State verfügbar:")
+    lines = ["<loaded_data>"]
     
     for key, dataset in datasets.items():
         meta = dataset.get("meta", {})
         data = dataset.get("data", {})
-        
-        num_keys = len(data) if isinstance(data, dict) else 0
-        data_keys = list(data.keys())[:5] if isinstance(data, dict) else []
+        stats = meta.get("statistics", {})
         timerange = meta.get("timerange", {})
+        settings = meta.get("settings", {})
+        
+        # Keys (max 6)
+        data_keys = list(data.keys())[:6] if isinstance(data, dict) else []
         
         lines.append(f"")
-        lines.append(f"### {key}")
-        lines.append(f"- Keys: {', '.join(data_keys)}")
+        lines.append(f"## {key}")
+        lines.append(f"keys: {', '.join(data_keys)}")
+        
+        # Zeitraum
         if timerange:
-            lines.append(f"- Zeitraum: {timerange.get('start', '?')} bis {timerange.get('end', '?')}")
-        if meta.get("statistics"):
-            stats = meta["statistics"]
-            first_stat = next(iter(stats.values()), {})
-            if isinstance(first_stat, dict):
-                lines.append(f"- Punkte pro Key: {first_stat.get('count', '?')}")
+            start = timerange.get("start") or timerange.get("start_human", "?")
+            end = timerange.get("end") or timerange.get("end_human", "?")
+            lines.append(f"zeitraum: {start} - {end}")
+        
+        # Intervall und Aggregation
+        if settings:
+            interval = settings.get("interval_human") or settings.get("interval", "?")
+            aggregation = settings.get("aggregation_human") or settings.get("aggregation", "AVG")
+            lines.append(f"einstellungen: {aggregation} alle {interval}")
+        
+        # Statistik-Preview für ersten Key
+        if stats:
+            first_key = next(iter(stats.keys()), None)
+            if first_key and isinstance(stats.get(first_key), dict):
+                s = stats[first_key]
+                count = s.get("count", "?")
+                min_val = s.get("min", "?")
+                max_val = s.get("max", "?")
+                avg_val = s.get("avg", "?")
+                lines.append(f"preview ({first_key}): {count} Punkte, min={min_val}, max={max_val}, avg={avg_val}")
     
     lines.append("")
-    lines.append("Diese Daten müssen NICHT erneut geladen werden.")
-    lines.append("Für Vergleiche/Korrelationen: Lade nur die FEHLENDEN Daten.")
-    lines.append("")
+    lines.append("</loaded_data>")
     
     return "\n".join(lines)
 
@@ -560,16 +580,12 @@ def detect_needs_user_input(messages: list) -> Tuple[bool, Optional[str]]:
 
 
 # =============================================================================
-# AGENT ERSTELLUNG
+# AGENT ERSTELLUNG (DEC-018: API Key Rotation)
 # =============================================================================
 
 def create_data_agent(tools: list):
-    """Erstellt den Data Agent mit Claude."""
-    llm = ChatAnthropic(
-        model=DEFAULT_MODEL,
-        api_key=ANTHROPIC_API_KEY,
-        temperature=0,
-    )
+    """Erstellt den Data Agent mit Claude und aktuellem API Key."""
+    llm = create_anthropic_client()  # Nutzt api_key_rotator
     return create_react_agent(llm, tools)
 
 
@@ -580,44 +596,48 @@ def create_data_agent(tools: list):
 def prepare_messages(state: AgentState, existing_datasets: dict) -> list:
     """
     Bereitet Messages für den Agent vor.
-    
+
     - Filtert SystemMessages (DEC-014)
-    - Fügt aktuellen Prompt hinzu
+    - Fügt aktuellen Prompt hinzu (DEC-021: mit cache_control)
     - Fügt Dataset-Hint hinzu wenn vorhanden
     """
     # Prompt generieren
     current_prompt = get_data_agent_prompt()
-    
+
     # Dataset-Hint hinzufügen wenn Daten vorhanden
     if existing_datasets:
         datasets_hint = format_existing_datasets_hint(existing_datasets)
         current_prompt = current_prompt + "\n\n" + datasets_hint
         logger.debug("Datasets-Hint zum Prompt hinzugefügt")
-    
+
     # SystemMessages filtern (DEC-014)
     filtered_messages = [
         msg for msg in state["messages"]
         if not isinstance(msg, SystemMessage)
     ]
-    
-    return [SystemMessage(content=current_prompt), *filtered_messages]
+
+    # DEC-021: SystemMessage mit cache_control für Prompt Caching
+    return [create_cached_system_message(current_prompt), *filtered_messages]
 
 
-async def execute_agent_with_retry(agent, messages: list, max_retries: int = MAX_RETRIES) -> dict:
+async def execute_agent_with_retry(agent, messages: list, tools: list, max_retries: int = MAX_RETRIES) -> dict:
     """
     Führt Agent aus mit Retry bei transienten Fehlern.
+    
+    DEC-018: Bei Rate Limit (429) wird der API Key rotiert.
     
     Retry bei:
     - ConnectionError
     - TimeoutError
-    - Rate Limit (429)
+    - Rate Limit (429) - mit Key-Rotation
     """
     last_exception = None
+    current_agent = agent
     
     for attempt in range(max_retries):
         try:
-            result = await agent.ainvoke({"messages": messages})
-            logger.debug(f"Agent erfolgreich (Versuch {attempt + 1})")
+            result = await current_agent.ainvoke({"messages": messages})
+            logger.debug(f"Agent erfolgreich (Versuch {attempt + 1}, {api_key_rotator.get_key_info()})")
             return result
             
         except (ConnectionError, TimeoutError) as e:
@@ -630,16 +650,23 @@ async def execute_agent_with_retry(agent, messages: list, max_retries: int = MAX
                 await asyncio.sleep(delay)
         
         except Exception as e:
-            # Nicht-transiente Fehler sofort werfen
             error_str = str(e).lower()
-            if "429" in error_str or "rate limit" in error_str:
+            
+            # Rate Limit Error - Key rotieren (DEC-018)
+            if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
                 last_exception = e
-                delay = RETRY_DELAY_BASE * (2 ** attempt)
-                logger.warning(f"Rate Limit (Versuch {attempt + 1}/{max_retries})")
+                logger.warning(f"Rate Limit mit {api_key_rotator.get_key_info()} (Versuch {attempt + 1}/{max_retries})")
                 
                 if attempt < max_retries - 1:
+                    # Key rotieren und neuen Agent erstellen
+                    api_key_rotator.rotate()
+                    current_agent = create_data_agent(tools)
+                    
+                    delay = RETRY_DELAY_BASE * (2 ** attempt)
+                    logger.info(f"Neuer Key: {api_key_rotator.get_key_info()}, warte {delay}s...")
                     await asyncio.sleep(delay)
             else:
+                # Anderer Fehler - sofort werfen
                 raise
     
     # Alle Retries fehlgeschlagen
@@ -759,8 +786,8 @@ async def run_data_agent(state: AgentState) -> dict[str, Any]:
         # 4. Messages vorbereiten
         messages = prepare_messages(state, existing_datasets)
         
-        # 5. Agent ausführen (mit Retry)
-        result = await execute_agent_with_retry(agent, messages)
+        # 5. Agent ausführen (mit Retry und Key-Rotation bei 429)
+        result = await execute_agent_with_retry(agent, messages, tools)
         logger.debug(f"Agent fertig, {len(result.get('messages', []))} Messages")
         
         # 6. Tool-Ergebnisse extrahieren

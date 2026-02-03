@@ -2,7 +2,7 @@
 
 > **Zweck:** Wiederverwendbare Patterns aus Projekt-Entscheidungen
 > **Für:** Claude erkennt ähnliche Probleme und schlägt bewährte Lösungen vor
-> **Stand:** 19. Dezember 2025
+> **Stand:** 03. Februar 2026
 
 ---
 
@@ -27,6 +27,10 @@
 | DEC-015 | XML-Tag Prompt-Struktur | Prompt unstrukturiert | XML-Tags für Sektionen | Alle Agent-Prompts |
 | DEC-016 | Production Code Quality | print(), lange Funktionen, kein Retry | Logging, SRP, Retry | Alle Agents |
 | DEC-017 | Graph Best Practices | Endlosschleifen, kein Error-Handler | max_steps, error_handler, Validierung | LangGraph Orchestrierung |
+| DEC-018 | API Key Rotation | Rate Limit (429) Errors | Round-Robin + Auto-Rotate bei 429 | Alle LLM-Aufrufe |
+| DEC-019 | Beispiel-basierte State-Awareness | Agent ignoriert geladene Daten | Beispiele im Prompt statt Tool | Multi-Turn Konversationen |
+| DEC-020 | Komprimierter Telemetry Lookup | Catalog ~10k Tokens im LLM-Context | Substring-Match in MCP Tool | Telemetrie-Key-Auflösung |
+| DEC-021 | Prompt Caching (Rate Limit) | 30k ITPM bei Multi-Agent Pipeline | cache_control auf System Prompts | Alle LLM-Aufrufe |
 
 ---
 
@@ -1041,6 +1045,518 @@ class MCPToolsProvider:
 
 ---
 
+## DEC-018: API Key Rotation für Rate Limit Handling
+
+**Datum:** 28.01.2026
+
+### Problem
+Bei intensiver Nutzung (Multi-Agent Pipeline mit vielen Tool-Calls) wird das Anthropic API Rate Limit erreicht (HTTP 429). Das führt zu Wartezeiten und unterbrochenen Anfragen.
+
+### Kontext
+- Anthropic Rate Limits sind pro API Key
+- Ein Stats Agent Aufruf kann 5-10 API Requests erzeugen
+- Das SDK hat eingebautes Retry mit Backoff, aber nur mit demselben Key
+- Best Practice: Mehrere Keys mit Round-Robin Rotation
+
+### Entscheidung
+**API Key Rotation mit automatischem Wechsel bei 429-Errors**
+
+### Pattern
+
+```python
+# config/settings.py
+
+class APIKeyRotator:
+    """
+    Round-Robin Rotation durch mehrere API Keys.
+    Thread-safe für parallele Requests.
+    """
+    
+    def __init__(self):
+        keys_str = os.getenv("ANTHROPIC_API_KEYS", "")
+        self.keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+        self._index = 0
+        self._lock = threading.Lock()
+    
+    def get_key(self) -> str:
+        """Gibt den aktuellen API Key zurück."""
+        with self._lock:
+            return self.keys[self._index]
+    
+    def rotate(self) -> str:
+        """Wechselt zum nächsten Key."""
+        with self._lock:
+            self._index = (self._index + 1) % len(self.keys)
+            return self.keys[self._index]
+
+# Globale Instanz
+api_key_rotator = APIKeyRotator()
+
+def create_anthropic_client(model=DEFAULT_MODEL, temperature=0, **kwargs):
+    """Erstellt Client mit aktuellem Key."""
+    return ChatAnthropic(
+        model=model,
+        api_key=api_key_rotator.get_key(),
+        temperature=temperature,
+        **kwargs
+    )
+```
+
+```python
+# In Agents (data_agent.py, viz_agent.py, etc.)
+
+async def execute_agent_with_retry(agent, messages, tools, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return await agent.ainvoke({"messages": messages})
+        except Exception as e:
+            if "429" in str(e).lower() or "rate limit" in str(e).lower():
+                # Key rotieren und neuen Agent erstellen
+                api_key_rotator.rotate()
+                agent = create_data_agent(tools)  # Mit neuem Key
+                await asyncio.sleep(delay)
+            else:
+                raise
+```
+
+```env
+# .env
+ANTHROPIC_API_KEYS=sk-key1...,sk-key2...,sk-key3...
+```
+
+### Begründung
+- **3 Keys = 3x Rate Limits**: Effektive Kapazitätserhöhung
+- **Automatische Rotation**: Bei 429-Error wird sofort der nächste Key verwendet
+- **Thread-safe**: Wichtig für parallele Requests im Multi-Agent System
+- **Rückwärtskompatibel**: `ANTHROPIC_API_KEY` funktioniert weiterhin als Fallback
+- **Quellen**: Anthropic Rate Limit Docs, Best Practices für Multi-Key Rotation
+
+### Betroffene Komponenten
+- `config/settings.py` - APIKeyRotator Klasse, create_anthropic_client()
+- `agents/data_agent.py` - execute_agent_with_retry() mit Key-Rotation
+- `agents/viz_agent.py` - create_anthropic_client() statt ChatAnthropic
+- `agents/stats_agent.py` - create_anthropic_client() statt ChatAnthropic
+- `agents/supervisor.py` - create_anthropic_client() statt ChatAnthropic
+- `agents/graph.py` - create_anthropic_client() statt ChatAnthropic
+- `.env` - ANTHROPIC_API_KEYS mit komma-getrennten Keys
+
+### Anwenden bei
+- Alle LLM-Aufrufe im System
+- Zukünftige Agents
+- Jede Stelle die ChatAnthropic direkt erstellt
+
+---
+
+## DEC-019: Beispiel-basierte State-Awareness statt dediziertes Tool
+
+**Datum:** 28.01.2026
+
+### Problem
+Bei Multi-Turn-Konversationen lädt der Data Agent Daten doppelt:
+- Turn 1: "Zeig kartesische Position" → lädt pos_act_x/y/z
+- Turn 2: "Korreliert das mit Orientierung?" → lädt pos_act_x/y/z UND pos_act_a/b/c (obwohl Position schon da)
+
+Der Agent nutzt die `<loaded_data>` Information im Prompt nicht effektiv.
+
+### Kontext
+- Ursprünglicher Plan (AP7.1): Dediziertes `inspect_loaded_data()` Tool mit InjectedState
+- Alternative: Beispiel-basierter Ansatz im Prompt
+- LangGraph Best Practice: "Context Engineering" - Agent bekommt Info im Prompt
+- Research: InjectedState Pattern ist für Daten-Übergabe, nicht für Entscheidungshilfe
+
+### Entscheidung
+**Beispiele im Prompt statt dediziertes Tool**
+
+### Pattern
+
+#### 1. Reicherer Dataset-Hint mit XML-Format
+```python
+def format_existing_datasets_hint(datasets: dict[str, Any]) -> str:
+    """Formatiert Hint mit reicheren Infos."""
+    if not datasets:
+        return ""
+    
+    lines = ["<loaded_data>"]
+    
+    for key, dataset in datasets.items():
+        meta = dataset.get("meta", {})
+        data = dataset.get("data", {})
+        stats = meta.get("statistics", {})
+        timerange = meta.get("timerange", {})
+        settings = meta.get("settings", {})
+        
+        lines.append(f"")
+        lines.append(f"## {key}")
+        lines.append(f"keys: {', '.join(list(data.keys())[:6])}")
+        
+        if timerange:
+            lines.append(f"zeitraum: {timerange.get('start')} - {timerange.get('end')}")
+        
+        if settings:
+            lines.append(f"einstellungen: {settings.get('aggregation_human')} alle {settings.get('interval_human')}")
+        
+        # Statistik-Preview für ersten Key
+        if stats:
+            first_key = next(iter(stats.keys()), None)
+            if first_key:
+                s = stats[first_key]
+                lines.append(f"preview ({first_key}): {s.get('count')} Punkte, min={s.get('min')}, max={s.get('max')}, avg={s.get('avg')}")
+    
+    lines.append("</loaded_data>")
+    return "\n".join(lines)
+```
+
+#### 2. Multi-Turn Beispiele im Prompt
+```xml
+<examples>
+## Multi-Turn Beispiele
+
+Beispiel 1 - Daten schon geladen:
+<loaded_data>
+## torque
+keys: torque_act_a1_nm, torque_act_a2_nm
+zeitraum: 2025-01-22T08:00 - 2025-01-22T17:00
+</loaded_data>
+
+User: "Zeig die Drehmomente nochmal"
+→ Keine API-Abfrage nötig! Daten sind bereits in <loaded_data>.
+
+Beispiel 2 - Korrelation, eine Seite fehlt:
+<loaded_data>
+## torque
+keys: torque_act_a1_nm, torque_act_a2_nm
+zeitraum: 2025-01-22T08:00 - 2025-01-22T17:00
+</loaded_data>
+
+User: "Gibt es einen Zusammenhang zwischen Position und Moment?"
+→ torque ist schon geladen (siehe <loaded_data>)
+→ Lade NUR axis_act_* für denselben Zeitraum
+
+Beispiel 3 - Beide Datentypen fehlen:
+<loaded_data>
+(leer)
+</loaded_data>
+
+User: "Vergleiche Position und Geschwindigkeit"
+→ Keine Daten geladen, lade beide auf einmal
+</examples>
+```
+
+### Vergleich der Ansätze
+
+| Kriterium | Tool-Ansatz | Beispiel-Ansatz |
+|-----------|-------------|------------------|
+| Extra API-Call | Ja (Kosten, Latenz) | Nein |
+| Skalierbarkeit | Neue Tools = neuer Code | Neue Beispiele = Prompt-Update |
+| Agent muss lernen | Tool aufzurufen | Beispiele zu verstehen |
+| Komplexität | Höher (InjectedState) | Niedriger (nur Prompt) |
+| Debugging | Tool-Call sichtbar | Implizit im Verhalten |
+
+### Begründung
+- **Kein Extra-API-Call**: Tool-Ansatz hätte bei jedem Turn einen zusätzlichen LLM-Call erzeugt
+- **Beispiele skalieren besser**: Hardcoded Instruktionen ("Prüfe IMMER ZUERST...") werden vom LLM oft ignoriert
+- **Context Engineering**: LangGraph empfiehlt, relevante Info direkt im Prompt bereitzustellen
+- **Konsistenz mit DEC-015**: XML-Tags für strukturierte Prompt-Sektionen
+- **Getestet**: Agent lädt bei "Korreliert das mit Orientierung?" nur die fehlenden Daten
+
+### Anwenden bei
+- Alle Agents die auf vorhandene State-Daten reagieren sollen
+- Multi-Turn Szenarien mit Daten-Akkumulation
+- Query-Interpretation basierend auf Kontext
+
+### Referenz
+- `agents/data_agent.py` - format_existing_datasets_hint()
+- `prompts/data_agent_prompt.py` - Multi-Turn Beispiele
+- `docs/AP7_AGENT_INTELLIGENCE.md` - AP7.1
+
+---
+
+## DEC-020: Komprimierter Telemetry Lookup statt Catalog im LLM-Context
+
+**Datum:** 02.02.2026
+
+### Problem
+Der vollständige Telemetrie-Catalog (~10.000 Tokens) wurde bei JEDER Anfrage komplett ins LLM-Context geladen:
+
+```
+User: "Zeig mir die Gelenkwinkel"
+  → get_attributes(keys="telemetry_catalog")  → ~10.000 Tokens ins Context
+  → LLM durchsucht Catalog, findet "Gelenkwinkel" → axis_act_*
+  → get_telemetry(keys="axis_act_a1_deg,...")
+```
+
+Bei einem Rate Limit von 30k Tokens/Minute führte das zu 429-Errors nach nur 2-3 Calls.
+
+### Kontext
+- Catalog: 13 Gruppen, 54 Keys, reichhaltige Beschreibungen (Sparkplug B Schema)
+- Pro Query: ~13.500 Tokens (System Prompt + Catalog + Tool-Response)
+- 2 Calls × 13.500 = 27.000 Tokens → Rate Limit fast ausgeschöpft
+- Drei Alternativen evaluiert: Neo4j Graph-DB, Embedding-Suche, Komprimierter JSON
+
+| Kriterium | Neo4j | Embedding Search | Komprimierter JSON |
+|-----------|-------|------------------|--------------------|
+| Setup-Aufwand | 🔴 Hoch | 🟡 Mittel | 🟢 Gering |
+| Token-Reduktion | 🟢 ~200 Tokens | 🟢 ~200 Tokens | 🟢 ~200-500 Tokens |
+| Genauigkeit | 🟡 Exact Match | 🟢 Semantisch | 🟡 Substring-Match |
+| Wartbarkeit | 🟡 Extra Service | 🟡 Extra Dependency | 🟢 Kein Extra |
+| Thesis-Wert | 🟢 Innovativ | 🟡 Standard-RAG | 🔴 Trivial |
+
+Neo4j als optionaler Ausblick für Evaluation notiert (bei >500 Keys sinnvoll).
+
+### Entscheidung
+**Komprimierter Lookup-Index + neues MCP-Tool `search_telemetry_keys` mit Substring-Matching**
+
+### Pattern
+
+#### 1. Lookup-Index (`config/telemetry_lookup.json`)
+```json
+{
+  "groups": {
+    "axis_position": {
+      "name": "Achspositionen (Soll)",
+      "aliases": ["position", "gelenkwinkel", "achswinkel", ...],
+      "unit": "°",
+      "keys": ["axis_act_a1_deg", "axis_act_a2_deg", ...],
+      "description": "Soll-Achswinkel A1-A6 ($AXIS_ACT)"
+    }
+  }
+}
+```
+
+#### 2. Neues MCP-Tool
+```python
+@mcp.tool()
+async def search_telemetry_keys(query: str) -> str:
+    """
+    Findet passende Telemetrie-Keys basierend auf einem Suchbegriff.
+    IMMER VOR get_telemetry, wenn der User natürlichsprachliche Begriffe verwendet.
+    """
+    matches = search_lookup(query)  # Substring-Match
+    
+    if matches:
+        return {"status": "found", "matches": matches}     # ~200 Tokens
+    else:
+        return {"status": "no_match", "available_groups": overview}  # ~300 Tokens
+```
+
+#### 3. Substring-Match Strategie
+```python
+def search_lookup(query: str) -> list[dict]:
+    query_lower = query.lower().strip()
+    for group_id, group_data in _telemetry_lookup.items():
+        aliases = group_data.get("aliases", [])
+        # query in alias ODER alias in query (case-insensitive)
+        matched = any(
+            query_lower in alias or alias in query_lower
+            for alias in aliases
+        )
+```
+
+#### 4. Fallback bei keinem Match (3B-minimal)
+```json
+{
+  "status": "no_match",
+  "hint": "Kein direkter Treffer. Versuche es mit einem der Aliases.",
+  "available_groups": [
+    {"group": "axis_position", "aliases": ["position", "gelenkwinkel", ...], "unit": "°"},
+    {"group": "torque_actual", "aliases": ["moment", "drehmoment", ...], "unit": "Nm"}
+  ]
+}
+```
+Enthält KEINE Keys — LLM soll mit besserem Alias nochmal suchen.
+
+### Ergebnis (gemessen)
+
+| Metrik | Vorher | Nachher | Reduktion |
+|--------|--------|---------|----------|
+| Tokens pro Key-Lookup | ~10.000 | ~200 | **98%** |
+| Prompt-Sektion | ~600 Tokens (`<semantic_catalog>`) | ~300 Tokens (`<key_lookup>`) | 50% |
+| LLM-Calls bis Rate Limit | 2-3 | 10+ | 3-5x mehr |
+| Tool-Calls pro Query | 2 (catalog + telemetry) | 2 (search + telemetry) | gleich |
+
+### Neuer Flow
+```
+User: "Zeig mir die Gelenkwinkel"
+  → search_telemetry_keys(query="Gelenkwinkel")  → ~200 Tokens
+  → Ergebnis: {"group": "axis_position", "keys": ["axis_act_a1_deg", ...]}
+  → get_telemetry(keys="axis_act_a1_deg,...")
+```
+
+### Betroffene Komponenten
+- `config/telemetry_lookup.json` — **NEU** — Komprimierter Lookup-Index
+- `mcp_servers/thingsboard_server.py` — Neues Tool + Lookup-Funktionen
+- `prompts/data_agent_prompt.py` — `<semantic_catalog>` → `<key_lookup>`
+- `config/krc5_telemetry_catalog.json` — Unverändert (bleibt Source of Truth)
+
+### Begründung
+- **Pragmatisch**: Löst das Rate-Limit-Problem sofort ohne neue Infrastruktur
+- **Konsistent mit DEC-001**: Tool-Description mit "WANN/NICHT BENUTZEN"
+- **Konsistent mit DEC-004**: Große Daten nicht durch LLM-Prompt schleusen
+- **Erweiterbar**: Neo4j oder Embedding-Suche können später den Substring-Match ersetzen
+- **Single Source of Truth**: `krc5_telemetry_catalog.json` bleibt die Referenz
+
+### Anwenden bei
+- Alle Telemetrie-Anfragen mit natürlicher Sprache
+- Zukünftige Erweiterung: Neue Roboter-Modelle mit eigenem Lookup
+- Generell: Große Kataloge/Metadaten die das LLM durchsuchen müsste
+
+### Referenz
+- `config/telemetry_lookup.json`
+- `mcp_servers/thingsboard_server.py` — Abschnitt "TELEMETRY LOOKUP INDEX"
+- `prompts/data_agent_prompt.py` — Abschnitt `<key_lookup>`
+
+---
+
+## DEC-021: Prompt Caching für Rate-Limit-Optimierung
+
+> **Status:** ✅ IMPLEMENTIERT (Alle Agents)
+> **Datum:** 03. Februar 2026
+> **Auslöser:** 429 Errors bei Multi-Agent Pipelines (data_agent + stats_agent)
+
+### Problem/Kontext
+
+Das System stößt bei komplexen Queries (z.B. Korrelationsanalyse mit Datenabruf + Statistik) trotz DEC-018 (Key Rotation, 3 Keys) und DEC-020 (Lookup-Optimierung) ans Rate Limit:
+
+```
+Organization rate limit: 30.000 Input Tokens per Minute (Tier 1)
+3 Keys × 30k = 90k/min theoretisch, aber Token-Bucket pro Organisation
+```
+
+**Beobachteter Fehler-Flow (02.02.2026):**
+```
+Supervisor:   1 Call  (~3.000 Tokens) ✅
+Data Agent:   3 Calls (~4.000-5.000 Tokens je) ✅
+Stats Agent:  1. Call → 429 (Key 1) → 429 (Key 2) → ✅ (Key 3)
+Stats Agent:  2. Call → 429 (Key 3, alle verbraucht) → Fallback lokal
+Stats Agent:  3. Call → 429
+```
+
+**Ursache:** Jeder der 6-8 LLM-Calls einer Pipeline sendet den **vollen System Prompt + Tool-Definitionen** (~3.500 Tokens). Bei 7 Calls = ~24.500 Tokens allein für statische Inhalte.
+
+### Alternativen-Bewertung
+
+| Kriterium | A: Prompt Caching | B: Prompt-Komprimierung | C: Inter-Agent Delay |
+|-----------|-------------------|--------------------------|----------------------|
+| Rate-Limit-Reduktion | 🟢 ~80% (gecached zählt nicht) | 🟡 ~30-40% | 🟡 Zeitliche Verteilung |
+| Implementierungsaufwand | 🟡 Moderat (Client anpassen) | 🟢 Gering (Prompts kürzen) | 🟢 Trivial (sleep) |
+| Latenz-Auswirkung | 🟢 Schneller (Cache-Read) | 🟢 Neutral | 🔴 Langsamer (~3x) |
+| Qualitäts-Risiko | 🟢 Keines | 🟡 Weniger Kontext | 🟢 Keines |
+| Von Anthropic empfohlen | 🟢 Ja, offiziell | 🟡 Allgemeine Best Practice | 🟡 Workaround |
+| Kosten-Auswirkung | 🟢 90% billiger für Reads | 🟢 Weniger Tokens = billiger | 🟢 Neutral |
+
+### Entscheidung: Option A — Prompt Caching
+
+Ergänzend Option B für niedrig hängende Früchte.
+
+### Wie Prompt Caching funktioniert
+
+**Anthropic Cache-Aware Rate Limits (seit 2025):**
+- `cache_read_input_tokens` zählen **NICHT** gegen das ITPM-Limit
+- Nur `input_tokens` (uncached) zählen
+- Cache-TTL: 5 Minuten (Standard) oder 1 Stunde
+- Minimum: 1.024 Tokens für Cache-Breakpoint
+- Kosten: Cache-Write = 25% Aufpreis, Cache-Read = 90% Rabatt
+
+**Prinzip:**
+```
+1. Call: System Prompt (3.500 Tokens) → Cache-Write → zählt als Input
+2. Call: System Prompt → Cache-Read → zählt NICHT gegen ITPM!
+3.-7. Call: Alle Cache-Read → zählen NICHT
+
+Effektiv: Statt 7 × 3.500 = 24.500 Tokens → nur 1 × 3.500 = 3.500 Tokens
+```
+
+### Implementierung
+
+**Umgesetzt (03.02.2026):**
+
+```python
+# config/settings.py - Hilfsfunktion für Prompt Caching
+
+def create_cached_system_message(content: str):
+    """
+    SystemMessage mit cache_control für Prompt Caching (DEC-021).
+
+    WICHTIG: content muss als list[dict] formatiert werden, damit LangChain
+    das cache_control korrekt an die Anthropic API weitergibt.
+    (Siehe: https://github.com/langchain-ai/langchain/issues/26701)
+    """
+    from langchain_core.messages import SystemMessage
+    return SystemMessage(
+        content=[{
+            "type": "text",
+            "text": content,
+            "cache_control": {"type": "ephemeral"}
+        }]
+    )
+
+# create_anthropic_client() mit Caching-Header
+PROMPT_CACHING_HEADERS = {"anthropic-beta": "prompt-caching-2024-07-31"}
+
+def create_anthropic_client(model=DEFAULT_MODEL, temperature=0, enable_caching=True, **kwargs):
+    model_kwargs = kwargs.pop("model_kwargs", {})
+    if enable_caching:
+        existing_headers = model_kwargs.get("extra_headers", {})
+        existing_headers.update(PROMPT_CACHING_HEADERS)
+        model_kwargs["extra_headers"] = existing_headers
+
+    return ChatAnthropic(
+        model=model,
+        api_key=api_key_rotator.get_key(),
+        temperature=temperature,
+        model_kwargs=model_kwargs if model_kwargs else None,
+        **kwargs
+    )
+```
+
+**Angepasste Komponenten:**
+- ✅ `config/settings.py` — `create_cached_system_message()`, Header in `create_anthropic_client()`
+- ✅ `agents/supervisor.py` — Nutzt `create_cached_system_message()`
+- ✅ `agents/graph.py` (respond_node) — Nutzt `create_cached_system_message()`
+- ✅ `agents/data_agent.py` — `prepare_messages()` nutzt `create_cached_system_message()`
+- ✅ `agents/stats_agent.py` — Nutzt `create_cached_system_message()`
+- ✅ `agents/viz_agent.py` — `select_and_execute_tool()` nutzt `create_cached_system_message()`
+
+**Verifizierung:**
+- Response-Headers prüfen: `cache_creation_input_tokens` vs `cache_read_input_tokens`
+- Im Logging auf Cache-Hit-Rate achten
+
+### Erwartete Auswirkung
+
+| Metrik | Vorher (DEC-020) | Nachher (DEC-021) | Verbesserung |
+|--------|------------------|-------------------|--------------|
+| ITPM pro Pipeline | ~30.000 | ~6.000 | ~80% |
+| Queries vor Rate Limit | 1-2 (komplex) | 5-10 (komplex) | 3-5x |
+| Kosten pro Pipeline | ~100% | ~40% (Cache-Reads) | ~60% |
+| Latenz | Baseline | Schneller (Cache) | ~15-20% |
+
+### Betroffene Komponenten
+- `config/settings.py` — `create_anthropic_client()` ggf. anpassen
+- `agents/supervisor.py` — System Prompt mit cache_control
+- `agents/data_agent.py` — System Prompt mit cache_control
+- `agents/stats_agent.py` — System Prompt mit cache_control
+- `agents/viz_agent.py` — System Prompt mit cache_control
+
+### Begründung
+- **Offiziell empfohlen**: Anthropic Blog "Token-saving updates" (Feb 2025)
+- **Konsistent mit DEC-018**: Key Rotation bleibt als Fallback aktiv
+- **Konsistent mit DEC-020**: Lookup-Optimierung reduziert die uncached Tokens weiter
+- **LangChain-Support**: `ChatAnthropic` unterstützt `cache_control` in Messages nativ
+- **Thesis-relevant**: Zeigt systematische Optimierungsstrategie über mehrere Ebenen
+
+### Quellen
+- https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+- https://www.anthropic.com/news/token-saving-updates
+- https://docs.langchain.com/oss/python/integrations/chat/anthropic
+- Anthropic Rate Limits Doku: Cache-Read Tokens zählen nicht gegen ITPM
+
+### Anwenden bei
+- Alle Agents mit statischen System Prompts
+- Multi-Agent Pipelines mit sequentiellen LLM-Calls
+- Generell: Wiederholte Calls mit gleichem Prompt-Präfix
+
+---
+
 ## 💡 IDEEN (noch nicht umgesetzt)
 
 ### IDEE-001: Dynamic Telemetry Key Discovery
@@ -1069,3 +1585,21 @@ Wenn der User nach Daten fragt, die du nicht in TELEMETRIE-KEYS findest:
 ```
 
 **Status:** Notiert, Umsetzung später
+
+---
+
+## 🔄 Änderungshistorie
+
+| Datum | Änderung |
+|-------|---------|
+| 2025-12-19 | Initiale Version mit 8 Patterns |
+| 2025-12-20 | DEC-009 (Error Handling) + DEC-010 (Datenpunkt-Limit) hinzugefügt |
+| 2025-12-20 | DEC-011 (Literal statt Regex) - Refactoring nach fehlgeschlagenem Test |
+| 2025-12-20 | DEC-012 (Integration Testing) - MCP Cleanup + Rate Limit Best Practices |
+| 2025-12-20 | DEC-013 (Multi-Turn Persistenz) - Checkpointer für State zwischen Turns |
+| 2025-12-23 | DEC-014 (SystemMessage Filter) - Anthropic Multi-Turn Fix |
+| 2025-12-23 | IDEE-001 (Dynamic Key Discovery) - Notiert für spätere Umsetzung |
+| 2025-12-23 | DEC-015 (Prompt-Struktur mit XML-Tags) - Anthropic Best Practice |
+| 2026-01-28 | DEC-019 (Beispiel-basierte State-Awareness) - AP7.1 abgeschlossen |
+| 2026-02-02 | DEC-020 (Komprimierter Telemetry Lookup) - Token-Verbrauch von ~10k auf ~200 reduziert |
+| 2026-02-03 | DEC-021 (Prompt Caching) - IMPLEMENTIERT: Alle Agents mit list[dict] content Format (LangChain Issue #26701) |
