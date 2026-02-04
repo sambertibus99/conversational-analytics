@@ -21,6 +21,7 @@ import json
 import asyncio
 import logging
 from contextlib import AsyncExitStack
+from datetime import datetime
 from typing import Any, Tuple, Optional
 
 from langchain_anthropic import ChatAnthropic
@@ -31,9 +32,10 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from langchain_mcp_adapters.tools import load_mcp_tools
 
-from agents.state import AgentState
+from agents.state import AgentState, DatasetMeta
 from prompts.data_agent_prompt import get_data_agent_prompt
 from config.settings import DEFAULT_MODEL, PROJECT_ROOT, api_key_rotator, create_anthropic_client, create_cached_system_message
+from config.duckdb_store import SessionStore, generate_dataset_key, determine_signal_type
 
 
 # =============================================================================
@@ -374,45 +376,36 @@ def extract_data_from_parsed(
 # HILFSFUNKTIONEN - DATASET HANDLING
 # =============================================================================
 
-def determine_dataset_key(data: Optional[dict], meta: Optional[dict]) -> str:
+def determine_dataset_key_legacy(data: Optional[dict], meta: Optional[dict]) -> str:
     """
-    Bestimmt einen eindeutigen Key für den Datensatz.
-    
+    Bestimmt einen UNS-inspirierten Dataset-Key (DEC-025).
+
+    Nutzt generate_dataset_key() und determine_signal_type() aus duckdb_store.
+
     Beispiele:
-    - Drehmomente → "torque"
-    - Geschwindigkeit → "velocity"
+    - Drehmomente → "krc5/torque/timeseries"
+    - Aktuelle Geschwindigkeit → "krc5/velocity/latest"
     """
     if data is None:
         return "unknown"
-    
+
     if not isinstance(data, dict):
         return "data"
-    
+
     keys = list(data.keys())
     if not keys:
         return "empty"
-    
-    first_key = keys[0].lower()
-    
-    key_mapping = {
-        "torque": "torque",
-        "vel": "velocity",
-        "speed": "velocity",
-        "pos": "position",
-        "acc": "acceleration",
-        "temp": "temperature",
-        "current": "current",
-        "amp": "current",
-        "axis": "axis",
-        "energy": "energy",
-    }
-    
-    for pattern, name in key_mapping.items():
-        if pattern in first_key:
-            return name
-    
-    # Fallback: Ersten Key-Teil als Basis
-    return first_key.split("_")[0] if "_" in first_key else first_key[:10]
+
+    signal_type = determine_signal_type(keys)
+
+    # Datentyp bestimmen
+    data_type = "timeseries"
+    if meta and meta.get("type") == "latest":
+        data_type = "latest"
+    elif meta and meta.get("type") == "data_availability":
+        data_type = "availability"
+
+    return generate_dataset_key("krc5", signal_type, data_type)
 
 
 def generate_data_summary(
@@ -484,55 +477,90 @@ def generate_data_summary(
 def format_existing_datasets_hint(datasets: dict[str, Any]) -> str:
     """
     Formatiert Hinweis über bereits geladene Datasets für den Prompt.
-    
-    AP7.1: Reichere Infos mit XML-Format für bessere State-Awareness.
+
+    DEC-025: Arbeitet jetzt mit DatasetMeta (Reference-only State).
     Enthält: Keys, Zeitraum, Intervall, Aggregation, Statistik-Preview.
     """
     if not datasets:
         return ""
-    
+
     lines = ["<loaded_data>"]
-    
+
     for key, dataset in datasets.items():
-        meta = dataset.get("meta", {})
-        data = dataset.get("data", {})
-        stats = meta.get("statistics", {})
-        timerange = meta.get("timerange", {})
-        settings = meta.get("settings", {})
-        
-        # Keys (max 6)
-        data_keys = list(data.keys())[:6] if isinstance(data, dict) else []
-        
-        lines.append(f"")
-        lines.append(f"## {key}")
-        lines.append(f"keys: {', '.join(data_keys)}")
-        
-        # Zeitraum
-        if timerange:
-            start = timerange.get("start") or timerange.get("start_human", "?")
-            end = timerange.get("end") or timerange.get("end_human", "?")
-            lines.append(f"zeitraum: {start} - {end}")
-        
-        # Intervall und Aggregation
-        if settings:
-            interval = settings.get("interval_human") or settings.get("interval", "?")
-            aggregation = settings.get("aggregation_human") or settings.get("aggregation", "AVG")
-            lines.append(f"einstellungen: {aggregation} alle {interval}")
-        
-        # Statistik-Preview für ersten Key
-        if stats:
-            first_key = next(iter(stats.keys()), None)
-            if first_key and isinstance(stats.get(first_key), dict):
-                s = stats[first_key]
-                count = s.get("count", "?")
-                min_val = s.get("min", "?")
-                max_val = s.get("max", "?")
-                avg_val = s.get("avg", "?")
-                lines.append(f"preview ({first_key}): {count} Punkte, min={min_val}, max={max_val}, avg={avg_val}")
-    
+        if not isinstance(dataset, dict):
+            continue
+
+        # DEC-025: DatasetMeta Format (kein "data" Key mehr)
+        if "dataset_key" in dataset:
+            # Neues DatasetMeta-Format
+            signal_keys = dataset.get("keys", [])
+            timerange = dataset.get("timerange", {})
+            point_count = dataset.get("point_count", "?")
+            meta = dataset.get("meta", {})
+            stats = meta.get("statistics", {}) if isinstance(meta, dict) else {}
+            settings = meta.get("settings", {}) if isinstance(meta, dict) else {}
+
+            lines.append(f"")
+            lines.append(f"## {key}")
+            lines.append(f"keys: {', '.join(signal_keys[:6])}")
+            lines.append(f"punkte: {point_count}")
+
+            if timerange:
+                start = timerange.get("start") or timerange.get("start_human", "?")
+                end = timerange.get("end") or timerange.get("end_human", "?")
+                lines.append(f"zeitraum: {start} - {end}")
+
+            if settings:
+                interval = settings.get("interval_human") or settings.get("interval", "?")
+                aggregation = settings.get("aggregation_human") or settings.get("aggregation", "AVG")
+                lines.append(f"einstellungen: {aggregation} alle {interval}")
+
+            if stats:
+                first_stat_key = next(iter(stats.keys()), None)
+                if first_stat_key and isinstance(stats.get(first_stat_key), dict):
+                    s = stats[first_stat_key]
+                    count = s.get("count", "?")
+                    min_val = s.get("min", "?")
+                    max_val = s.get("max", "?")
+                    avg_val = s.get("avg", "?")
+                    lines.append(f"preview ({first_stat_key}): {count} Punkte, min={min_val}, max={max_val}, avg={avg_val}")
+        else:
+            # Legacy-Format: {"data": {...}, "meta": {...}}
+            meta = dataset.get("meta", {})
+            data = dataset.get("data", {})
+            stats = meta.get("statistics", {})
+            timerange = meta.get("timerange", {})
+            settings = meta.get("settings", {})
+
+            data_keys = list(data.keys())[:6] if isinstance(data, dict) else []
+
+            lines.append(f"")
+            lines.append(f"## {key}")
+            lines.append(f"keys: {', '.join(data_keys)}")
+
+            if timerange:
+                start = timerange.get("start") or timerange.get("start_human", "?")
+                end = timerange.get("end") or timerange.get("end_human", "?")
+                lines.append(f"zeitraum: {start} - {end}")
+
+            if settings:
+                interval = settings.get("interval_human") or settings.get("interval", "?")
+                aggregation = settings.get("aggregation_human") or settings.get("aggregation", "AVG")
+                lines.append(f"einstellungen: {aggregation} alle {interval}")
+
+            if stats:
+                first_key = next(iter(stats.keys()), None)
+                if first_key and isinstance(stats.get(first_key), dict):
+                    s = stats[first_key]
+                    count = s.get("count", "?")
+                    min_val = s.get("min", "?")
+                    max_val = s.get("max", "?")
+                    avg_val = s.get("avg", "?")
+                    lines.append(f"preview ({first_key}): {count} Punkte, min={min_val}, max={max_val}, avg={avg_val}")
+
     lines.append("")
     lines.append("</loaded_data>")
-    
+
     return "\n".join(lines)
 
 
@@ -616,6 +644,12 @@ def prepare_messages(state: AgentState, existing_datasets: dict) -> list:
         current_prompt = current_prompt + "\n\n" + datasets_hint
         logger.debug("Datasets-Hint zum Prompt hinzugefügt")
 
+    # Data Instructions vom Supervisor injizieren
+    data_instructions = state.get("data_instructions")
+    if data_instructions:
+        current_prompt = current_prompt + "\n\n<supervisor_instructions>\n" + data_instructions + "\n</supervisor_instructions>"
+        logger.debug(f"Data Instructions injiziert: {data_instructions[:80]}...")
+
     # SystemMessages filtern (DEC-014)
     filtered_messages = [
         msg for msg in state["messages"]
@@ -681,38 +715,90 @@ async def execute_agent_with_retry(agent, messages: list, tools: list, max_retri
 
 def extract_tool_results(
     result: dict
-) -> Tuple[Optional[Any], Optional[dict], Optional[str]]:
+) -> Tuple[Optional[Any], Optional[dict], Optional[str], list]:
     """
     Extrahiert Daten aus Agent-Ergebnis.
-    
+
     Durchsucht alle ToolMessages und extrahiert die relevantesten Daten.
+    Gibt zusätzlich ALLE extrahierten Datasets zurück (für DuckDB-Speicherung).
+
+    Returns:
+        (primary_data, primary_meta, primary_file, all_datasets)
+        all_datasets: Liste von (data, meta, file) Tupeln
     """
     data = None
     meta = None
     data_file = None
-    
+    all_datasets: list[Tuple[Any, Optional[dict], Optional[str]]] = []
+
     for msg in result.get("messages", []):
         if isinstance(msg, ToolMessage):
             text_content = extract_text_from_tool_content(msg.content)
-            
+
             if text_content:
                 parsed = parse_json_safe(text_content)
-                
+
                 if parsed is not None:
                     extracted_data, extracted_meta, extracted_file = extract_data_from_parsed(parsed)
-                    
+
                     if extracted_data is not None:
+                        all_datasets.append((extracted_data, extracted_meta, extracted_file))
+
                         # Priorisiere Ergebnisse mit Statistiken
                         current_is_list = meta and meta.get("type") == "list"
                         new_has_stats = extracted_meta and extracted_meta.get("statistics")
                         new_is_not_list = extracted_meta and extracted_meta.get("type") != "list"
-                        
+
                         if data is None or (current_is_list and new_is_not_list) or new_has_stats:
                             data = extracted_data
                             meta = extracted_meta
                             data_file = extracted_file
-    
-    return data, meta, data_file
+
+    return data, meta, data_file, all_datasets
+
+
+def _store_dataset_in_duckdb(
+    data: dict,
+    meta: Optional[dict],
+    data_file: Optional[str],
+    session_id: str,
+    data_retrieval_mode: str,
+) -> Tuple[str, DatasetMeta]:
+    """
+    DEC-025: Speichert ein Dataset in DuckDB und erstellt DatasetMeta.
+
+    Returns:
+        (dataset_key, DatasetMeta)
+    """
+    dataset_key = determine_dataset_key_legacy(data, meta)
+    signal_keys = list(data.keys())
+    unit = _detect_unit(signal_keys)
+    point_count = 0
+
+    try:
+        store = SessionStore.get_instance(session_id)
+        point_count = store.store_dataset(dataset_key, data, unit=unit)
+        logger.info(f"DuckDB: {point_count} Punkte gespeichert für '{dataset_key}'")
+    except Exception as e:
+        logger.warning(f"DuckDB store fehlgeschlagen: {e} — Daten nur in File")
+
+    timerange = {}
+    if meta and meta.get("timerange"):
+        timerange = meta["timerange"]
+
+    dataset_meta = DatasetMeta(
+        dataset_key=dataset_key,
+        device_id="krc5",
+        keys=signal_keys,
+        point_count=point_count,
+        timerange=timerange,
+        retrieval_mode=data_retrieval_mode,
+        unit=unit,
+        created_at=datetime.now().isoformat(),
+        data_file=data_file,
+        meta=meta or {},
+    )
+    return dataset_key, dataset_meta
 
 
 def build_result(
@@ -722,24 +808,43 @@ def build_result(
     data_file: Optional[str],
     quality: Optional[dict],
     needs_input: bool,
-    input_reason: Optional[str]
+    input_reason: Optional[str],
+    session_id: str = "default",
+    data_retrieval_mode: str = "aggregated",
+    all_datasets: Optional[list] = None,
 ) -> dict[str, Any]:
-    """Baut das Ergebnis-Dictionary zusammen."""
-    
+    """
+    Baut das Ergebnis-Dictionary zusammen.
+
+    DEC-025: Rohdaten werden in DuckDB SessionStore gespeichert.
+    Im State (datasets) landen nur noch DatasetMeta-Referenzen.
+    Speichert ALLE Datasets aus allen Tool-Aufrufen, nicht nur das letzte.
+    """
+
     summary = generate_data_summary(data, meta, quality)
     logger.info(f"Summary: {summary}")
-    
-    # Dataset unter Key speichern
-    new_datasets = {}
-    if data is not None and isinstance(data, dict):
-        dataset_key = determine_dataset_key(data, meta)
-        new_datasets[dataset_key] = {
-            "data": data,
-            "meta": meta,
-            "data_file": data_file,
-        }
-        logger.debug(f"Neuer Datensatz unter Key '{dataset_key}'")
-    
+
+    new_datasets: dict[str, DatasetMeta] = {}
+
+    # ALLE Datasets in DuckDB speichern (nicht nur das primäre)
+    if all_datasets:
+        for ds_data, ds_meta, ds_file in all_datasets:
+            if ds_data is not None and isinstance(ds_data, dict) and _is_telemetry_data(ds_data):
+                key, meta_entry = _store_dataset_in_duckdb(
+                    ds_data, ds_meta, ds_file, session_id, data_retrieval_mode,
+                )
+                if meta_entry.get("point_count", 0) > 0:
+                    new_datasets[key] = meta_entry
+        if new_datasets:
+            logger.info(f"DuckDB: {len(new_datasets)} Datasets gespeichert")
+
+    # Fallback: nur primäres Dataset (wenn all_datasets nicht übergeben)
+    elif data is not None and isinstance(data, dict):
+        key, meta_entry = _store_dataset_in_duckdb(
+            data, meta, data_file, session_id, data_retrieval_mode,
+        )
+        new_datasets[key] = meta_entry
+
     return {
         "messages": result.get("messages", []),
         "datasets": new_datasets,
@@ -748,6 +853,49 @@ def build_result(
         "needs_user_input": needs_input,
         "user_input_reason": input_reason,
     }
+
+
+def _detect_unit(keys: list[str]) -> str:
+    """Erkennt Einheit aus Signal-Keys."""
+    if not keys:
+        return ""
+    first = keys[0].lower()
+    unit_mapping = [
+        ("_nm", "Nm"),
+        ("_deg", "deg"),
+        ("_mm", "mm"),
+        ("_pct", "%"),
+        ("_m_per_s", "m/s"),
+        ("_a", "A"),
+        ("_kwh", "kWh"),
+    ]
+    for suffix, unit in unit_mapping:
+        if suffix in first:
+            return unit
+    return ""
+
+
+def _is_telemetry_data(data: dict) -> bool:
+    """
+    Prüft ob ein Dict tatsächlich Telemetrie-Daten enthält.
+
+    Telemetrie-Daten haben das Format:
+    - Timeseries: {"key": [{"value": "25.0", "timestamp": 1234}, ...]}
+    - Latest: {"key": {"value": "25.0", "timestamp": 1234}}
+
+    NICHT Telemetrie: search_telemetry_keys Responses, data_availability, etc.
+    """
+    if not data:
+        return False
+    first_val = next(iter(data.values()))
+    # Timeseries: Wert ist Liste von {value, timestamp} Dicts
+    if isinstance(first_val, list) and len(first_val) > 0:
+        item = first_val[0]
+        return isinstance(item, dict) and "value" in item
+    # Latest: Wert ist einzelnes {value, timestamp} Dict
+    if isinstance(first_val, dict) and "value" in first_val:
+        return True
+    return False
 
 
 def build_error_result(error: Exception) -> dict[str, Any]:
@@ -796,21 +944,34 @@ async def run_data_agent(state: AgentState) -> dict[str, Any]:
         result = await execute_agent_with_retry(agent, messages, tools)
         logger.debug(f"Agent fertig, {len(result.get('messages', []))} Messages")
         
-        # 6. Tool-Ergebnisse extrahieren
-        data, meta, data_file = extract_tool_results(result)
-        
+        # 6. Tool-Ergebnisse extrahieren (alle Datasets, nicht nur das letzte)
+        data, meta, data_file, all_datasets = extract_tool_results(result)
+        telemetry_count = sum(1 for d, _, _ in all_datasets if isinstance(d, dict) and _is_telemetry_data(d))
+        if telemetry_count > 0:
+            logger.info(f"Data Agent hat {telemetry_count} Telemetrie-Datasets geladen")
+
         # 7. Datenqualität prüfen
         quality = None
         if data and isinstance(data, dict):
             quality = validate_data_quality(data)
             if meta:
                 meta["quality"] = quality
-        
+
         # 8. User-Input-Bedarf prüfen
         needs_input, input_reason = detect_needs_user_input(result.get("messages", []))
-        
-        # 9. Ergebnis zusammenstellen
-        return build_result(result, data, meta, data_file, quality, needs_input, input_reason)
+
+        # 9. Session-ID und Data-Mode für DuckDB (DEC-025)
+        session_id = state.get("session_id", "default")
+        data_mode = state.get("data_retrieval_mode", "aggregated")
+
+        # 10. Ergebnis zusammenstellen (speichert ALLE Datasets in DuckDB)
+        # asyncio.to_thread: DuckDB-Inserts blockieren den Event Loop nicht mehr,
+        # Socket.IO Heartbeats bleiben aktiv → kein Chainlit-Reconnect
+        return await asyncio.to_thread(
+            build_result,
+            result, data, meta, data_file, quality, needs_input, input_reason,
+            session_id, data_mode, all_datasets,
+        )
         
     except Exception as e:
         return build_error_result(e)
