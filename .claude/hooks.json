@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/sam/ma_ws/conversational-analytics/.claude/hooks/validate_xml_prompts.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

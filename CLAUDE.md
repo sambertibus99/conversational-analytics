@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-MCP-based LLM multi-agent system for natural language IIoT data analysis of KUKA KRC5 robots. Uses LangGraph for orchestration, Chainlit for the frontend, ThingsBoard MCP for data access, and AntV MCP for chart generation.
+MCP-based LLM multi-agent system for natural language IIoT data analysis of KUKA KRC5 robots. Uses LangGraph for orchestration, Chainlit for the frontend, ThingsBoard MCP for data access, and AntV MCP for chart generation. Python 3.12, dependencies in `requirements.txt`.
+
+Documentation and code comments are in German. User-facing interactions are in German.
 
 ## Commands
 
@@ -12,9 +14,12 @@ MCP-based LLM multi-agent system for natural language IIoT data analysis of KUKA
 # Run app
 source venv/bin/activate && chainlit run app.py
 
-# Tests
-python -m pytest tests/ -m "not integration" -v   # Unit tests (fast)
-python -m pytest tests/ -m integration -v          # Integration tests (needs ThingsBoard)
+# Tests (prefer run_tests.py if ROS2 is installed — removes ROS path conflicts)
+python run_tests.py                              # Unit tests (default)
+python run_tests.py --integration                # All tests incl. integration
+python run_tests.py --coverage                   # With coverage report
+python -m pytest tests/ -m "not integration" -v  # Unit tests (direct pytest)
+python -m pytest tests/ -m integration -v        # Integration tests (needs ThingsBoard)
 python -m pytest tests/test_data_agent.py::test_latest_telemetry -v  # Single test
 
 # Test individual agents (standalone mode)
@@ -56,7 +61,9 @@ User → Chainlit (app.py) → LangGraph (graph.py)
                      Respond Node → User
 ```
 
-**Agent Routing:** Supervisor creates plan like `["data_agent", "viz_agent"]` or `["data_agent", "stats_agent"]`. Agents execute sequentially, sharing data via `AgentState`.
+**Agent Routing:** Supervisor creates plan like `["data_agent", "viz_agent"]` or `["data_agent", "stats_agent"]`. Agents execute sequentially, sharing data via `AgentState`. Supervisor also sets `data_retrieval_mode`: `"raw"` for stats/correlation queries, `"aggregated"` for visualization (DEC-023).
+
+**Multi-Turn Persistence (DEC-013):** `app.py` generates a UUID `thread_id` per chat session and passes it as `config={"configurable": {"thread_id": ...}}` to `graph.ainvoke()`. The `InMemorySaver` checkpointer keeps `datasets` and `data_summary` across turns via custom reducers (`merge_datasets`, `merge_summaries`).
 
 **State Flow (DEC-013):**
 1. Agents write to `AgentState` (state.py) with reducers:
@@ -65,6 +72,8 @@ User → Chainlit (app.py) → LangGraph (graph.py)
    - `chart_url`, `statistics`: Per-turn outputs - **overwritten each turn**
 2. Large data saved to `outputs/data/`, only metadata in state (DEC-004)
 3. `respond_node` reads all state to generate final response
+
+**MCP Sessions:** ThingsBoard and AntV MCP servers use global session caching (DEC-005). Sessions stay open while the app runs. For testing, use the `cleanup_mcp_after_test` fixture to reset between tests.
 
 ## Key Patterns
 
@@ -84,38 +93,36 @@ All 24 patterns documented in `docs/DECISIONS.md`. Critical ones for daily work:
 | Query-Type Data Mode (DEC-023) | `raw` for stats, `aggregated` for viz | Correlation/statistics queries |
 | Timeseries Correlation (DEC-024) | `pd.merge_asof` for timestamp alignment | IoT sensor correlation |
 
+**Gotcha (DEC-021):** LangChain does NOT propagate `additional_kwargs={"cache_control": ...}` to the Anthropic API. Format `content` as `list[dict]` with `cache_control` in the content block instead. See `create_cached_system_message()` in `config/settings.py`.
+
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `agents/graph.py` | LangGraph orchestration, routing, respond_node |
+| `app.py` | Chainlit entry point, thread-ID management, MCP warmup |
+| `agents/graph.py` | LangGraph orchestration, routing, respond_node, error_handler |
 | `agents/state.py` | AgentState with reducers for datasets/summaries |
+| `agents/supervisor.py` | Query analysis, plan creation, data_retrieval_mode selection |
 | `agents/data_agent.py` | Fetches data via ThingsBoard MCP |
 | `agents/viz_agent.py` | Generates charts via AntV MCP (10 chart types) |
 | `agents/stats_agent.py` | Statistical analysis with InjectedState (DEC-003/024) |
+| `agents/utils.py` | Shared helpers: `extract_data_from_datasets`, dataset hints |
 | `tools/stats_functions.py` | Pure Python stats functions incl. `merge_asof` correlation |
 | `config/settings.py` | `APIKeyRotator`, `create_anthropic_client()`, `create_cached_system_message()` |
-| `prompts/*.py` | System prompts with XML-tag structure |
+| `prompts/*.py` | System prompts with XML-tag structure (DEC-015) |
 | `mcp_servers/thingsboard_server.py` | MCP tools: data, lookup, attributes (DEC-020) |
+| `mcp_servers/thingsboard_client.py` | Async HTTP client with retry, custom exceptions (DEC-009) |
 | `config/telemetry_lookup.json` | Compressed lookup index for key resolution |
+| `tests/conftest.py` | Test fixtures: `cleanup_mcp_after_test`, session event loop |
+| `evaluation/run_evaluation.py` | Benchmark runner against `test_queries.py` |
 
 ## Code Style
 
 - Use `logger` (not print) for debugging
-- Use `create_anthropic_client()` from settings.py for LLM clients
-- Use `create_cached_system_message()` for system prompts (DEC-021)
-- Prompts go in `prompts/` directory, imported into agents
+- Prompts go in `prompts/` directory as functions (support dynamic content like DEC-022 dates), imported into agents
 - Mark integration tests with `@pytest.mark.integration`
-- Use `cleanup_mcp_after_test` fixture for MCP tests
-- MCP sessions are cached globally (warmup at startup, reused across requests)
-
-## MCP Session Management
-
-MCP servers (ThingsBoard, AntV) use global session caching (DEC-005):
-- First request: ~15s (server startup + warmup)
-- Subsequent requests: ~5s (session reused)
-- Sessions stay open while app runs
-- For testing: use `cleanup_mcp_after_test` fixture to reset between tests
+- Async tests: `asyncio_mode = auto` in pytest.ini, no `@pytest.mark.asyncio` needed
+- Custom exception hierarchy in `mcp_servers/thingsboard_client.py`: `ThingsBoardError` → `AuthError`, `ConnectionError`, `RateLimitError`, `NotFoundError`
 
 ## Before Making Changes
 
