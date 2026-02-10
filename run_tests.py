@@ -43,6 +43,7 @@ def main():
             "tests/test_mcp_server",
             "tests/test_agents",
             "tests/test_token_budget.py",
+            "tests/test_duckdb_store.py",
             "-v",
         ]
     
