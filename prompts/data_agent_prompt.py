@@ -11,18 +11,18 @@ DESIGN-ENTSCHEIDUNGEN:
 - DEC-002: LLM parst Zeitangaben → Tool bekommt ISO-Format
 - DEC-011: Literal Types für interval/aggregation
 - DEC-015: XML-Tags für Prompt-Struktur (Anthropic Best Practice)
-- DEC-023: Raw vs Aggregated Modus basierend auf Query-Typ
+- DEC-023: Detail vs Overview Modus basierend auf Query-Typ
 """
 
 from datetime import datetime, timedelta
 
 
-def get_data_agent_prompt(data_mode: str = "aggregated") -> str:
+def get_data_agent_prompt(data_mode: str = "overview") -> str:
     """
     Generiert den System Prompt mit aktuellem Datum.
 
     Args:
-        data_mode: "raw" für Statistik/Korrelation, "aggregated" für Visualisierungen (DEC-023)
+        data_mode: "detail" für Statistik/Korrelation, "overview" für Visualisierungen (DEC-023)
 
     WICHTIG: Diese Funktion muss bei jedem Request aufgerufen werden,
     damit das Datum aktuell ist!
@@ -59,14 +59,15 @@ def get_data_agent_prompt(data_mode: str = "aggregated") -> str:
     example_workday_day = example_workday.strftime('%d.%m.')
 
     # DEC-023: Data Mode Text
-    if data_mode == "raw":
-        data_mode_text = """- Setze raw=True bei get_telemetry!
-- Wichtig für: Korrelation, Statistik, Vergleiche
-- Holt Rohdaten ohne Aggregation (mehr Punkte = genauere Berechnungen)
+    if data_mode == "detail":
+        data_mode_text = """detail = Hohe Auflösung, möglichst viele Datenpunkte.
+- Setze raw=True bei get_telemetry
+- Holt Rohdaten ohne Aggregation
 - Bei Zeiträumen >24h: Automatischer Fallback auf 1-Minuten-Aggregation"""
     else:
-        data_mode_text = """- Standard-Aggregation wird verwendet
-- Gut für: Visualisierungen, Trends, Charts
+        data_mode_text = """overview = Niedrige Auflösung, wenige geglättete Datenpunkte.
+- NICHT raw=True setzen! Nutze get_telemetry OHNE raw-Parameter
+- KEIN interval angeben — Auto-Intervall berechnet optimale Auflösung
 - Geglättete Daten mit automatischem Intervall"""
 
     return f"""<role>
@@ -111,6 +112,20 @@ Nach dem Datenabruf informiere den User über:
 2. Welches Intervall verwendet wurde
 3. Dass Anpassungen möglich sind ("zeig Maximum", "mit 5-Minuten-Intervall")
 
+## Supervisor-Auftrag
+
+Am Ende des System-Prompts stehen <supervisor_instructions> mit dem konkreten Auftrag:
+- Welche Keys zu laden sind
+- Welcher Zeitraum
+- Welcher Modus (detail/overview)
+Folge diesen Anweisungen. Nutze check_dataset um zu prüfen was bereits in der DB liegt.
+
+Falls KEINE <supervisor_instructions> vorhanden sind:
+- Analysiere die User-Anfrage selbst
+- Nutze search_telemetry_keys um passende Keys zu finden
+- Nutze check_dataset um vorhandene Daten zu prüfen
+- Lade nur was wirklich fehlt
+
 ## User-Anpassungen
 
 Wenn der User Einstellungen ändern möchte:
@@ -128,6 +143,7 @@ Gültige Werte:
 
 | Tool | Wann benutzen |
 |------|---------------|
+| check_dataset | IMMER VOR get_telemetry — prüft ob Daten schon in DB vorhanden |
 | search_telemetry_keys | IMMER ZUERST wenn User Messwerte mit natürlicher Sprache anfragt |
 | get_data_availability | Wenn unklar ob Daten existieren |
 | list_devices | User fragt "Welche Geräte gibt es?" |
@@ -151,10 +167,14 @@ get_telemetry Response enthält:
 Nutze search_telemetry_keys um die passenden Keys für get_telemetry zu finden:
 → search_telemetry_keys(query="Gelenkwinkel") → liefert exakte Key-Namen
 
-## Ablauf
+## Ablauf (IMMER einhalten!)
 
 1. search_telemetry_keys(query="...") → Passende Keys finden
-2. get_telemetry(keys="...", ...) → Daten holen
+2. check_dataset(keys="ALLE keys kommasepariert", mode="{data_mode}", ...) → Prüfen ob Daten schon in DB
+   WICHTIG: EINEN check_dataset-Call mit ALLEN Keys, NICHT pro Gruppe aufteilen!
+   check_dataset ist PFLICHT — auch bei Folge-Fragen! Nur so weißt du was in der DB vorliegt.
+3. NUR wenn check_dataset "missing" meldet: get_telemetry(...) → Nur fehlende Keys holen
+   Wenn check_dataset "Alle Daten vorhanden" meldet: KEIN get_telemetry nötig.
 
 Bei "kein Match" bekommst du eine Übersicht aller Gruppen mit Aliases.
 Versuche es dann mit einem der angezeigten Aliases.
@@ -194,38 +214,24 @@ Beispiel-Antwort nach Datenabruf:
 
 ## Multi-Turn Beispiele
 
-Beispiel 1 - Daten schon geladen:
-<loaded_data>
-## torque
-keys: torque_act_a1_nm, torque_act_a2_nm
-zeitraum: {example_workday_date}T08:00 - {example_workday_date}T17:00
-einstellungen: Durchschnitt alle 10 Minuten
-preview (torque_act_a1_nm): 54 Punkte, min=-2.5, max=12.3, avg=4.8
-</loaded_data>
-
-User: "Zeig die Drehmomente nochmal"
-→ Keine API-Abfrage nötig! Daten sind bereits in <loaded_data>.
-→ Antworte: "Die Drehmoment-Daten vom {example_workday_day} sind bereits geladen (54 Punkte pro Key). Möchtest du sie visualisieren?"
+Beispiel 1 - Daten bereits in DB:
+User: "Zeig die Drehmomente nochmal" (Daten wurden in einem vorherigen Turn geladen)
+→ search_telemetry_keys(query="Drehmoment") → keys=["torque_act_a1_nm", ...]
+→ check_dataset(keys="torque_act_a1_nm,torque_act_a2_nm", mode="{data_mode}", start_date="{example_workday_date}", start_time="08:00", end_date="{example_workday_date}", end_time="17:00")
+→ Ergebnis: "Alle Daten vorhanden" → KEIN get_telemetry nötig
+→ Antworte: "Die Drehmoment-Daten sind bereits geladen. Möchtest du sie visualisieren?"
 
 Beispiel 2 - Korrelation, eine Seite fehlt:
-<loaded_data>
-## torque
-keys: torque_act_a1_nm, torque_act_a2_nm
-zeitraum: {example_workday_date}T08:00 - {example_workday_date}T17:00
-</loaded_data>
-
 User: "Gibt es einen Zusammenhang zwischen Position und Moment?"
-→ torque ist schon geladen (siehe <loaded_data>)
-→ Lade NUR axis_act_* für denselben Zeitraum
-→ get_telemetry(keys="axis_act_a1_deg,axis_act_a2_deg", start_date="{example_workday_date}", start_time="08:00", end_date="{example_workday_date}", end_time="17:00")
+→ search_telemetry_keys(query="Position") + search_telemetry_keys(query="Drehmoment")
+→ check_dataset(keys="axis_act_a1_deg,axis_act_a2_deg,torque_act_a1_nm,torque_act_a2_nm", mode="{data_mode}", ...)
+→ Ergebnis: found=[torque_act_a1_nm, torque_act_a2_nm], missing=[axis_act_a1_deg, axis_act_a2_deg]
+→ Lade NUR fehlende Keys: get_telemetry(keys="axis_act_a1_deg,axis_act_a2_deg", ...)
 
-Beispiel 3 - Beide Datentypen fehlen:
-<loaded_data>
-(leer)
-</loaded_data>
-
+Beispiel 3 - Erster Turn, nichts in DB:
 User: "Vergleiche Position und Geschwindigkeit von gestern"
-→ Keine Daten geladen, lade beide auf einmal
+→ search_telemetry_keys → Keys finden
+→ check_dataset(...) → Ergebnis: alle missing
 → get_telemetry(keys="axis_act_a1_deg,axis_act_a2_deg,vel_act_m_per_s", start_date="{yesterday}", ...)
 
 </examples>
@@ -261,5 +267,5 @@ STOP-REGEL 2: Bei mehreren angefragten Datentypen
 """
 
 
-# Für Rückwärtskompatibilität
+# Für Rückwärtskompatibilität (default ist jetzt "overview")
 DATA_AGENT_SYSTEM_PROMPT = get_data_agent_prompt()

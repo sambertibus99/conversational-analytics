@@ -2,7 +2,7 @@
 
 > **Zweck:** Wiederverwendbare Patterns aus Projekt-Entscheidungen
 > **Für:** Claude erkennt ähnliche Probleme und schlägt bewährte Lösungen vor
-> **Stand:** 03. Februar 2026
+> **Stand:** 04. Februar 2026
 
 ---
 
@@ -34,6 +34,8 @@
 | DEC-022 | Dynamische Few-Shot Dates | Falsches Jahr in Beispielen | Datums-Beispiele dynamisch generieren | Prompts mit Datumsangaben |
 | DEC-023 | Query-Typ-basierte Daten | Zu wenig Punkte für Statistik | Raw für Stats, Aggregated für Viz | Korrelation, Statistik-Queries |
 | DEC-024 | Timeseries Korrelation | IoT-Sensoren mit unterschiedlichen Timestamps | pd.merge_asof für Alignment | Korrelation zwischen Sensoren |
+| DEC-025 | DuckDB Reference-only State | Rohdaten im AgentState sprengen Token-Limits | In-Memory DuckDB pro Session, nur DatasetMeta im State | Alle Datenzugriffe in Stats/Viz Agent |
+| DEC-028 | Data Agent als Daten-Gatekeeper | Supervisor hat zu viel Detail-Wissen über Datasets | Data Agent läuft immer, setzt active_dataset_keys | Alle Turns mit Viz/Stats Agent |
 
 ---
 
@@ -1991,6 +1993,211 @@ Ergebnis: 3 gematchte Paare für Korrelation
 
 ---
 
+## DEC-025: DuckDB Reference-only State
+
+### Problem
+Rohdaten (Tausende Datenpunkte als `[{value, timestamp}, ...]`) werden im `AgentState` gespeichert und bei jedem Agent-Hop kopiert. Das führt zu:
+- Token-Limit-Problemen bei großen Zeitreihen
+- Langsamer State-Serialisierung im Checkpointer
+- Keine effiziente Aggregation oder Joins auf den Rohdaten möglich
+
+### Kontext
+- Bisheriger Ansatz: `datasets = {"torque": {"data": {"torque_a1": [{...}, ...]}, "meta": {...}}}`
+- DEC-004 speichert bereits Rohdaten als Datei, aber Stats/Viz Agent lesen trotzdem aus State
+- Alternativen: Redis, SQLite, Pandas DataFrames im State
+- DuckDB bietet SQL-Analytik (AVG, ASOF JOIN, Window Functions) direkt in-memory
+
+### Entscheidung
+**In-Memory DuckDB pro Chat-Session als analytischer Datenspeicher. AgentState hält nur noch `DatasetMeta` (Metadaten + Referenz), keine Rohdaten mehr.**
+
+### Pattern
+
+**1. SessionStore (Singleton pro Session):**
+```python
+from config.duckdb_store import SessionStore
+
+# Erstellen (in app.py bei Chat-Start)
+store = SessionStore.get_instance(session_id)
+
+# Daten speichern (in data_agent.py)
+store.store_dataset(dataset_key, data_dict)
+# data_dict = {"torque_a1_nm": [{"value": "25.3", "timestamp": 1703001234567}, ...]}
+
+# Abfragen (in stats/viz tools)
+values = store.get_values(dataset_key, signal_key)
+ts, vals = store.get_timeseries(dataset_key, signal_key)
+result = store.query("SELECT AVG(value) FROM telemetry WHERE signal_key = ?", [key])
+
+# Aufräumen (Session-Ende)
+SessionStore.destroy(session_id)
+```
+
+**2. DatasetMeta statt Rohdaten im State:**
+```python
+class DatasetMeta(TypedDict, total=False):
+    dataset_key: str          # UNS-Key: "krc5/torque/timeseries/2h"
+    device_id: str
+    keys: list[str]           # ["torque_act_a1_nm", "torque_act_a2_nm"]
+    point_count: int
+    timerange: dict           # {"start": ..., "end": ...}
+    retrieval_mode: str       # "raw" | "aggregated"
+    unit: str
+    created_at: str           # ISO 8601
+
+# State enthält nur noch Meta:
+datasets = {"torque": DatasetMeta}  # statt {"torque": {"data": {...}, "meta": {...}}}
+```
+
+**3. DuckDB-first Helpers (utils.py):**
+```python
+from agents.utils import get_data_from_state, get_values_for_key
+
+# In allen Stats/Viz Tools:
+data = get_data_from_state(state)          # DuckDB → Legacy Fallback
+values = get_values_for_key(state, key)    # DuckDB → Legacy Fallback
+ts, vals = get_timeseries_for_key(state, key)
+keys = get_available_signal_keys(state)
+```
+
+**4. UNS-inspirierte Dataset-Keys:**
+```python
+from config.duckdb_store import generate_dataset_key
+
+key = generate_dataset_key("krc5", "torque", "timeseries", "2h")
+# → "krc5/torque/timeseries/2h"
+```
+
+### DuckDB Schema
+```sql
+CREATE TABLE telemetry (
+    dataset_key TEXT,
+    signal_key TEXT,
+    ts BIGINT,        -- Unix Timestamp in ms
+    value DOUBLE,
+    unit TEXT
+)
+```
+
+### Begründung
+- **Keine Token-Kosten:** Rohdaten nie im LLM-Kontext, nur DatasetMeta (~200 Tokens vs. ~50k)
+- **SQL-Analytik:** `AVG`, `PERCENTILE`, `ASOF JOIN` direkt auf DB statt Python-Loops
+- **Session-Isolation:** Jede Chat-Session hat eigene `:memory:` DB, kein Crosstalk
+- **Backward-kompatibel:** DuckDB-first Helpers fallen auf Legacy-Format zurück
+- **UNS-Keys:** Vorbereitung für Multi-Device-Fähigkeit (`device/signal_type/data_type/temporal`)
+
+### Implementierung
+
+| Datei | Änderung |
+|-------|----------|
+| `config/duckdb_store.py` | NEU — SessionStore, generate_dataset_key, determine_signal_type |
+| `agents/state.py` | DatasetMeta TypedDict, session_id in AgentState |
+| `agents/data_agent.py` | build_result() schreibt DuckDB, gibt DatasetMeta zurück |
+| `agents/stats_agent.py` | Alle 8 Tools nutzen DuckDB-first Helpers |
+| `agents/viz_agent.py` | Alle 10 Chart-Tools nutzen get_data_from_state() |
+| `agents/utils.py` | 4 neue DuckDB-first Helpers + Legacy-Fallback |
+| `agents/graph.py` | respond_node + run_query() mit session_id |
+| `app.py` | SessionStore Lifecycle (create bei Chat-Start) |
+| `tests/test_duckdb_store.py` | 35 Tests für Store, Schema, UNS-Keys, ASOF JOIN |
+
+### Anwenden bei
+
+- Alle neuen Tools die auf Telemetrie-Daten zugreifen → `get_data_from_state(state)` verwenden
+- Neue Agents die Daten laden → `SessionStore.store_dataset()` statt State-Dict
+- Komplexe Aggregationen → SQL-Query statt Python-Loop
+- Multi-Device-Erweiterungen → UNS-Key-Schema nutzen
+
+### Referenz
+- `config/duckdb_store.py` — SessionStore Implementation
+- `agents/utils.py` — DuckDB-first Helpers
+- `agents/state.py:DatasetMeta` — TypedDict Definition
+- `tests/test_duckdb_store.py` — 35 Unit Tests
+
+---
+
+## DEC-028: Data Agent als Daten-Gatekeeper
+
+### Problem
+Der Supervisor setzt `active_dataset_keys` — dafür sieht er über `build_dataset_context()` die vollen Dataset-Keys mit Metadaten (Signals, Punkte, Zeitraum, Modus). Das ist dieselbe Art "zu viel Wissen" die beim Data Agent zu Bias führte (DEC-027). Der Supervisor trifft Detail-Entscheidungen über Datenbestände, obwohl er nur planen sollte.
+
+### Kontext
+- Orchestrator-Worker Pattern (LangGraph Best Practice): Supervisor entscheidet WAS, Worker entscheidet WIE
+- Bisher: Supervisor wählt `active_dataset_keys` aus vollen Dataset-Metadaten → Bias-Gefahr
+- Bisher: `validate_plan()` fügt `data_agent` nur ein wenn KEINE Datasets vorhanden → bei Folge-Turns fehlt Filterung
+- `check_dataset` Tool im Data Agent kann DuckDB direkt abfragen
+
+### Entscheidung
+**Data Agent läuft IMMER wenn Downstream-Agents (viz/stats) Daten brauchen. Nur der Data Agent kennt die DuckDB-Datenbank und setzt `active_dataset_keys`.**
+
+### Pattern
+
+**1. Supervisor: Reset + kompakter Kontext**
+```python
+# Supervisor gibt IMMER active_dataset_keys=None zurück (Reset)
+return {
+    "plan": final_plan,
+    "active_dataset_keys": None,  # Data Agent setzt neu
+    ...
+}
+
+# build_dataset_context() zeigt nur Summary, keine Keys
+def build_dataset_context(datasets, data_summary):
+    return f"## VORHANDENE DATEN\n{data_summary}"
+```
+
+**2. validate_plan(): Data Agent immer einfügen**
+```python
+# Alt: if needs_data and not has_data_agent and not has_datasets
+# Neu: has_datasets Check entfernt
+if needs_data and not has_data_agent:
+    repaired = ["data_agent"] + repaired
+```
+
+**3. Data Agent: active_dataset_keys setzen**
+```python
+# Neue Daten geladen → Keys der neuen Datasets
+active_keys = [key for key in new_datasets]
+
+# Keine neuen Daten (check_dataset: vorhanden) → found-Keys als Fallback
+if not active_keys and check_dataset_keys:
+    active_keys = check_dataset_keys
+```
+
+**4. Lifecycle pro Turn:**
+```
+Supervisor  → active_dataset_keys = None        (Reset)
+Data Agent  → active_dataset_keys = [key1, ...]  (Neu gesetzt)
+Viz Agent   → liest [key1, ...]                   (Gefiltert via get_data_from_state)
+```
+
+### Begründung
+- **Separation of Concerns:** Supervisor plant, Data Agent entscheidet über Daten-Details
+- **Kein Bias:** Supervisor sieht keine vollen Dataset-Keys, kann nicht falsch wählen
+- **Robuster:** Data Agent prüft via `check_dataset` was wirklich in DuckDB liegt
+- **Einfacher Prompt:** Supervisor-Prompt wird kürzer (keine `<dataset_matching>` 4-Dimensionen-Prüfung)
+
+### Implementierung
+
+| Datei | Änderung |
+|-------|----------|
+| `agents/supervisor.py` | `build_dataset_context()` vereinfacht, `active_dataset_keys` aus Parse/Return entfernt, `validate_plan()` fügt data_agent IMMER ein |
+| `prompts/supervisor_prompt.py` | `active_dataset_keys` aus Examples/Output/Rules entfernt, `<dataset_matching>` vereinfacht |
+| `agents/data_agent.py` | Neue `_extract_check_dataset_found_keys()`, `build_result()` mit `check_dataset_keys` Fallback |
+| `agents/state.py` | Kommentar: "Data Agent setzt, Supervisor resettet" |
+| `prompts/data_agent_prompt.py` | Fallback-Logik für fehlende `<supervisor_instructions>` |
+
+### Anwenden bei
+- Alle Turns mit Viz/Stats Agent → Data Agent muss immer im Plan sein
+- Neue Agents die gefilterte Daten brauchen → `get_data_from_state(state)` nutzt `active_dataset_keys`
+- Supervisor-Prompt-Änderungen → keine Dataset-Key-Details in den Supervisor-Kontext geben
+
+### Referenz
+- `agents/supervisor.py:build_dataset_context()` — Kompakter Kontext
+- `agents/data_agent.py:_extract_check_dataset_found_keys()` — Fallback-Logik
+- `agents/data_agent.py:build_result()` — active_dataset_keys Lifecycle
+- `agents/state.py:active_dataset_keys` — Feld-Dokumentation
+
+---
+
 ## 💡 IDEEN (noch nicht umgesetzt)
 
 ### IDEE-001: Dynamic Telemetry Key Discovery
@@ -2043,3 +2250,5 @@ Wenn der User nach Daten fragt, die du nicht in TELEMETRIE-KEYS findest:
 | 2026-02-03 | DEC-023 (Query-Typ-basierte Datenstrategie) - IMPLEMENTIERT: Raw vs. Aggregated basierend auf Use Case |
 | 2026-02-03 | DEC-024 (Timeseries Korrelation) - IMPLEMENTIERT: pd.merge_asof für IoT-Sensoren mit unterschiedlichen Timestamps |
 | 2026-02-03 | Stats Agent Refactoring - Auf InjectedState Pattern umgebaut (wie Viz Agent), MCP Server entfernt |
+| 2026-02-04 | DEC-025 (DuckDB Reference-only State) - IMPLEMENTIERT: In-Memory DuckDB pro Session, DatasetMeta statt Rohdaten im State, UNS-Keys |
+| 2026-02-11 | DEC-028 (Data Agent als Daten-Gatekeeper) - IMPLEMENTIERT: Data Agent setzt active_dataset_keys, Supervisor bekommt nur Summary |

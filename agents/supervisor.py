@@ -9,7 +9,7 @@ Er führt selbst KEINE Aktionen aus – er plant nur!
 DESIGN-ENTSCHEIDUNGEN:
 - DEC-013: Multi-Turn Support (berücksichtigt vorhandene Datasets)
 - DEC-016: Strukturiertes Logging
-- DEC-023: Query-Typ-basierte Datenstrategie (raw vs aggregated)
+- DEC-023: Query-Typ-basierte Datenstrategie (detail vs overview)
 """
 
 import sys
@@ -64,7 +64,7 @@ def parse_supervisor_response(response: str) -> dict[str, Any]:
     Ist robust gegen Markdown-Codeblöcke.
     """
     if not response:
-        return {"plan": [], "reasoning": "Keine Antwort vom Supervisor", "data_mode": "aggregated"}
+        return {"plan": [], "reasoning": "Keine Antwort vom Supervisor", "data_mode": "overview"}
 
     cleaned = response.strip()
 
@@ -80,13 +80,13 @@ def parse_supervisor_response(response: str) -> dict[str, Any]:
         result = json.loads(cleaned)
 
         if not isinstance(result, dict):
-            return {"plan": [], "reasoning": f"Ungültiges Format: {type(result)}", "data_mode": "aggregated"}
+            return {"plan": [], "reasoning": f"Ungültiges Format: {type(result)}", "data_mode": "overview"}
 
         if "plan" not in result:
-            return {"plan": [], "reasoning": "Kein 'plan' Feld in Antwort", "data_mode": "aggregated"}
+            return {"plan": [], "reasoning": "Kein 'plan' Feld in Antwort", "data_mode": "overview"}
 
         if not isinstance(result["plan"], list):
-            return {"plan": [], "reasoning": f"'plan' ist keine Liste: {type(result['plan'])}", "data_mode": "aggregated"}
+            return {"plan": [], "reasoning": f"'plan' ist keine Liste: {type(result['plan'])}", "data_mode": "overview"}
 
         # Validiere Agent-Namen
         for agent in result["plan"]:
@@ -94,48 +94,54 @@ def parse_supervisor_response(response: str) -> dict[str, Any]:
                 logger.warning(f"Unbekannter Agent '{agent}' im Plan")
 
         # DEC-023: Data Mode validieren
-        data_mode = result.get("data_mode", "aggregated")
-        if data_mode not in ("raw", "aggregated"):
-            logger.warning(f"Ungültiger data_mode '{data_mode}', verwende 'aggregated'")
-            data_mode = "aggregated"
+        data_mode = result.get("data_mode", "overview")
+        if data_mode not in ("detail", "overview"):
+            logger.warning(f"Ungültiger data_mode '{data_mode}', verwende 'overview'")
+            data_mode = "overview"
 
         return {
             "plan": result["plan"],
             "reasoning": result.get("reasoning", "Keine Begründung"),
             "data_mode": data_mode,
+            "data_instructions": result.get("data_instructions"),
+            "needs_user_input": result.get("needs_user_input", False),
+            "user_input_reason": result.get("user_input_reason"),
         }
 
     except json.JSONDecodeError as e:
         logger.warning(f"JSON Parse Error: {e}")
         logger.debug(f"Response war: {cleaned[:200]}")
-        return {"plan": [], "reasoning": f"JSON Parse Error: {str(e)}", "data_mode": "aggregated"}
+        return {"plan": [], "reasoning": f"JSON Parse Error: {str(e)}", "data_mode": "overview"}
 
 
 def validate_plan(plan: list[str], has_datasets: bool) -> Tuple[bool, str, list[str]]:
     """
     Validiert den Plan auf logische Konsistenz.
-    
+
+    DEC-028: data_agent wird IMMER eingefügt wenn stats/viz geplant ist,
+    auch wenn Datasets vorhanden sind. Der Data Agent entscheidet selbst
+    über active_dataset_keys (check_dataset).
+
     Returns:
         Tuple von (is_valid, message, repaired_plan)
     """
     if not plan:
         return True, "Leerer Plan ist valide", plan
-    
+
     repaired = plan.copy()
-    
+
     # Prüfe auf ungültige Agents
     for agent in plan:
         if agent not in VALID_AGENTS:
             return False, f"Ungültiger Agent: {agent}", []
-    
-    # Prüfe ob data_agent fehlt wenn stats/viz vorhanden
+
+    # DEC-028: data_agent IMMER wenn stats/viz geplant
     needs_data = "stats_agent" in plan or "viz_agent" in plan
     has_data_agent = "data_agent" in plan
-    
-    if needs_data and not has_data_agent and not has_datasets:
-        # Reparieren: data_agent hinzufügen
+
+    if needs_data and not has_data_agent:
         repaired = ["data_agent"] + repaired
-        logger.debug(f"Plan repariert: data_agent hinzugefügt")
+        logger.debug("Plan repariert: data_agent hinzugefügt (DEC-028: wird immer gebraucht)")
         return True, "Plan repariert", repaired
     
     # Prüfe Reihenfolge
@@ -152,28 +158,25 @@ def validate_plan(plan: list[str], has_datasets: bool) -> Tuple[bool, str, list[
 
 
 def build_dataset_context(datasets: dict, data_summary: str) -> str:
-    """Baut Kontext-Info über vorhandene Datasets."""
+    """
+    Baut kompakten Kontext über vorhandene Daten (DEC-028).
+
+    Der Supervisor bekommt nur data_summary — keine vollen Dataset-Keys.
+    Der Data Agent entscheidet welche Datasets relevant sind.
+    """
     if not datasets:
         return ""
-    
-    dataset_keys = list(datasets.keys())
-    all_data_keys = []
-    for ds in datasets.values():
-        if isinstance(ds, dict) and "data" in ds:
-            all_data_keys.extend(ds["data"].keys())
-    
+
+    summary = data_summary if data_summary else "Daten vorhanden (Details beim Data Agent)."
+
     return f"""
 
-## BEREITS GELADENE DATEN
+## VORHANDENE DATEN
 
-Datasets: {', '.join(dataset_keys)}
-Verfügbare Keys: {', '.join(all_data_keys[:10])}{'...' if len(all_data_keys) > 10 else ''}
-Summary: {data_summary}
+{summary}
 
-WICHTIG: 
-- Wenn der User nach NEUEN Daten fragt (andere Keys/Zeitraum), MUSS data_agent im Plan sein!
-- Wenn der User nur Analyse/Visualisierung der VORHANDENEN Daten will, kann data_agent weggelassen werden.
-- Bei "Zusammenhang mit X" oder "Korrelation mit X" - prüfe ob X schon geladen ist!
+WICHTIG: Der data_agent entscheidet welche Datasets relevant sind.
+Wenn Daten benötigt werden (neue oder vorhandene), MUSS data_agent im Plan sein.
 """
 
 
@@ -240,6 +243,8 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
             return {
                 "plan": [],
                 "reasoning": "Keine User-Anfrage gefunden",
+                "needs_user_input": False,
+                "user_input_reason": None,
             }
         
         # 2. Dataset-Kontext
@@ -279,18 +284,44 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
                 "plan": [],
                 "reasoning": f"Plan ungültig: {validation_msg}",
                 "current_step": 0,
+                "needs_user_input": False,
+                "user_input_reason": None,
             }
         
         final_plan = repaired_plan if repaired_plan != result["plan"] else result["plan"]
-        data_mode = result.get("data_mode", "aggregated")
+        data_mode = result.get("data_mode", "overview")
+
+        data_instructions = result.get("data_instructions")
+        needs_input = result.get("needs_user_input", False)
+        input_reason = result.get("user_input_reason")
 
         logger.info(f"Plan erstellt: {final_plan}, data_mode: {data_mode}")
+        if data_instructions:
+            logger.info(f"Data Instructions: {data_instructions[:80]}...")
+        if needs_input:
+            logger.info(f"Rückfrage nötig: {input_reason}")
+
+        # Bei Rückfrage → leerer Plan, respond zeigt Frage
+        if needs_input and input_reason:
+            return {
+                "plan": [],
+                "reasoning": result["reasoning"],
+                "current_step": 0,
+                "needs_user_input": True,
+                "user_input_reason": input_reason,
+                "active_dataset_keys": None,  # DEC-028: Reset
+                "messages": [AIMessage(content=input_reason)],
+            }
 
         return {
             "plan": final_plan,
             "reasoning": result["reasoning"],
             "current_step": 0,  # Step zurücksetzen für neuen Plan
             "data_retrieval_mode": data_mode,  # DEC-023
+            "data_instructions": data_instructions,
+            "active_dataset_keys": None,  # DEC-028: Reset — Data Agent setzt neu
+            "needs_user_input": False,  # Explizit zurücksetzen (Checkpointer persistiert!)
+            "user_input_reason": None,
             "messages": [AIMessage(content=f"Plan erstellt: {final_plan}")],
         }
     
@@ -301,6 +332,8 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
             "plan": [],
             "reasoning": error_msg,
             "error": str(e),
+            "needs_user_input": False,
+            "user_input_reason": None,
         }
 
 

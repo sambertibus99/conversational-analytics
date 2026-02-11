@@ -61,23 +61,25 @@ User → Chainlit (app.py) → LangGraph (graph.py)
                      Respond Node → User
 ```
 
-**Agent Routing:** Supervisor creates plan like `["data_agent", "viz_agent"]` or `["data_agent", "stats_agent"]`. Agents execute sequentially, sharing data via `AgentState`. Supervisor also sets `data_retrieval_mode`: `"raw"` for stats/correlation queries, `"aggregated"` for visualization (DEC-023).
+**Agent Routing:** Supervisor creates plan like `["data_agent", "viz_agent"]` or `["data_agent", "stats_agent"]`. Agents execute sequentially, sharing data via `AgentState`. Supervisor sets `data_retrieval_mode`: `"raw"` for stats/correlation queries, `"aggregated"` for visualization (DEC-023). Data Agent always runs when viz/stats are planned (DEC-028).
 
 **Multi-Turn Persistence (DEC-013):** `app.py` generates a UUID `thread_id` per chat session and passes it as `config={"configurable": {"thread_id": ...}}` to `graph.ainvoke()`. The `InMemorySaver` checkpointer keeps `datasets` and `data_summary` across turns via custom reducers (`merge_datasets`, `merge_summaries`).
 
-**State Flow (DEC-013):**
+**State Flow (DEC-013, DEC-025):**
 1. Agents write to `AgentState` (state.py) with reducers:
-   - `datasets`: Dict keyed by type (e.g., `{"torque": {...}, "position": {...}}`) - **accumulates across turns**
+   - `datasets`: Dict of `DatasetMeta` references (e.g., `{"krc5/torque/timeseries": DatasetMeta}`) - **accumulates across turns**
    - `data_summary`: Short text for LLM context - **accumulates across turns**
    - `chart_url`, `statistics`: Per-turn outputs - **overwritten each turn**
-2. Large data saved to `outputs/data/`, only metadata in state (DEC-004)
-3. `respond_node` reads all state to generate final response
+   - `session_id`: DuckDB SessionStore ID (set by app.py, matches thread_id)
+2. Raw data stored in DuckDB `SessionStore` (in-memory, per session) — only `DatasetMeta` in State (DEC-025)
+3. Stats/Viz agents read data via `get_data_from_state()` helper (DuckDB-first with legacy fallback)
+4. `respond_node` reads `DatasetMeta` from state to generate final response
 
 **MCP Sessions:** ThingsBoard and AntV MCP servers use global session caching (DEC-005). Sessions stay open while the app runs. For testing, use the `cleanup_mcp_after_test` fixture to reset between tests.
 
 ## Key Patterns
 
-All 24 patterns documented in `docs/DECISIONS.md`. Critical ones for daily work:
+All 26 patterns documented in `docs/DECISIONS.md`. Critical ones for daily work:
 
 | Pattern | What | When |
 |---------|------|------|
@@ -92,8 +94,12 @@ All 24 patterns documented in `docs/DECISIONS.md`. Critical ones for daily work:
 | Dynamic Few-Shot Dates (DEC-022) | Generate example dates dynamically | Prompts with date examples |
 | Query-Type Data Mode (DEC-023) | `raw` for stats, `aggregated` for viz | Correlation/statistics queries |
 | Timeseries Correlation (DEC-024) | `pd.merge_asof` for timestamp alignment | IoT sensor correlation |
+| DuckDB Reference State (DEC-025) | Raw data in DuckDB, only `DatasetMeta` in State | All data storage/retrieval |
+| Data Agent Gatekeeper (DEC-028) | Data Agent always runs, sets `active_dataset_keys` | All turns with viz/stats agents |
 
 **Gotcha (DEC-021):** LangChain does NOT propagate `additional_kwargs={"cache_control": ...}` to the Anthropic API. Format `content` as `list[dict]` with `cache_control` in the content block instead. See `create_cached_system_message()` in `config/settings.py`.
+
+**Gotcha (DEC-025):** When accessing data in tools/agents, always use `get_data_from_state(state)` from `agents/utils.py` instead of `extract_data_from_datasets(state["datasets"])`. The helper tries DuckDB first, falls back to legacy format. The `state` dict must contain `session_id` for DuckDB lookups.
 
 ## Key Files
 
@@ -109,6 +115,7 @@ All 24 patterns documented in `docs/DECISIONS.md`. Critical ones for daily work:
 | `agents/utils.py` | Shared helpers: `extract_data_from_datasets`, dataset hints |
 | `tools/stats_functions.py` | Pure Python stats functions incl. `merge_asof` correlation |
 | `config/settings.py` | `APIKeyRotator`, `create_anthropic_client()`, `create_cached_system_message()` |
+| `config/duckdb_store.py` | `SessionStore` (DuckDB), `generate_dataset_key()`, UNS-Keys (DEC-025) |
 | `prompts/*.py` | System prompts with XML-tag structure (DEC-015) |
 | `mcp_servers/thingsboard_server.py` | MCP tools: data, lookup, attributes (DEC-020) |
 | `mcp_servers/thingsboard_client.py` | Async HTTP client with retry, custom exceptions (DEC-009) |
@@ -123,6 +130,48 @@ All 24 patterns documented in `docs/DECISIONS.md`. Critical ones for daily work:
 - Mark integration tests with `@pytest.mark.integration`
 - Async tests: `asyncio_mode = auto` in pytest.ini, no `@pytest.mark.asyncio` needed
 - Custom exception hierarchy in `mcp_servers/thingsboard_client.py`: `ThingsBoardError` → `AuthError`, `ConnectionError`, `RateLimitError`, `NotFoundError`
+
+## Claude Code Workflow
+
+### Subagents (`.claude/agents/`)
+
+| Agent | Modell | Wann aufrufen |
+|-------|--------|---------------|
+| `decisions` | sonnet | Architektonische Änderungen, neue Agents/Prompts, Datenfluss-Änderungen, neue Patterns |
+| `prompt-engineer` | sonnet | Prompts erstellen, ändern oder erweitern (kennt DEC-015, DEC-022) |
+| `pattern-reviewer` | haiku | Nach Code-Änderungen: prüft Code gegen alle 25 DEC-Patterns (read-only) |
+| `test-runner` | haiku | Nach Code-Änderungen: Tests ausführen und Ergebnisse zusammenfassen |
+| `e2e-tester` | sonnet | E2E-Tests: Startet Chainlit-App, testet via Playwright-Browser gegen test_queries.py |
+
+**Empfohlener Workflow nach Code-Änderungen:**
+1. `test-runner` — Tests ausführen
+2. `pattern-reviewer` — DEC-Compliance prüfen
+
+**Empfohlener Workflow bei neuen Features:**
+1. `decisions` — Relevante DECs und Architektur-Empfehlung holen
+2. Implementieren
+3. `prompt-engineer` — Falls Prompts betroffen
+4. `test-runner` + `pattern-reviewer` — Validierung
+
+### Slash Commands (`.claude/commands/`)
+
+| Command | Zweck |
+|---------|-------|
+| `/test-agent <name>` | Tests ausführen (`data`, `viz`, `stats`, `graph`, `all`, `integration`, `coverage`) |
+| `/new-decision` | Neue DEC in `docs/DECISIONS.md` dokumentieren |
+| `/update-status` | Session-Eintrag in `docs/04_AKTUELLER_STAND.md` hinzufügen |
+| `/e2e-test <arg>` | E2E-Tests via Playwright (`einfach`, `mittel`, `komplex`, `abstention`, `all`, `E1`...) |
+
+### MCP-Server
+
+| Server | Transport | Zweck |
+|--------|-----------|-------|
+| `context7` | HTTP | Aktuelle Bibliotheks-Dokumentation (LangGraph, Chainlit, MCP etc.) |
+| `playwright` | stdio | Browser-Automatisierung für E2E-Tests (Playwright MCP) |
+
+### Post-Edit Hook
+
+Edits an `prompts/*.py` werden automatisch auf DEC-015 XML-Tag-Struktur validiert (Pflicht: `<role>`, `<task>`).
 
 ## Before Making Changes
 

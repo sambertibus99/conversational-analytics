@@ -3,12 +3,12 @@ Zentraler State für das Multi-Agent System.
 
 Der State wird zwischen allen Agents geteilt und enthält:
 - messages: Chat-Verlauf (akkumuliert via add_messages)
-- datasets: Geladene Datensätze (akkumuliert via merge_datasets)
+- datasets: DatasetMeta-Referenzen (akkumuliert via merge_datasets)
 - plan: Ausführungsplan vom Supervisor
 - statistics: Berechnete Statistiken
 - chart_url: URL/Pfad zum generierten Chart
 
-WICHTIG (DEC-013): 
+WICHTIG (DEC-013):
 - Checkpointer persistiert State zwischen Turns
 - Reducer sorgen dafür, dass Daten akkumuliert statt überschrieben werden
 
@@ -17,11 +17,48 @@ DEC-017: Graph Best Practices
 - max_steps: Cycle Guard gegen Endlosschleifen
 
 DEC-023: Query-Typ-basierte Datenstrategie
-- data_retrieval_mode: "raw" für Stats, "aggregated" für Viz
+- data_retrieval_mode: "detail" für Stats, "overview" für Viz
+
+DEC-025: Reference-only State — Rohdaten in DuckDB, nur Metadaten im State
+- datasets enthält nur noch DatasetMeta (kein "data" Key mehr)
+- Rohdaten werden über SessionStore (DuckDB) abgefragt
 """
 
-from typing import Any, Annotated
+from typing import Any, Annotated, TypedDict
 from langgraph.graph import MessagesState
+
+
+class DatasetMeta(TypedDict, total=False):
+    """
+    Metadaten-Referenz für ein Dataset in DuckDB (DEC-025).
+
+    Ersetzt das bisherige {"data": {...}, "meta": {...}} Format.
+    Rohdaten liegen in SessionStore, der State hält nur Referenzen.
+
+    Beispiel:
+        {
+            "dataset_key": "krc5/torque/timeseries/2h",
+            "device_id": "krc5",
+            "keys": ["torque_act_a1_nm", "torque_act_a2_nm"],
+            "point_count": 627,
+            "timerange": {"start": "12:00", "end": "14:00"},
+            "retrieval_mode": "overview",
+            "unit": "Nm",
+            "created_at": "2025-12-16T12:00:00",
+            "data_file": "/tmp/telemetry_xxx.json",
+            "meta": {"type": "success", "statistics": {...}},
+        }
+    """
+    dataset_key: str          # UNS-Key: "krc5/torque/timeseries/2h"
+    device_id: str
+    keys: list[str]           # Signal-Keys: ["torque_act_a1_nm", ...]
+    point_count: int
+    timerange: dict           # {"start": ..., "end": ...}
+    retrieval_mode: str       # "detail" | "overview"
+    unit: str
+    created_at: str           # ISO 8601
+    data_file: str | None     # Backup-Pfad (optional, DEC-004)
+    meta: dict                # Originale Meta-Daten vom MCP Server
 
 
 def merge_datasets(existing: dict[str, Any] | None, new: dict[str, Any] | None) -> dict[str, Any]:
@@ -81,6 +118,10 @@ class AgentState(MessagesState):
     - Andere Felder werden überschrieben (plan, chart_url, etc.)
     """
     
+    # === DuckDB Session (DEC-025) ===
+    # Wird von app.py gesetzt, korrespondiert zur Chat-Session
+    session_id: str = "default"
+
     # === Planung (vom Supervisor) ===
     # Wird pro Turn neu erstellt
     plan: list[str] | None = None
@@ -88,12 +129,17 @@ class AgentState(MessagesState):
     reasoning: str | None = None
 
     # === Daten-Retrieval-Modus (DEC-023) ===
-    # "raw" für Stats/Korrelation (mehr Punkte), "aggregated" für Viz (Standard)
-    data_retrieval_mode: str = "aggregated"
+    # "detail" für Stats/Korrelation (mehr Punkte), "overview" für Viz (Standard)
+    data_retrieval_mode: str = "overview"
+
+    # === Data Instructions (vom Supervisor an Data Agent) ===
+    # Konkrete Anweisungen was der Data Agent laden soll
+    data_instructions: str | None = None
     
     # === Daten (vom Data Agent) ===
     # AKKUMULIERT über Turns via merge_datasets Reducer
-    # Format: {"torque": {"data": [...], "meta": {...}}, "velocity": {...}}
+    # DEC-025: Nur noch DatasetMeta (Referenzen), Rohdaten in DuckDB SessionStore
+    # Format: {"krc5/torque/timeseries/2h": DatasetMeta, ...}
     datasets: Annotated[dict[str, Any], merge_datasets] = {}
     
     # Kurze Zusammenfassung für LLM-Context - AKKUMULIERT
@@ -102,6 +148,13 @@ class AgentState(MessagesState):
     # Pfad zur aktuellen Datendatei (für Viz/Stats Agent)
     # Wird pro Turn überschrieben
     current_data_file: str | None = None
+
+    # === Aktive Dataset-Keys für den aktuellen Turn (DEC-026/028) ===
+    # Wird vom Data Agent gesetzt (basierend auf check_dataset + get_telemetry).
+    # Supervisor resettet auf None am Turn-Anfang, Data Agent setzt neu.
+    # Viz/Stats Agents lesen nur Daten für diese Keys.
+    # None = alle Daten (Fallback)
+    active_dataset_keys: list[str] | None = None
     
     # === Statistiken (vom Stats Agent) ===
     statistics: dict[str, Any] | None = None
