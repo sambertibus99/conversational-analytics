@@ -161,6 +161,8 @@ All 26 patterns documented in `docs/DECISIONS.md`. Critical ones for daily work:
 | `/new-decision` | Neue DEC in `docs/DECISIONS.md` dokumentieren |
 | `/update-status` | Session-Eintrag in `docs/04_AKTUELLER_STAND.md` hinzufügen |
 | `/e2e-test <arg>` | E2E-Tests via Playwright (`einfach`, `mittel`, `komplex`, `abstention`, `all`, `E1`...) |
+| `/session-save` | Session-Kontext sichern für Wiederaufnahme (vor Kompaktierung/Sessionwechsel) |
+| `/session-resume [thema]` | Gespeicherten Session-Kontext laden und Arbeit fortsetzen |
 
 ### MCP-Server
 

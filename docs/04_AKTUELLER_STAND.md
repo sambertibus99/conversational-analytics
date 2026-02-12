@@ -1,6 +1,6 @@
 # AKTUELLER STAND
 
-> **Letzte Aktualisierung:** 03. Februar 2026 (DEC-021 Prompt Caching)
+> **Letzte Aktualisierung:** 04. Februar 2026 (DEC-025 DuckDB + data_instructions + Re-Plan Konzept)
 
 ---
 
@@ -18,6 +18,35 @@ Das System ist funktionsfähig und getestet:
 ---
 
 ## ✅ Abgeschlossene Sessions
+
+### Session 8: DEC-025 DuckDB Reference-only State + Bugfixes + Re-Plan Konzept (04.02.2026)
+
+**Problem:** Rohdaten im AgentState sprengten Token-Limits. Korrelationsanalyse scheiterte weil nur letztes Dataset gespeichert wurde. Data Agent lud teilweise nur Metadaten statt echte Zeitreihen.
+
+**Lösung (DEC-025):** In-Memory DuckDB pro Chat-Session als analytischer Datenspeicher. State hält nur noch DatasetMeta-Referenzen. Mehrere Bugfixes für Multi-Dataset-Speicherung und SessionStore-Lifecycle.
+
+**Änderungen:**
+- `config/duckdb_store.py` — **NEU** — SessionStore Singleton mit DuckDB `:memory:`, Schema `telemetry(dataset_key, signal_key, ts, value, unit)`, Convenience-Methoden (get_values, get_timeseries, list_datasets, ASOF JOIN)
+- `agents/state.py` — `DatasetMeta` TypedDict, `data_instructions` Feld für Supervisor→Data Agent Kommunikation
+- `agents/data_agent.py` — `extract_tool_results()` gibt ALLE Datasets zurück (nicht nur letztes), `_store_dataset_in_duckdb()` Helper, `build_result()` speichert alle Datasets, 0-Punkt-Filter gegen Junk
+- `agents/supervisor.py` — Parst `data_instructions` aus LLM-Response, gibt sie im State weiter
+- `prompts/supervisor_prompt.py` — `data_instructions` Feld in Output-Format + Beispiele für Korrelation, Exploration
+- `config/duckdb_store.py` — `determine_signal_type()` nutzt `telemetry_lookup.json` statt hardcoded Mapping
+- `app.py` — SessionStore Lifecycle: `destroy_all()` bei `on_chat_start`, kein Destroy bei `on_chat_end` (Pipeline-Race-Condition)
+- `tests/test_duckdb_store.py` — **NEU** — 40 Tests (Lifecycle, Store, Query, UNS-Keys, ASOF JOIN)
+- `docs/DECISIONS.md` — DEC-025 dokumentiert
+
+**Bugfixes:**
+- Korrelation `n_matched=1` trotz 150k Punkten → nur letztes Dataset wurde in DuckDB gespeichert (jetzt alle)
+- `on_chat_end` zerstörte SessionStore während Pipeline noch lief → kein Destroy mehr bei Chat-Ende
+- Junk-Datasets (search_telemetry_keys Responses) mit 0 Punkten → gefiltert
+
+**Noch offen (nächste Session):**
+- **Re-Planning Loop (DEC-026):** Supervisor bewertet Data Agent Ergebnisse und plant dynamisch um. Plan erstellt, siehe `.claude/plans/nifty-mixing-quail.md`
+
+**Test-Ergebnis:** 176 passed, 49 failed (pre-existing, nicht durch DEC-025 verursacht)
+
+---
 
 ### Session 7: Prompt Caching DEC-021 (03.02.2026)
 
@@ -235,7 +264,7 @@ Session-Typ B: Implementierung
 
 ---
 
-## 🧠 Entscheidungs-Patterns (21 total)
+## 🧠 Entscheidungs-Patterns (25 total)
 
 | ID | Pattern | Anwenden bei | Status |
 |----|---------|--------------|--------|

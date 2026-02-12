@@ -35,6 +35,9 @@ logs/
 .DS_Store
 Thumbs.db
 
+# Claude Code Sessions (persönlich, nicht team-shared)
+.claude/sessions/
+
 # Project specific
 outputs/
 charts/
