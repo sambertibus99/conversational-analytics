@@ -86,7 +86,7 @@ class SessionStore:
         logger.info(f"SessionStore erstellt: {session_id}")
 
     def _init_schema(self) -> None:
-        """Erstellt das Telemetrie-Schema."""
+        """Erstellt das Telemetrie- und Statistik-Schema."""
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS telemetry (
                 dataset_key TEXT NOT NULL,
@@ -95,6 +95,16 @@ class SessionStore:
                 value       DOUBLE NOT NULL,
                 unit        TEXT DEFAULT '',
                 PRIMARY KEY (dataset_key, signal_key, ts)
+            )
+        """)
+        # DEC-030: Eigene Tabelle für Stats-Ergebnisse (keine Zeitreihen, JSON-Struktur)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS statistics (
+                dataset_key   TEXT PRIMARY KEY,
+                analysis_type TEXT NOT NULL,
+                result        TEXT NOT NULL,
+                metadata      TEXT,
+                created_at    BIGINT NOT NULL
             )
         """)
 
@@ -138,6 +148,7 @@ class SessionStore:
     def clear(self) -> None:
         """Löscht alle Daten, behält Schema und Instanz."""
         self._conn.execute("DELETE FROM telemetry")
+        self._conn.execute("DELETE FROM statistics")
         logger.info(f"SessionStore geleert: {self._session_id}")
 
     def clear_dataset(self, dataset_key: str) -> None:
@@ -378,6 +389,136 @@ class SessionStore:
             result[signal_key].append({"value": str(value), "timestamp": ts})
         return result
 
+    # =================================================================
+    # STATISTIK-DATEN SCHREIBEN/LESEN (DEC-030)
+    # =================================================================
+
+    def store_statistics(
+        self,
+        dataset_key: str,
+        analysis_type: str,
+        result: dict,
+        metadata: dict | None = None,
+    ) -> None:
+        """
+        Speichert ein Stats-Ergebnis in DuckDB (DEC-030).
+
+        Args:
+            dataset_key: UNS-Key, z.B. "krc5/stats/correlation/pos_act_z_mm-axis_act_a1_deg/..."
+            analysis_type: "correlation", "mean", "std", etc.
+            result: Das Berechnungsergebnis als Dict
+            metadata: Optionale Metadaten (Source-Keys, Zeitraum, etc.)
+        """
+        import json as _json
+        import time
+
+        self._conn.execute(
+            "INSERT OR REPLACE INTO statistics (dataset_key, analysis_type, result, metadata, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                dataset_key,
+                analysis_type,
+                _json.dumps(result, ensure_ascii=False),
+                _json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                int(time.time() * 1000),
+            ],
+        )
+        logger.debug(f"store_statistics: {dataset_key} ({analysis_type})")
+
+    def get_statistics(self, dataset_key: str) -> dict | None:
+        """
+        Liest ein Stats-Ergebnis aus DuckDB (DEC-030).
+
+        Returns:
+            Dict mit "analysis_type", "result", "metadata" oder None
+        """
+        import json as _json
+
+        rows = self._conn.execute(
+            "SELECT analysis_type, result, metadata FROM statistics WHERE dataset_key = ?",
+            [dataset_key],
+        ).fetchall()
+
+        if not rows:
+            return None
+
+        row = rows[0]
+        return {
+            "analysis_type": row[0],
+            "result": _json.loads(row[1]),
+            "metadata": _json.loads(row[2]) if row[2] else None,
+        }
+
+    def get_statistics_as_chart_data(self, dataset_key: str) -> dict[str, list[dict]]:
+        """
+        Konvertiert ein Stats-Ergebnis zu ThingsBoard-Format für den Viz Agent (DEC-030).
+
+        Korrelation: {"axis_act_a1_deg": [{"value": "-0.664", "timestamp": 0}], ...}
+        Mean/Std/etc.: {"torque_act_a1_nm": [{"value": "25.3", "timestamp": 0}]}
+
+        Returns:
+            Dict im ThingsBoard-Format oder leeres Dict
+        """
+        entry = self.get_statistics(dataset_key)
+        if not entry:
+            return {}
+
+        result = entry["result"]
+        analysis_type = entry["analysis_type"]
+
+        # Korrelation: result enthält key_x, key_y, r
+        if analysis_type == "correlation" and "r" in result:
+            key_y = result.get("key_y", "correlation")
+            return {key_y: [{"value": str(result["r"]), "timestamp": 0}]}
+
+        # Einzelwert-Stats (mean, std, min_max, trend, percentiles, anomaly, summary)
+        key = result.get("key", "value")
+
+        if "mean" in result:
+            return {key: [{"value": str(result["mean"]), "timestamp": 0}]}
+        if "std" in result:
+            return {key: [{"value": str(result["std"]), "timestamp": 0}]}
+        if "min" in result and "max" in result:
+            return {
+                f"{key}_min": [{"value": str(result["min"]), "timestamp": 0}],
+                f"{key}_max": [{"value": str(result["max"]), "timestamp": 0}],
+            }
+        if "slope" in result:
+            return {key: [{"value": str(result["slope"]), "timestamp": 0}]}
+
+        return {}
+
+    def get_multi_statistics_as_chart_data(self, dataset_keys: list[str]) -> dict[str, list[dict]]:
+        """
+        Konvertiert mehrere Stats-Ergebnisse zu einem kombinierten ThingsBoard-Format (DEC-030).
+
+        Typisch für Korrelation: Mehrere Paare → ein Chart mit allen Werten.
+
+        Returns:
+            Kombiniertes Dict im ThingsBoard-Format
+        """
+        merged: dict[str, list[dict]] = {}
+        for dk in dataset_keys:
+            data = self.get_statistics_as_chart_data(dk)
+            merged.update(data)
+        return merged
+
+    def list_statistics(self) -> list[dict]:
+        """
+        Gibt eine Übersicht aller gespeicherten Stats-Datasets zurück (DEC-030).
+
+        Returns:
+            Liste von Dicts: [{"dataset_key": ..., "analysis_type": ..., "created_at": ...}]
+        """
+        rows = self._conn.execute(
+            "SELECT dataset_key, analysis_type, created_at FROM statistics ORDER BY created_at DESC"
+        ).fetchall()
+
+        return [
+            {"dataset_key": row[0], "analysis_type": row[1], "created_at": row[2]}
+            for row in rows
+        ]
+
     def point_count(self, dataset_key: str | None = None) -> int:
         """Gibt die Anzahl der gespeicherten Datenpunkte zurück."""
         if dataset_key:
@@ -439,6 +580,36 @@ def generate_dataset_key(
         parts.append(interval_agg.lower())
     elif temporal:
         parts.append(temporal.lower())
+    return "/".join(parts)
+
+
+def generate_stats_dataset_key(
+    device_id: str,
+    analysis_type: str,
+    reference_key: str,
+    time_range: str = "",
+) -> str:
+    """
+    Generiert einen UNS-Key für Stats-Ergebnisse (DEC-030).
+
+    Format: "{device}/stats/{analysis_type}/{reference_key}[/{time_range}]"
+
+    Beispiele:
+        generate_stats_dataset_key("krc5", "correlation", "pos_act_z_mm-axis_act_a1_deg", "2026-02-11_15-55_17-55")
+        → "krc5/stats/correlation/pos_act_z_mm-axis_act_a1_deg/2026-02-11_15-55_17-55"
+
+        generate_stats_dataset_key("krc5", "mean", "torque_act_a1_nm", "2026-02-11_15-55_17-55")
+        → "krc5/stats/mean/torque_act_a1_nm/2026-02-11_15-55_17-55"
+
+    Args:
+        device_id: Geräte-ID (z.B. "krc5")
+        analysis_type: "correlation", "mean", "std", "min_max", "trend", "percentiles", "anomaly", "summary"
+        reference_key: Einzelvariable oder Paar: "pos_act_z_mm-axis_act_a1_deg"
+        time_range: Zeitraum-String (z.B. "2026-02-11_15-55_17-55")
+    """
+    parts = [device_id.lower(), "stats", analysis_type.lower(), reference_key.lower()]
+    if time_range:
+        parts.append(time_range.lower())
     return "/".join(parts)
 
 

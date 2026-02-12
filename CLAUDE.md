@@ -79,7 +79,7 @@ User → Chainlit (app.py) → LangGraph (graph.py)
 
 ## Key Patterns
 
-All 26 patterns documented in `docs/DECISIONS.md`. Critical ones for daily work:
+All 27 patterns documented in `docs/DECISIONS.md`. Critical ones for daily work:
 
 | Pattern | What | When |
 |---------|------|------|
@@ -96,6 +96,7 @@ All 26 patterns documented in `docs/DECISIONS.md`. Critical ones for daily work:
 | Timeseries Correlation (DEC-024) | `pd.merge_asof` for timestamp alignment | IoT sensor correlation |
 | DuckDB Reference State (DEC-025) | Raw data in DuckDB, only `DatasetMeta` in State | All data storage/retrieval |
 | Data Agent Gatekeeper (DEC-028) | Data Agent always runs, sets `active_dataset_keys` | All turns with viz/stats agents |
+| Stats DuckDB Persistence (DEC-030) | Stats in DuckDB `statistics` table, `active_stats_keys` for Viz | Stats-to-Viz multi-turn flow |
 
 **Gotcha (DEC-021):** LangChain does NOT propagate `additional_kwargs={"cache_control": ...}` to the Anthropic API. Format `content` as `list[dict]` with `cache_control` in the content block instead. See `create_cached_system_message()` in `config/settings.py`.
 

@@ -37,6 +37,7 @@
 | DEC-025 | DuckDB Reference-only State | Rohdaten im AgentState sprengen Token-Limits | In-Memory DuckDB pro Session, nur DatasetMeta im State | Alle Datenzugriffe in Stats/Viz Agent |
 | DEC-028 | Data Agent als Daten-Gatekeeper | Supervisor hat zu viel Detail-Wissen über Datasets | Data Agent läuft immer, setzt active_dataset_keys | Alle Turns mit Viz/Stats Agent |
 | DEC-029 | Supervisor als Kontext-Instanz | Follow-up-Queries scheitern weil Konversationskontext fehlt | Strukturierte turn_history + Telemetrie-Referenz im Prompt | Multi-Turn Konversationen |
+| DEC-030 | Stats als persistente DuckDB-Datasets | Stats-Ergebnisse gehen nach Turn verloren | Eigene statistics-Tabelle + active_stats_keys | Stats→Viz Multi-Turn Flow |
 
 ---
 
@@ -2296,6 +2297,117 @@ def build_turn_context(turn_history, datasets) -> str:
 
 ---
 
+## DEC-030: Stats-Ergebnisse als persistente DuckDB-Datasets
+
+### Problem
+Stats Agent berechnet Ergebnisse (Korrelation, Mean, etc.), speichert sie aber nur in `state["statistics"]` — das wird vom Supervisor pro Turn auf `None` resettet. Im Folge-Turn ("zeig als Balkendiagramm") kann der Viz Agent die Ergebnisse nicht finden.
+
+**Beispiel:** User fragt "Korrelation z-Position und alle Achsen?", bekommt Ergebnisse. Dann "zeig als Balkendiagramm" — Viz Agent findet keine Daten weil `statistics` resettet wurde.
+
+### Kontext
+- `statistics` ist per-Turn (wird vom Supervisor auf None gesetzt)
+- `datasets` akkumuliert über Turns via merge_datasets Reducer
+- Stats sind keine Zeitreihen — anderes Schema als Telemetrie
+- Viz Agent nutzt `get_data_from_state()` für Datenzugriff
+
+### Entscheidung
+**Eigene `statistics`-Tabelle in DuckDB, UNS-Keys mit `stats/`-Präfix, neues State-Feld `active_stats_keys`. Stats Agent persistiert Ergebnisse, Supervisor kann `active_stats_keys` im Folge-Turn setzen, Viz Agent liest via `get_data_from_state()`.**
+
+### Pattern
+
+**1. DuckDB statistics-Tabelle**
+```sql
+CREATE TABLE IF NOT EXISTS statistics (
+    dataset_key   TEXT PRIMARY KEY,
+    analysis_type TEXT NOT NULL,
+    result        TEXT NOT NULL,
+    metadata      TEXT,
+    created_at    BIGINT NOT NULL
+)
+```
+
+**2. UNS-Key-Schema für Stats**
+```
+krc5/stats/{analysis_type}/{reference_key}/{time_range}
+```
+| Tool | Beispiel |
+|------|---------|
+| correlation | `krc5/stats/correlation/pos_act_z_mm-axis_act_a1_deg/2026-02-11_15-55_17-55` |
+| mean | `krc5/stats/mean/torque_act_a1_nm/2026-02-11_15-55_17-55` |
+| std, min_max, trend, percentiles, anomaly, summary | Analog mit jeweiligem Typ |
+
+**3. active_stats_keys (getrennt von active_dataset_keys)**
+```python
+# In AgentState — kein Reducer, wird pro Turn gesetzt/resettet
+active_stats_keys: list[str] | None = None
+```
+
+**4. Stats Agent persistiert**
+```python
+# run_stats_agent() Return:
+return {
+    "statistics": statistics,              # Für respond_node
+    "statistics_summary": stats_summary,
+    "datasets": {dk: DatasetMeta(...)},    # Persistiert via Reducer
+    "active_stats_keys": [dk, ...],        # Für Viz Agent
+}
+```
+
+**5. get_data_from_state() Prioritäten**
+```python
+# 1. active_stats_keys → DuckDB statistics-Tabelle
+# 2. active_dataset_keys → DuckDB telemetry-Tabelle
+# 3. Fallback → alle Telemetrie-Daten
+```
+
+**6. Supervisor DEC-030 Ausnahme**
+```python
+# validate_plan(): Wenn active_stats_keys gesetzt und nur viz_agent geplant
+# → data_agent wird NICHT erzwungen (DEC-028 Ausnahme)
+```
+
+### Datenfluss
+```
+Turn N: "Korrelation z-Position und Achsen?"
+  stats_agent → DuckDB statistics-Tabelle + DatasetMeta in datasets + active_stats_keys
+  respond_node → turn_history mit stats_dataset_keys
+
+Turn N+1: "Zeig als Balkendiagramm"
+  Supervisor sieht stats_dataset_keys → plan: ["viz_agent"], active_stats_keys: [...]
+  viz_agent → get_data_from_state() erkennt active_stats_keys → lädt aus statistics-Tabelle
+```
+
+### Begründung
+- **Getrennte Tabelle:** Stats sind keine Zeitreihen, haben JSON-Struktur
+- **Getrennte Keys:** `active_stats_keys` vs `active_dataset_keys` — klare Semantik
+- **DEC-028 Ausnahme:** data_agent nicht nötig wenn Stats bereits in DuckDB liegen
+- **Bestehende Reducer:** `merge_datasets` akkumuliert DatasetMeta automatisch über Turns
+
+### Implementierung
+
+| Datei | Änderung |
+|-------|----------|
+| `config/duckdb_store.py` | `statistics` Tabelle, `store_statistics()`, `get_statistics()`, `get_statistics_as_chart_data()`, `get_multi_statistics_as_chart_data()`, `list_statistics()`, `generate_stats_dataset_key()` |
+| `agents/state.py` | `active_stats_keys: list[str] \| None = None` |
+| `agents/stats_agent.py` | `_store_stats_in_duckdb()`, `_stats_to_chart_data()`, `_determine_analysis_type()`, `_extract_time_range_from_state()`, Return erweitert um `datasets` + `active_stats_keys` |
+| `agents/utils.py` | `get_data_from_state()` Priorität 1: active_stats_keys → statistics-Tabelle |
+| `agents/graph.py` | `_build_turn_entry()` schreibt `stats_dataset_keys` in turn_history |
+| `agents/supervisor.py` | `parse_supervisor_response()` extrahiert `active_stats_keys`, `validate_plan()` DEC-030 Ausnahme, `run_supervisor()` durchreichen |
+| `prompts/supervisor_prompt.py` | Regel 6 (DEC-030 Ausnahme), `active_stats_keys` in output_format, Stats-Viz Multi-Turn Beispiel |
+
+### Anwenden bei
+- Multi-Turn Stats→Viz: "Berechne Korrelation" → "Zeig als Balkendiagramm"
+- Stats-Ergebnisse zwischen Turns referenzieren
+- Neue Analyse-Tools die Ergebnisse persistieren müssen
+
+### Referenz
+- `config/duckdb_store.py:store_statistics()` — Speichert Stats in DuckDB
+- `config/duckdb_store.py:generate_stats_dataset_key()` — UNS-Key-Generator für Stats
+- `agents/stats_agent.py:_store_stats_in_duckdb()` — Orchestriert Persistierung
+- `agents/utils.py:get_data_from_state()` — Liest Stats mit Priorität
+
+---
+
 ## 💡 IDEEN (noch nicht umgesetzt)
 
 ### IDEE-001: Dynamic Telemetry Key Discovery
@@ -2351,3 +2463,4 @@ Wenn der User nach Daten fragt, die du nicht in TELEMETRIE-KEYS findest:
 | 2026-02-04 | DEC-025 (DuckDB Reference-only State) - IMPLEMENTIERT: In-Memory DuckDB pro Session, DatasetMeta statt Rohdaten im State, UNS-Keys |
 | 2026-02-11 | DEC-028 (Data Agent als Daten-Gatekeeper) - IMPLEMENTIERT: Data Agent setzt active_dataset_keys, Supervisor bekommt nur Summary |
 | 2026-02-11 | DEC-029 (Supervisor als Kontext-Instanz) - IMPLEMENTIERT: turn_history, Telemetrie-Referenz, Opus-Modell, build_turn_context() |
+| 2026-02-12 | DEC-030 (Stats als persistente DuckDB-Datasets) - IMPLEMENTIERT: statistics-Tabelle, active_stats_keys, Stats→Viz Multi-Turn Flow |

@@ -22,6 +22,10 @@ DEC-023: Query-Typ-basierte Datenstrategie
 DEC-025: Reference-only State — Rohdaten in DuckDB, nur Metadaten im State
 - datasets enthält nur noch DatasetMeta (kein "data" Key mehr)
 - Rohdaten werden über SessionStore (DuckDB) abgefragt
+
+DEC-030: Stats-Ergebnisse als persistente DuckDB-Datasets
+- active_stats_keys: Analog zu active_dataset_keys, aber für Stats-Ergebnisse
+- Stats Agent speichert Ergebnisse in DuckDB statistics-Tabelle
 """
 
 from typing import Any, Annotated, TypedDict
@@ -154,6 +158,12 @@ class AgentState(MessagesState):
     # None = alle Daten (Fallback)
     active_dataset_keys: list[str] | None = None
     
+    # === Aktive Stats-Dataset-Keys für den aktuellen Turn (DEC-030) ===
+    # Getrennt von active_dataset_keys (nur Telemetrie).
+    # Stats Agent setzt nach Berechnung, Supervisor kann im Folge-Turn setzen.
+    # None = keine Stats-Daten aktiv
+    active_stats_keys: list[str] | None = None
+
     # === Statistiken (vom Stats Agent) ===
     statistics: dict[str, Any] | None = None
     statistics_summary: str | None = None

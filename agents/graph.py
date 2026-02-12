@@ -180,6 +180,12 @@ def _build_turn_entry(state: AgentState) -> dict:
     entry["result_type"] = result_type
     if result_summary:
         entry["result_summary"] = result_summary
+
+    # DEC-030: Stats-Dataset-Keys in turn_history aufnehmen
+    active_stats = state.get("active_stats_keys")
+    if active_stats:
+        entry["stats_dataset_keys"] = active_stats
+
     return entry
 
 
