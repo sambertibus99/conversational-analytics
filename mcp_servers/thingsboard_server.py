@@ -89,6 +89,12 @@ AGGREGATION_OPTIONS = {
 # Intervall-Mapping: Vordefinierte Optionen statt Regex-Parsing
 # Format: "key" -> (milliseconds, human_readable)
 INTERVAL_OPTIONS = {
+    "1s": (1000, "1 Sekunde"),
+    "2s": (2000, "2 Sekunden"),
+    "3s": (3000, "3 Sekunden"),
+    "5s": (5000, "5 Sekunden"),
+    "10s": (10000, "10 Sekunden"),
+    "30s": (30000, "30 Sekunden"),
     "1m": (60000, "1 Minute"),
     "5m": (300000, "5 Minuten"),
     "10m": (600000, "10 Minuten"),
@@ -98,9 +104,13 @@ INTERVAL_OPTIONS = {
     "1d": (86400000, "1 Tag"),
 }
 
-# Datenpunkt-Limits
+# Datenpunkt-Limits (aggregierter Modus)
 DATAPOINT_WARNING_THRESHOLD = 1000   # Ab hier: Warnung
 DATAPOINT_ERROR_THRESHOLD = 10000    # Ab hier: Fehler, User muss anpassen
+
+# Datenpunkt-Limits (Raw-Modus)
+RAW_DATAPOINT_THRESHOLD = 5000       # Ab hier: User fragen ob Downsampling
+RAW_DEFAULT_SAMPLING_HZ = 10         # KRC5 Standard-Sampling (~100ms)
 
 
 # =============================================================================
@@ -393,6 +403,109 @@ def check_datapoint_limit(
         }
     
     return None  # Alles OK
+
+
+def snap_to_interval(target_ms: int) -> tuple[str, int, str]:
+    """
+    Snapped einen Ziel-Intervall zur nächstgrößeren INTERVAL_OPTION.
+
+    Args:
+        target_ms: Gewünschtes Intervall in Millisekunden
+
+    Returns:
+        (interval_key, interval_ms, human_readable)
+    """
+    sorted_options = sorted(INTERVAL_OPTIONS.items(), key=lambda x: x[1][0])
+    for key, (ms, human) in sorted_options:
+        if ms >= target_ms:
+            return key, ms, human
+    # Fallback: größtes verfügbares Intervall
+    key, (ms, human) = sorted_options[-1]
+    return key, ms, human
+
+
+def check_raw_datapoint_limit(
+    start_dt: datetime,
+    end_dt: datetime,
+    num_keys: int,
+    sampling_hz: int = RAW_DEFAULT_SAMPLING_HZ,
+) -> dict | None:
+    """
+    Schätzt die erwartete Anzahl an Roh-Datenpunkten und gibt ggf. Fehlermeldung zurück.
+
+    Args:
+        start_dt: Startzeitpunkt
+        end_dt: Endzeitpunkt
+        num_keys: Anzahl der abgefragten Keys
+        sampling_hz: Abtastrate in Hz (default: RAW_DEFAULT_SAMPLING_HZ)
+
+    Returns:
+        None wenn unter RAW_DATAPOINT_THRESHOLD, sonst Error-Dict mit Intervall-Optionen
+    """
+    duration_s = (end_dt - start_dt).total_seconds()
+    estimated_per_key = int(duration_s * sampling_hz)
+    estimated_total = estimated_per_key * num_keys
+
+    logger.debug(
+        f"Raw-Estimation: {duration_s:.0f}s × {sampling_hz}Hz × {num_keys} Keys "
+        f"= {estimated_total} Punkte (Threshold: {RAW_DATAPOINT_THRESHOLD})"
+    )
+
+    if estimated_total <= RAW_DATAPOINT_THRESHOLD:
+        return None
+
+    # Optimales Intervall berechnen: ~1500 Punkte pro Key
+    target_points_per_key = 1500
+    target_interval_ms = int((duration_s / target_points_per_key) * 1000)
+    optimal_key, optimal_ms, optimal_human = snap_to_interval(target_interval_ms)
+    optimal_points = int(duration_s * 1000 / optimal_ms) * num_keys
+
+    # Optionsliste: 2-3 Intervalle mit Punktzahlen
+    options = []
+    seen = set()
+    for candidate_ms in [optimal_ms, optimal_ms * 2, optimal_ms * 5]:
+        cand_key, cand_ms, cand_human = snap_to_interval(candidate_ms)
+        if cand_key not in seen:
+            seen.add(cand_key)
+            cand_points = int(duration_s * 1000 / cand_ms) * num_keys
+            options.append({
+                "interval": cand_key,
+                "interval_human": cand_human,
+                "estimated_points": cand_points,
+            })
+
+    duration_human = (
+        f"{duration_s / 3600:.1f} Stunden" if duration_s >= 3600
+        else f"{duration_s / 60:.0f} Minuten"
+    )
+
+    return {
+        "status": "error_too_many_datapoints",
+        "message": (
+            f"Rohdaten für {duration_human} mit {num_keys} Key(s) würden ca. "
+            f"{estimated_total:,} Datenpunkte erzeugen (bei ~{sampling_hz} Hz Sampling). "
+            f"Das ist zu viel für eine sinnvolle Verarbeitung."
+        ),
+        "estimated_total_points": estimated_total,
+        "estimated_per_key": estimated_per_key,
+        "threshold": RAW_DATAPOINT_THRESHOLD,
+        "suggestion": {
+            "interval": optimal_key,
+            "interval_human": optimal_human,
+            "expected_points": optimal_points,
+        },
+        "options": options,
+        "user_action": (
+            f"Bitte frage den User: Soll ich statt Rohdaten "
+            f"{optimal_human}-Durchschnitte verwenden? "
+            f"(ca. {optimal_points:,} Punkte statt {estimated_total:,})"
+        ),
+        "hint": (
+            f"Der Zeitraum ({duration_human}) ist zu lang für Rohdaten mit voller Auflösung. "
+            f"Frage den User ob Server-seitig aggregierte Daten (z.B. {optimal_human}-Durchschnitte) "
+            f"ausreichen, oder ob ein kürzerer Zeitraum gewählt werden soll."
+        ),
+    }
 
 
 def format_thingsboard_error(error: ThingsBoardError) -> dict:
@@ -772,7 +885,7 @@ async def get_telemetry(
     end_date: str,
     start_time: str = "00:00",
     end_time: str = "23:59",
-    interval: Literal["1m", "5m", "10m", "30m", "1h", "6h", "1d"] | None = None,
+    interval: Literal["1s", "2s", "3s", "5s", "10s", "30s", "1m", "5m", "10m", "30m", "1h", "6h", "1d"] | None = None,
     aggregation: Literal["AVG", "MIN", "MAX", "SUM", "COUNT"] | None = None,
     device_name: str = "KRC5",
     raw: bool = False,
@@ -811,7 +924,7 @@ async def get_telemetry(
         end_date: Enddatum YYYY-MM-DD (z.B. "2025-12-16") - PFLICHT
         start_time: Startzeit HH:MM (default: "00:00")
         end_time: Endzeit HH:MM (default: "23:59")
-        interval: OPTIONAL - "1m", "5m", "10m", "30m", "1h", "6h", "1d" (sonst auto)
+        interval: OPTIONAL - "1s", "5s", "10s", "30s", "1m", "5m", "10m", "30m", "1h", "6h", "1d" (sonst auto)
         aggregation: OPTIONAL - "AVG", "MIN", "MAX", "SUM", "COUNT" (default: AVG)
         device_name: Gerätename (default: "KRC5")
         raw: OPTIONAL - True für Rohdaten ohne Aggregation (für Statistik/Korrelation)
@@ -881,7 +994,7 @@ async def get_telemetry(
 
         # DEC-023: Raw vs Aggregated Modus
         client = await get_client()
-        data_mode_used = "aggregated"
+        data_mode_used = "overview"
         sampling_info = None
 
         if raw:
@@ -889,16 +1002,17 @@ async def get_telemetry(
             duration_hours = (end_dt - start_dt).total_seconds() / 3600
 
             if duration_hours <= 24:
-                # ≤24h: Echte Rohdaten mit Limit
+                # Rohdaten holen ohne hardcoded Limit
+                # Hinweis: Datenpunkt-Estimation erfolgt jetzt im post_model_hook
+                # des Data Agents (raw_estimation_hook) VOR dem Tool-Call
                 logger.info(f"Raw-Modus: Hole Rohdaten für {duration_hours:.1f}h Zeitraum")
                 data = await client.get_telemetry(
-                    device_id, key_list, start_ts, end_ts, limit=10000
+                    device_id, key_list, start_ts, end_ts, limit=50000
                 )
-                data_mode_used = "raw"
+                data_mode_used = "detail"
                 sampling_info = {
-                    "mode": "raw",
-                    "limit": 10000,
-                    "time_resolution": "Original-Sampling (~1s)",
+                    "mode": "detail",
+                    "time_resolution": "Original-Sampling (~100ms)",
                 }
             else:
                 # >24h: Fallback auf feinste Aggregation (1 Minute)
@@ -906,9 +1020,9 @@ async def get_telemetry(
                 data = await client.get_telemetry_aggregated(
                     device_id, key_list, start_ts, end_ts, 60000, tb_aggregation  # 1 Minute
                 )
-                data_mode_used = "raw_fallback"
+                data_mode_used = "detail_fallback"
                 sampling_info = {
-                    "mode": "raw_fallback",
+                    "mode": "detail_fallback",
                     "reason": f"Zeitraum {duration_hours:.0f}h zu lang für echte Rohdaten",
                     "time_resolution": "1 Minute Aggregation",
                 }

@@ -31,7 +31,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
 
-from agents.state import AgentState
+from agents.state import AgentState, TurnEntry, TurnDataset
 from agents.supervisor import supervisor_node
 from agents.data_agent import data_agent_node
 from agents.stats_agent import stats_agent_node
@@ -64,6 +64,126 @@ DEFAULT_MAX_STEPS = 10
 
 
 # =============================================================================
+# TURN HISTORY HELPERS (DEC-029 AP2)
+# =============================================================================
+
+def _format_timerange(timerange: dict) -> str:
+    """Formatiert timerange dict zu lesbarem String."""
+    if not timerange:
+        return ""
+    start = timerange.get("start_human") or timerange.get("start", "")
+    end = timerange.get("end_human") or timerange.get("end", "")
+    if start and end:
+        return f"{start} - {end}"
+    return str(start or end or "")
+
+
+def _group_datasets_by_timerange(state: AgentState) -> list[dict]:
+    """Gruppiert aktive Datasets nach Zeitraum für TurnEntry."""
+    all_datasets = state.get("datasets", {})
+    active_keys = state.get("active_dataset_keys")
+
+    # Nur aktive Datasets (dieser Turn)
+    if active_keys:
+        filtered = {k: v for k, v in all_datasets.items() if k in active_keys}
+    else:
+        filtered = all_datasets
+
+    # Gruppiere nach timerange-String
+    groups: dict[str, list[str]] = {}  # timerange -> signal_keys
+    for ds_key, ds_meta in filtered.items():
+        if not isinstance(ds_meta, dict):
+            continue
+        timerange = ds_meta.get("timerange", {})
+        tr_str = _format_timerange(timerange)
+        signal_keys = ds_meta.get("keys", [])
+        groups.setdefault(tr_str, []).extend(signal_keys)
+
+    # Dedupliziere keys pro Gruppe
+    return [
+        {"keys": sorted(set(keys)), "timerange": tr}
+        for tr, keys in groups.items()
+        if keys
+    ]
+
+
+def _determine_result_type(state: AgentState) -> str:
+    """Bestimmt den Ergebnis-Typ des aktuellen Turns."""
+    if state.get("chart_url"):
+        return "chart"
+    if state.get("statistics_summary"):
+        return "statistics"
+    if state.get("needs_user_input"):
+        return "clarification"
+    if state.get("error"):
+        return "error"
+    plan = state.get("plan")
+    if plan == []:
+        return "abstention"
+    return "data"
+
+
+def _determine_result_summary(state: AgentState, result_type: str) -> str:
+    """Erstellt eine kurze Zusammenfassung des Ergebnisses."""
+    if result_type == "statistics":
+        return (state.get("statistics_summary") or "")[:300]
+    if result_type == "chart":
+        return state.get("chart_type") or "Chart erstellt"
+    if result_type == "error":
+        return (state.get("error") or "")[:200]
+    if result_type == "abstention":
+        return (state.get("reasoning") or "")[:200]
+    if result_type == "clarification":
+        return (state.get("user_input_reason") or "")[:200]
+    # data: Zusammenfassung aus aktiven DatasetMeta
+    active_keys = state.get("active_dataset_keys") or []
+    datasets = state.get("datasets", {})
+    parts = []
+    for k in active_keys[:3]:
+        ds = datasets.get(k)
+        if isinstance(ds, dict):
+            keys = ds.get("keys", [])
+            pts = ds.get("point_count", "?")
+            parts.append(f"{', '.join(keys[:2])}: {pts} Punkte")
+    return "; ".join(parts)[:200] if parts else ""
+
+
+def _build_turn_entry(state: AgentState) -> dict:
+    """Baut einen TurnEntry aus dem aktuellen State (DEC-029 AP2)."""
+    messages = state.get("messages", [])
+
+    # user_query: Letzte HumanMessage, truncated auf 200 Zeichen
+    user_query = ""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            user_query = msg.content[:200]
+            break
+
+    # plan
+    plan = state.get("plan") or []
+
+    # data_mode
+    data_mode = state.get("data_retrieval_mode", "overview")
+
+    # datasets: Gruppiert nach Zeitraum aus DatasetMeta
+    datasets_grouped = _group_datasets_by_timerange(state)
+
+    # result_type
+    result_type = _determine_result_type(state)
+
+    # result_summary
+    result_summary = _determine_result_summary(state, result_type)
+
+    entry: dict = {"user_query": user_query, "plan": plan, "data_mode": data_mode}
+    if datasets_grouped:
+        entry["datasets"] = datasets_grouped
+    entry["result_type"] = result_type
+    if result_summary:
+        entry["result_summary"] = result_summary
+    return entry
+
+
+# =============================================================================
 # RESPOND NODE
 # =============================================================================
 
@@ -82,6 +202,7 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
         logger.warning("Keine Messages im State!")
         return {
             "messages": [AIMessage(content="Es ist ein Fehler aufgetreten: Keine Anfrage gefunden.")],
+            "turn_history": [_build_turn_entry(state)],
         }
     
     # SPEZIALFALL: User-Input wird benötigt
@@ -91,10 +212,11 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
         for msg in reversed(messages):
             if isinstance(msg, AIMessage) and isinstance(msg.content, str):
                 logger.debug("Gebe vorherige AI-Message direkt weiter")
-                return {"messages": [msg]}
-        
+                return {"messages": [msg], "turn_history": [_build_turn_entry(state)]}
+
         return {
             "messages": [AIMessage(content="Es ist ein Problem aufgetreten. Bitte versuche es nochmal.")],
+            "turn_history": [_build_turn_entry(state)],
         }
     
     # Sammle Kontext für normale Response
@@ -117,41 +239,66 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
     if plan:
         context_parts.append(f"Ausgeführte Agents: {plan}")
     
-    # Daten-Summary
-    data_summary = state.get("data_summary")
-    if data_summary:
-        context_parts.append(f"Geladene Daten: {data_summary}")
-    
-    # Datasets Info mit Datenwerten
-    datasets = state.get("datasets", {})
+    # Datasets Info (DEC-025: DatasetMeta oder Legacy)
+    # Nur aktive Datasets dieses Turns anzeigen (nicht akkumulierte aus vorherigen Turns)
+    all_datasets = state.get("datasets", {})
+    active_keys = state.get("active_dataset_keys")
+    if active_keys:
+        datasets = {k: v for k, v in all_datasets.items() if k in active_keys}
+    else:
+        datasets = all_datasets
     if datasets:
         context_parts.append(f"Verfügbare Datasets: {', '.join(datasets.keys())}")
         context_parts.append("\n## DATENWERTE")
-        
+
         for ds_name, ds_content in datasets.items():
             if not isinstance(ds_content, dict):
                 continue
-                
-            data = ds_content.get("data", {})
-            if not isinstance(data, dict):
-                continue
-                
-            context_parts.append(f"\n### Dataset: {ds_name}")
-            
-            for key, values in data.items():
-                if isinstance(values, list) and len(values) > 0:
-                    if isinstance(values[0], dict) and "value" in values[0]:
-                        first_val = values[0].get("value", "?")
-                        last_val = values[-1].get("value", "?")
-                        context_parts.append(f"- {key}: {len(values)} Punkte, von {first_val} bis {last_val}")
+
+            # DEC-025: DatasetMeta-Format (hat "dataset_key")
+            if "dataset_key" in ds_content:
+                context_parts.append(f"\n### Dataset: {ds_name}")
+                signal_keys = ds_content.get("keys", [])
+                point_count = ds_content.get("point_count", "?")
+                timerange = ds_content.get("timerange", {})
+                context_parts.append(f"- Signals: {', '.join(signal_keys[:6])}")
+                context_parts.append(f"- Punkte: {point_count}")
+                if timerange:
+                    start = timerange.get("start") or timerange.get("start_human", "?")
+                    end = timerange.get("end") or timerange.get("end_human", "?")
+                    context_parts.append(f"- Zeitraum: {start} - {end}")
+
+                # Statistiken aus Meta
+                meta = ds_content.get("meta", {})
+                if isinstance(meta, dict) and meta.get("statistics"):
+                    stats = meta["statistics"]
+                    for sk, sv in list(stats.items())[:3]:
+                        if isinstance(sv, dict):
+                            context_parts.append(
+                                f"- {sk}: min={sv.get('min','?')}, max={sv.get('max','?')}, avg={sv.get('avg','?')}"
+                            )
+            else:
+                # Legacy-Format: hat "data" Key
+                data = ds_content.get("data", {})
+                if not isinstance(data, dict):
+                    continue
+
+                context_parts.append(f"\n### Dataset: {ds_name}")
+
+                for key, values in data.items():
+                    if isinstance(values, list) and len(values) > 0:
+                        if isinstance(values[0], dict) and "value" in values[0]:
+                            first_val = values[0].get("value", "?")
+                            last_val = values[-1].get("value", "?")
+                            context_parts.append(f"- {key}: {len(values)} Punkte, von {first_val} bis {last_val}")
+                        else:
+                            context_parts.append(f"- {key}: {len(values)} Werte")
+                    elif isinstance(values, dict) and "value" in values:
+                        val = values.get("value", "?")
+                        ts = values.get("timestamp", "?")
+                        context_parts.append(f"- {key}: {val} (Zeitstempel: {ts})")
                     else:
-                        context_parts.append(f"- {key}: {len(values)} Werte")
-                elif isinstance(values, dict) and "value" in values:
-                    val = values.get("value", "?")
-                    ts = values.get("timestamp", "?")
-                    context_parts.append(f"- {key}: {val} (Zeitstempel: {ts})")
-                else:
-                    context_parts.append(f"- {key}: {values}")
+                        context_parts.append(f"- {key}: {values}")
     
     # Statistiken
     if state.get("statistics"):
@@ -178,7 +325,7 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
             context_parts.append(f"Grund: {reasoning}")
     
     context = "\n".join(context_parts)
-    logger.debug(f"Context für LLM: {context[:300]}...")
+    logger.info(f"Respond-Context ({len(context)} chars):\n{context}")
     
     # LLM für Response (DEC-018: API Key Rotation, DEC-021: Prompt Caching)
     llm = create_anthropic_client(temperature=0.3)
@@ -193,6 +340,7 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
 
     return {
         "messages": [AIMessage(content=response.content)],
+        "turn_history": [_build_turn_entry(state)],
     }
 
 
@@ -418,42 +566,62 @@ def get_graph():
 # PUBLIC API
 # =============================================================================
 
-async def run_query(query: str, thread_id: str = "default") -> dict[str, Any]:
+async def run_query(
+    query: str,
+    thread_id: str = "default",
+    session_id: str | None = None,
+) -> dict[str, Any]:
     """
     Führt eine User-Query durch den gesamten Graph.
-    
+
     Args:
         query: Die Frage des Users
         thread_id: Eindeutige ID für die Konversation (für State-Persistenz)
-        
+        session_id: DuckDB SessionStore ID (DEC-025, default: thread_id)
+
     Returns:
         dict mit response, plan, data_summary, statistics, chart_url, etc.
     """
     graph = get_graph()
-    
+
     # Config mit thread_id für Checkpointer
     config = {"configurable": {"thread_id": thread_id}}
-    
-    # Input State mit max_steps
-    input_state = {
-        "messages": [HumanMessage(content=query)],
-        "max_steps": DEFAULT_MAX_STEPS,
-    }
-    
-    logger.info(f"Query starten: '{query[:50]}...' (thread: {thread_id})")
-    
+
+    # DEC-025: SessionStore als "in use" markieren (Schutz gegen Destroy bei Page-Refresh)
+    effective_session_id = session_id or thread_id
+    try:
+        from config.duckdb_store import SessionStore
+        store = SessionStore.get_instance(effective_session_id)
+        store.acquire()
+    except Exception:
+        pass  # Store existiert evtl. noch nicht — OK
+
     # Graph ausführen
-    result = await graph.ainvoke(input_state, config)
-    
+    try:
+        input_state = {
+            "messages": [HumanMessage(content=query)],
+            "max_steps": DEFAULT_MAX_STEPS,
+            "session_id": session_id or thread_id,
+        }
+        logger.info(f"Query starten: '{query[:50]}...' (thread: {thread_id})")
+        result = await graph.ainvoke(input_state, config)
+    finally:
+        # Store wieder freigeben
+        try:
+            store = SessionStore.get_instance(effective_session_id)
+            store.release()
+        except Exception:
+            pass
+
     logger.info(f"Query fertig. Plan war: {result.get('plan')}")
-    
+
     # Finale Response extrahieren
     final_response = ""
     for msg in reversed(result.get("messages", [])):
         if isinstance(msg, AIMessage) and isinstance(msg.content, str):
             final_response = msg.content
             break
-    
+
     return {
         "response": final_response,
         "plan": result.get("plan", []),

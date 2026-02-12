@@ -2,7 +2,7 @@
 
 > **Zweck:** Wiederverwendbare Patterns aus Projekt-Entscheidungen
 > **Für:** Claude erkennt ähnliche Probleme und schlägt bewährte Lösungen vor
-> **Stand:** 04. Februar 2026
+> **Stand:** 11. Februar 2026
 
 ---
 
@@ -36,6 +36,7 @@
 | DEC-024 | Timeseries Korrelation | IoT-Sensoren mit unterschiedlichen Timestamps | pd.merge_asof für Alignment | Korrelation zwischen Sensoren |
 | DEC-025 | DuckDB Reference-only State | Rohdaten im AgentState sprengen Token-Limits | In-Memory DuckDB pro Session, nur DatasetMeta im State | Alle Datenzugriffe in Stats/Viz Agent |
 | DEC-028 | Data Agent als Daten-Gatekeeper | Supervisor hat zu viel Detail-Wissen über Datasets | Data Agent läuft immer, setzt active_dataset_keys | Alle Turns mit Viz/Stats Agent |
+| DEC-029 | Supervisor als Kontext-Instanz | Follow-up-Queries scheitern weil Konversationskontext fehlt | Strukturierte turn_history + Telemetrie-Referenz im Prompt | Multi-Turn Konversationen |
 
 ---
 
@@ -2198,6 +2199,99 @@ Viz Agent   → liest [key1, ...]                   (Gefiltert via get_data_from
 
 ---
 
+## DEC-029: Supervisor als zentrale Kontext-Instanz (turn_history)
+
+### Problem
+In Multi-Turn-Konversationen gehen Follow-up-Queries schief, weil der Supervisor nur die letzte User-Query + einen verlustbehafteten `data_summary`-Text sieht. Er weiß nicht was der User vorher gefragt hat, welche Daten geladen wurden oder welche Ergebnisse produziert wurden. Dadurch erzeugt er falsche `data_instructions` (falsche Keys, falsches Datum, falscher Zeitraum).
+
+**Beispiel:** User fragt "Korrelation Moment/Position, 3 Achsen, 4.Feb 14:20-15:00", dann "zeig mir die Daten in einem Diagramm". Der Supervisor weiß nicht was "die Daten" bedeutet und holt komplett falsche Daten.
+
+### Kontext
+- Orchestrator-Worker Pattern: Supervisor muss genug Kontext haben um richtig zu planen
+- `data_summary` ist verlustbehaftet: keine Keys, kein Zeitraum, kein Ergebnis-Typ
+- Checkpointer persistiert State zwischen Turns — `turn_history` akkumuliert automatisch
+- Supervisor-Prompt hatte keine Telemetrie-Referenz → konnte Keys nicht zuordnen
+
+### Entscheidung
+**Neues `turn_history` State-Feld mit strukturierten Turn-Zusammenfassungen. Supervisor bekommt vollen Konversationskontext inkl. geladener Keys, Zeiträume und Ergebnisse. Zusätzlich kompakte Telemetrie-Gruppen-Tabelle im Prompt. Supervisor-Modell auf Opus umgestellt.**
+
+### Pattern
+
+**1. TurnEntry-Struktur (State)**
+```python
+class TurnEntry(TypedDict, total=False):
+    user_query: str             # "Korrelation Moment/Position, 3 Achsen..."
+    plan: list[str]             # ["data_agent", "stats_agent"]
+    data_mode: str              # "detail" | "overview"
+    datasets: list[TurnDataset] # Gruppiert nach Zeitraum
+    result_type: str            # "data" | "chart" | "statistics" | "error" | "abstention" | "clarification"
+    result_summary: str         # "Korrelation: A1 r=0.012, A2 r=-0.617"
+```
+
+**2. Reducer (max 20 Einträge)**
+```python
+turn_history: Annotated[list[dict], append_turn_history] = []
+
+def append_turn_history(existing, new):
+    return (existing + new)[-20:]
+```
+
+**3. respond_node schreibt turn_history**
+```python
+# Am Ende jedes Turns:
+turn_entry = _build_turn_entry(state)
+return {"messages": [...], "turn_history": [turn_entry]}
+```
+
+**4. Supervisor liest turn_history**
+```python
+def build_turn_context(turn_history, datasets) -> str:
+    # Zeigt max 15 Turns im Format:
+    # Turn 1: "Korrelation Moment/Position..."
+    #   Plan: ["data_agent", "stats_agent"]
+    #   Daten: torque_act_a1_nm, axis_act_a1_deg (04.02. 14:20-15:00)
+    #   Ergebnis (statistics): Korrelation A1 r=0.012
+```
+
+**5. Telemetrie-Referenz im Prompt**
+```
+<telemetry_reference>
+| Gruppe | Keys | Einheit | Begriffe |
+|--------|------|---------|----------|
+| Ist-Drehmomente | torque_act_a1..a6_nm | Nm | Moment, Drehmoment, Kraft |
+| ... (alle 13 Gruppen) |
+</telemetry_reference>
+```
+
+### Begründung
+- **Voller Kontext:** Supervisor sieht alle bisherigen Queries, geladene Daten und Ergebnisse
+- **Korrekte Follow-ups:** "Zeig mir die Daten als Chart" wird richtig aufgelöst (Keys + Zeitraum aus vorherigem Turn)
+- **Telemetrie-Referenz:** Supervisor kann User-Begriffe ("Drehmoment") auf Keys abbilden ohne extra Tool-Call
+- **Opus-Modell:** Besseres Reasoning für komplexe Multi-Turn-Planung
+- **Backward-kompatibel:** Alte Sessions ohne turn_history bekommen Fallback "Daten vorhanden"
+
+### Implementierung
+
+| Datei | Änderung |
+|-------|----------|
+| `agents/state.py` | `TurnEntry`, `TurnDataset` TypedDicts, `append_turn_history` Reducer, `turn_history` Feld, `data_summary` als DEPRECATED markiert |
+| `agents/graph.py` | `_build_turn_entry()` + Helfer, alle respond_node Return-Pfade mit `turn_history` |
+| `agents/supervisor.py` | `build_turn_context()` ersetzt `build_dataset_context()`, Opus-Modell |
+| `prompts/supervisor_prompt.py` | `get_supervisor_prompt()` Funktion statt Konstante, `_build_telemetry_table()`, Multi-Turn-Beispiele mit turn_history Format |
+
+### Anwenden bei
+- Multi-Turn-Konversationen → Supervisor hat jetzt Kontext über bisherige Turns
+- Follow-up-Queries ("zeig das als Chart", "nochmal für Achse 2") → Keys/Zeitraum aus turn_history
+- Neue Agents die Konversationskontext brauchen → `state["turn_history"]` lesen
+
+### Referenz
+- `agents/state.py:TurnEntry` — Strukturierte Turn-Zusammenfassung
+- `agents/graph.py:_build_turn_entry()` — Schreibt turn_history am Ende jedes Turns
+- `agents/supervisor.py:build_turn_context()` — Liest turn_history für Supervisor-Kontext
+- `prompts/supervisor_prompt.py:get_supervisor_prompt()` — Prompt mit Telemetrie-Referenz
+
+---
+
 ## 💡 IDEEN (noch nicht umgesetzt)
 
 ### IDEE-001: Dynamic Telemetry Key Discovery
@@ -2252,3 +2346,4 @@ Wenn der User nach Daten fragt, die du nicht in TELEMETRIE-KEYS findest:
 | 2026-02-03 | Stats Agent Refactoring - Auf InjectedState Pattern umgebaut (wie Viz Agent), MCP Server entfernt |
 | 2026-02-04 | DEC-025 (DuckDB Reference-only State) - IMPLEMENTIERT: In-Memory DuckDB pro Session, DatasetMeta statt Rohdaten im State, UNS-Keys |
 | 2026-02-11 | DEC-028 (Data Agent als Daten-Gatekeeper) - IMPLEMENTIERT: Data Agent setzt active_dataset_keys, Supervisor bekommt nur Summary |
+| 2026-02-11 | DEC-029 (Supervisor als Kontext-Instanz) - IMPLEMENTIERT: turn_history, Telemetrie-Referenz, Opus-Modell, build_turn_context() |

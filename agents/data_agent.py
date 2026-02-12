@@ -1276,8 +1276,12 @@ def build_result(
     - Keine neuen Daten (check_dataset: vorhanden) → found-Keys aus check_dataset
     """
 
-    summary = generate_data_summary(data, meta, quality)
-    logger.info(f"Summary: {summary}")
+    # Summary nur für echte Telemetrie generieren (nicht check_dataset Responses)
+    if data and isinstance(data, dict) and _is_telemetry_data(data):
+        summary = generate_data_summary(data, meta, quality)
+        logger.info(f"Summary: {summary}")
+    else:
+        summary = ""  # merge_summaries Reducer behält vorherigen Wert
 
     new_datasets: dict[str, DatasetMeta] = {}
     active_keys: list[str] = []  # DEC-026: Keys dieses Turns
@@ -1514,9 +1518,9 @@ async def run_data_agent(state: AgentState) -> dict[str, Any]:
         # 7b. DEC-028: check_dataset found-Keys als Fallback für active_dataset_keys
         check_dataset_keys = _extract_check_dataset_found_keys(result, input_message_count)
 
-        # 8. Datenqualität prüfen
+        # 8. Datenqualität prüfen (nur für echte Telemetrie, nicht check_dataset Responses)
         quality = None
-        if data and isinstance(data, dict):
+        if data and isinstance(data, dict) and _is_telemetry_data(data):
             quality = validate_data_quality(data)
             if meta:
                 meta["quality"] = quality

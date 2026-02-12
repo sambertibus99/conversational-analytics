@@ -29,7 +29,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from agents.state import AgentState
 from agents.utils import extract_user_query
-from prompts.supervisor_prompt import SUPERVISOR_SYSTEM_PROMPT
+from prompts.supervisor_prompt import get_supervisor_prompt
 from config.settings import DEFAULT_MODEL, api_key_rotator, create_anthropic_client, create_cached_system_message
 
 
@@ -51,9 +51,12 @@ VALID_AGENTS = {"data_agent", "stats_agent", "viz_agent"}
 # HILFSFUNKTIONEN
 # =============================================================================
 
+SUPERVISOR_MODEL = "claude-opus-4-20250514"  # DEC-029: Opus für besseres Reasoning
+
+
 def create_supervisor_llm():
-    """Erstellt das LLM für den Supervisor mit aktuellem API Key (DEC-018)."""
-    return create_anthropic_client()
+    """Erstellt das LLM für den Supervisor mit aktuellem API Key (DEC-018, DEC-029: Opus)."""
+    return create_anthropic_client(model=SUPERVISOR_MODEL)
 
 
 def parse_supervisor_response(response: str) -> dict[str, Any]:
@@ -157,27 +160,46 @@ def validate_plan(plan: list[str], has_datasets: bool) -> Tuple[bool, str, list[
     return True, "Plan ist valide", repaired
 
 
-def build_dataset_context(datasets: dict, data_summary: str) -> str:
+def build_turn_context(turn_history: list, datasets: dict) -> str:
     """
-    Baut kompakten Kontext über vorhandene Daten (DEC-028).
+    Baut Kontext aus turn_history für den Supervisor (DEC-029).
 
-    Der Supervisor bekommt nur data_summary — keine vollen Dataset-Keys.
-    Der Data Agent entscheidet welche Datasets relevant sind.
+    Ersetzt build_dataset_context(). Der Supervisor bekommt nun den
+    strukturierten Konversationsverlauf statt nur data_summary.
+
+    Fallback: Alte Sessions ohne turn_history bekommen minimalen Hinweis.
     """
-    if not datasets:
+    if not turn_history and not datasets:
         return ""
 
-    summary = data_summary if data_summary else "Daten vorhanden (Details beim Data Agent)."
+    parts = []
 
-    return f"""
+    if turn_history:
+        parts.append("\n## BISHERIGER VERLAUF\n")
+        for i, turn in enumerate(turn_history[-15:], 1):  # Max 15 Turns
+            query = turn.get("user_query", "?")
+            plan = turn.get("plan", [])
+            turn_datasets = turn.get("datasets", [])
+            result_type = turn.get("result_type", "?")
+            result_summary = turn.get("result_summary", "")
 
-## VORHANDENE DATEN
+            parts.append(f"Turn {i}: \"{query}\"")
+            if plan:
+                parts.append(f"  Plan: {plan}")
+            for ds in turn_datasets:
+                keys = ds.get("keys", [])
+                tr = ds.get("timerange", "")
+                if keys:
+                    parts.append(f"  Daten: {', '.join(keys[:8])} ({tr})")
+            if result_summary:
+                parts.append(f"  Ergebnis ({result_type}): {result_summary}")
+            parts.append("")
+    elif datasets:
+        # Fallback für alte Sessions ohne turn_history
+        parts.append("\n## VORHANDENE DATEN\n")
+        parts.append("Daten vorhanden (Details beim Data Agent).")
 
-{summary}
-
-WICHTIG: Der data_agent entscheidet welche Datasets relevant sind.
-Wenn Daten benötigt werden (neue oder vorhandene), MUSS data_agent im Plan sein.
-"""
+    return "\n".join(parts)
 
 
 # =============================================================================
@@ -247,17 +269,19 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
                 "user_input_reason": None,
             }
         
-        # 2. Dataset-Kontext
+        # 2. Turn-Kontext (DEC-029: turn_history statt data_summary)
+        turn_history = state.get("turn_history", [])
         datasets = state.get("datasets", {})
-        data_summary = state.get("data_summary", "")
-        context_info = build_dataset_context(datasets, data_summary)
-        
+        context_info = build_turn_context(turn_history, datasets)
+
+        if turn_history:
+            logger.debug(f"Turn History: {len(turn_history)} Turns")
         if datasets:
             logger.debug(f"Datasets vorhanden: {list(datasets.keys())}")
         
         # 3. LLM aufrufen (DEC-021: Prompt Caching via list[dict] content)
         llm = create_supervisor_llm()
-        enhanced_prompt = SUPERVISOR_SYSTEM_PROMPT + context_info
+        enhanced_prompt = get_supervisor_prompt() + context_info
 
         messages = [
             create_cached_system_message(enhanced_prompt),
@@ -322,6 +346,15 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
             "active_dataset_keys": None,  # DEC-028: Reset — Data Agent setzt neu
             "needs_user_input": False,  # Explizit zurücksetzen (Checkpointer persistiert!)
             "user_input_reason": None,
+            # Per-Turn Outputs resetten (Checkpointer persistiert alte Werte!)
+            "chart_url": None,
+            "chart_type": None,
+            "statistics": None,
+            "statistics_summary": None,
+            "error": None,
+            "error_count": 0,
+            "should_abstain": False,
+            "abstain_reason": None,
             "messages": [AIMessage(content=f"Plan erstellt: {final_plan}")],
         }
     

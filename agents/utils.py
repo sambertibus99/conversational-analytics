@@ -2,6 +2,7 @@
 Gemeinsame Hilfsfunktionen für alle Agents.
 
 DEC-016: Ausgelagert für DRY-Prinzip und Wiederverwendbarkeit.
+DEC-025: DuckDB-First Datenzugriff mit Legacy-Fallback.
 """
 
 import logging
@@ -11,36 +12,207 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# DATEN-EXTRAKTION AUS DATASETS (DEC-013)
+# DUCKDB-FIRST DATENZUGRIFF (DEC-025)
+# =============================================================================
+
+def get_data_from_state(state: dict) -> dict[str, list]:
+    """
+    DEC-025/026: Holt Daten aus DuckDB (primär) oder Legacy-State (Fallback).
+
+    DEC-026: Wenn active_dataset_keys gesetzt ist, werden nur Daten für
+    diese Keys geladen. Sonst alle Daten (Fallback).
+
+    Returns:
+        Daten im ThingsBoard-Format: {"signal_key": [{"value": ..., "timestamp": ...}, ...]}
+    """
+    session_id = state.get("session_id", "default")
+    active_keys = state.get("active_dataset_keys")  # DEC-026
+
+    # Versuch 1: DuckDB SessionStore
+    try:
+        from config.duckdb_store import SessionStore
+        if session_id in SessionStore._instances:
+            store = SessionStore.get_instance(session_id)
+            if store.point_count() > 0:
+                if active_keys:
+                    data = store.get_data_for_datasets(active_keys)
+                    logger.debug(f"DuckDB gefiltert: {len(data)} signal keys für {len(active_keys)} dataset keys")
+                else:
+                    data = store.get_all_data_merged()
+                    logger.debug(f"DuckDB: {len(data)} signal keys, {store.point_count()} Punkte")
+                if data:
+                    return data
+    except Exception as e:
+        logger.debug(f"DuckDB nicht verfügbar: {e}")
+
+    # Versuch 2: Legacy-Format aus State
+    datasets = state.get("datasets", {})
+    return extract_data_from_datasets(datasets)
+
+
+def get_values_for_key(state: dict, signal_key: str) -> list[float]:
+    """
+    DEC-025: Holt Werte für einen Signal-Key (DuckDB-first).
+    DEC-026: Filtert nach active_dataset_keys wenn gesetzt.
+
+    Returns:
+        Liste von float-Werten, zeitlich sortiert.
+    """
+    session_id = state.get("session_id", "default")
+    active_keys = state.get("active_dataset_keys")  # DEC-026
+
+    # Versuch 1: DuckDB
+    try:
+        from config.duckdb_store import SessionStore
+        if session_id in SessionStore._instances:
+            store = SessionStore.get_instance(session_id)
+            if active_keys:
+                placeholders = ", ".join(["?"] * len(active_keys))
+                values = store.query(
+                    f"SELECT value FROM telemetry WHERE signal_key = ? AND dataset_key IN ({placeholders}) ORDER BY ts",
+                    [signal_key] + active_keys,
+                )
+            else:
+                values = store.query(
+                    "SELECT value FROM telemetry WHERE signal_key = ? ORDER BY ts",
+                    [signal_key],
+                )
+            if values:
+                return [r[0] for r in values]
+    except Exception as e:
+        logger.debug(f"DuckDB Lookup fehlgeschlagen: {e}")
+
+    # Versuch 2: Legacy
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    return extract_values_from_data(data, signal_key)
+
+
+def get_timeseries_for_key(state: dict, signal_key: str) -> tuple[list[int], list[float]]:
+    """
+    DEC-025: Holt Timestamps und Werte für einen Signal-Key (DuckDB-first).
+    DEC-026: Filtert nach active_dataset_keys wenn gesetzt.
+
+    Returns:
+        Tuple (timestamps, values), beide zeitlich sortiert.
+    """
+    session_id = state.get("session_id", "default")
+    active_keys = state.get("active_dataset_keys")  # DEC-026
+
+    # Versuch 1: DuckDB
+    try:
+        from config.duckdb_store import SessionStore
+        if session_id in SessionStore._instances:
+            store = SessionStore.get_instance(session_id)
+            if active_keys:
+                placeholders = ", ".join(["?"] * len(active_keys))
+                rows = store.query(
+                    f"SELECT ts, value FROM telemetry WHERE signal_key = ? AND dataset_key IN ({placeholders}) ORDER BY ts",
+                    [signal_key] + active_keys,
+                )
+            else:
+                rows = store.query(
+                    "SELECT ts, value FROM telemetry WHERE signal_key = ? ORDER BY ts",
+                    [signal_key],
+                )
+            if rows:
+                return [r[0] for r in rows], [r[1] for r in rows]
+    except Exception as e:
+        logger.debug(f"DuckDB Lookup fehlgeschlagen: {e}")
+
+    # Versuch 2: Legacy
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    return extract_timestamps_from_data(data, signal_key), extract_values_from_data(data, signal_key)
+
+
+def get_available_signal_keys(state: dict) -> list[str]:
+    """
+    DEC-025: Gibt verfügbare Signal-Keys zurück (DuckDB-first).
+    DEC-026: Filtert nach active_dataset_keys wenn gesetzt.
+    """
+    session_id = state.get("session_id", "default")
+    active_keys = state.get("active_dataset_keys")  # DEC-026
+
+    # Versuch 1: DuckDB
+    try:
+        from config.duckdb_store import SessionStore
+        if session_id in SessionStore._instances:
+            store = SessionStore.get_instance(session_id)
+            if active_keys:
+                placeholders = ", ".join(["?"] * len(active_keys))
+                rows = store.query(
+                    f"SELECT DISTINCT signal_key FROM telemetry WHERE dataset_key IN ({placeholders})",
+                    active_keys,
+                )
+            else:
+                rows = store.query("SELECT DISTINCT signal_key FROM telemetry")
+            if rows:
+                return [r[0] for r in rows]
+    except Exception as e:
+        logger.debug(f"DuckDB Lookup fehlgeschlagen: {e}")
+
+    # Versuch 2: Legacy
+    datasets = state.get("datasets", {})
+    data = extract_data_from_datasets(datasets)
+    return list(data.keys())
+
+
+# =============================================================================
+# LEGACY: DATEN-EXTRAKTION AUS DATASETS (DEC-013)
 # =============================================================================
 
 def extract_data_from_datasets(datasets: dict[str, Any]) -> dict[str, list]:
     """
     Extrahiert und merged Daten aus allen Datasets.
-    
-    Beispiel:
+
+    DEC-025: Unterstützt sowohl Legacy-Format (mit "data" Key) als auch
+    das neue DatasetMeta-Format (ohne "data" Key, Daten in DuckDB).
+    Bei DatasetMeta-Format wird versucht, Daten aus DuckDB zu laden.
+
+    Beispiel Legacy:
         datasets = {
             "torque": {"data": {"torque_a1": [...], "torque_a2": [...]}, ...},
-            "velocity": {"data": {"vel_a1": [...], ...}, ...}
         }
-        
+
     Returns:
-        {"torque_a1": [...], "torque_a2": [...], "vel_a1": [...], ...}
+        {"torque_a1": [...], "torque_a2": [...], ...}
     """
     if not datasets:
         return {}
-    
+
     merged = {}
+    duckdb_keys = []
+
     for dataset_key, dataset_value in datasets.items():
         if not isinstance(dataset_value, dict):
             continue
-        
+
+        # DEC-025: DatasetMeta-Format (hat "dataset_key" statt "data")
+        if "dataset_key" in dataset_value and "data" not in dataset_value:
+            duckdb_keys.append(dataset_value["dataset_key"])
+            continue
+
+        # Legacy-Format: hat "data" Key
         data = dataset_value.get("data", {})
         if isinstance(data, dict):
             for key, values in data.items():
-                # Bei Duplikaten: letzteres gewinnt
                 merged[key] = values
-    
+
+    # DuckDB-Daten nachladen wenn nötig
+    if duckdb_keys and not merged:
+        try:
+            from config.duckdb_store import SessionStore
+            # Prüfe ob eine Session existiert
+            for sid, store_inst in SessionStore._instances.items():
+                for dk in duckdb_keys:
+                    data = store_inst.get_all_signal_data(dk)
+                    merged.update(data)
+                if merged:
+                    break
+        except Exception as e:
+            logger.debug(f"DuckDB Fallback in extract_data_from_datasets: {e}")
+
     return merged
 
 
@@ -48,19 +220,34 @@ def get_dataset_meta(datasets: dict[str, Any]) -> dict:
     """
     Extrahiert Metadaten aus Datasets.
     Gibt die erste Meta mit Zeitraum zurück.
+
+    DEC-025: Unterstützt sowohl Legacy- als auch DatasetMeta-Format.
     """
     if not datasets:
         return {}
-    
+
     for dataset_value in datasets.values():
         if isinstance(dataset_value, dict):
-            meta = dataset_value.get("meta", {})
-            if meta.get("timerange"):
-                return meta
-    
+            # DEC-025: DatasetMeta hat "meta" direkt und "timerange"
+            if "dataset_key" in dataset_value:
+                meta = dataset_value.get("meta", {})
+                if meta.get("timerange"):
+                    return meta
+                if dataset_value.get("timerange"):
+                    return {"timerange": dataset_value["timerange"]}
+            else:
+                # Legacy-Format
+                meta = dataset_value.get("meta", {})
+                if meta.get("timerange"):
+                    return meta
+
     # Fallback: erste Meta
     first_dataset = next(iter(datasets.values()), {})
-    return first_dataset.get("meta", {}) if isinstance(first_dataset, dict) else {}
+    if isinstance(first_dataset, dict):
+        if "dataset_key" in first_dataset:
+            return first_dataset.get("meta", {})
+        return first_dataset.get("meta", {})
+    return {}
 
 
 # =============================================================================

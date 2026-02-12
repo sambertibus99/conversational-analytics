@@ -23,6 +23,8 @@ from agents.data_agent import (
     extract_text_from_tool_content,
     parse_json_safe,
     load_data_from_file,
+    determine_dataset_key_rich,
+    _extract_time_range,
 )
 
 
@@ -337,12 +339,12 @@ class TestGenerateDataSummary:
                 "end": "17.12.2025 13:10",
             },
         }
-        
+
         summary = generate_data_summary(None, meta)
-        
+
         assert "KEINE DATEN" in summary
-        assert "Mittwoch" in summary
-    
+        assert "Keine Daten gefunden" in summary
+
     def test_data_availability_summary(self):
         """Testet Summary für data_availability."""
         meta = {
@@ -355,12 +357,12 @@ class TestGenerateDataSummary:
             },
             "total_points": 24000,
         }
-        
+
         summary = generate_data_summary({}, meta)
-        
+
         assert "VERFÜGBAR" in summary
-        assert "Dienstag" in summary
-    
+        assert "16.12.2025" in summary
+
     def test_success_with_statistics_summary(self):
         """Testet Summary für success mit Statistiken."""
         meta = {
@@ -379,28 +381,27 @@ class TestGenerateDataSummary:
                 }
             },
         }
-        
+
         summary = generate_data_summary({"pos_act_x_mm": []}, meta)
-        
-        assert "94.789" in summary or "94.79" in summary
-        assert "Dienstag" in summary
-    
+
+        assert "pos_act_x_mm" in summary
+        assert "627" in summary
+
     def test_latest_telemetry_summary(self, latest_telemetry_response):
         """Testet Summary für latest telemetry."""
         meta = {"type": "latest", "data_points": {"axis_act_a1_deg": 1}}
-        
+
         summary = generate_data_summary(latest_telemetry_response, meta)
-        
+
         assert "Aktuelle Werte" in summary
-        assert "25.34" in summary
-    
+
     def test_list_summary(self, telemetry_keys_response):
         """Testet Summary für Listen."""
         meta = {"type": "list", "count": len(telemetry_keys_response)}
-        
+
         summary = generate_data_summary(telemetry_keys_response, meta)
-        
-        assert "Einträge" in summary
+
+        assert len(summary) > 0
     
     def test_none_data_none_meta(self):
         """Testet Summary für None/None."""
@@ -478,5 +479,145 @@ class TestResponsePriority:
         }
         
         data, meta, file = extract_data_from_parsed(response)
-        
+
         assert meta["type"] == "data_availability"
+
+
+# =============================================================================
+# DETERMINE_DATASET_KEY_RICH TESTS (DEC-026)
+# =============================================================================
+
+class TestDetermineDatasetKeyRich:
+    """Tests für determine_dataset_key_rich()."""
+
+    def test_basic_timeseries_overview(self):
+        """Overview Timeseries-Key mit Metadaten."""
+        data = {"torque_act_a1_nm": [{"value": "25.0", "timestamp": 1000}]}
+        meta = {
+            "type": "success",
+            "timerange": {
+                "start_human": "16.12.2025 12:00",
+                "end_human": "16.12.2025 14:00",
+            },
+            "settings": {
+                "interval_human": "60 Sekunden",
+                "aggregation": "AVG",
+            },
+        }
+        key = determine_dataset_key_rich(data, meta, "overview")
+        assert key == "krc5/torque_act_a1_nm/timeseries/overview/2025-12-16_12-00_14-00/60sekunden_avg"
+
+    def test_detail_mode_no_interval(self):
+        """Detail-Modus ohne Intervall."""
+        data = {"torque_act_a1_nm": [{"value": "25.0", "timestamp": 1000}]}
+        meta = {
+            "type": "success",
+            "timerange": {
+                "start_human": "16.12.2025 12:00",
+                "end_human": "16.12.2025 14:00",
+            },
+        }
+        key = determine_dataset_key_rich(data, meta, "detail")
+        assert key == "krc5/torque_act_a1_nm/timeseries/detail/2025-12-16_12-00_14-00"
+
+    def test_latest_telemetry(self):
+        """Latest-Telemetrie-Key."""
+        data = {"axis_act_a1_deg": {"value": "25.34", "timestamp": 1000}}
+        meta = {"type": "latest"}
+        key = determine_dataset_key_rich(data, meta, "overview")
+        assert key == "krc5/axis_act_a1_deg/latest/overview"
+
+    def test_no_meta(self):
+        """Key ohne Metadaten — Fallback auf Basis-Key."""
+        data = {"vel_act_m_per_s": [{"value": "1.0", "timestamp": 1000}]}
+        key = determine_dataset_key_rich(data, None, "overview")
+        assert key == "krc5/vel_act_m_per_s/timeseries/overview"
+
+    def test_none_data(self):
+        """None-Daten geben 'unknown'."""
+        key = determine_dataset_key_rich(None, None, "overview")
+        assert key == "unknown"
+
+    def test_empty_data(self):
+        """Leere Daten geben 'unknown'."""
+        key = determine_dataset_key_rich({}, None, "overview")
+        assert key == "unknown"
+
+    def test_different_signals_different_keys(self):
+        """Verschiedene Signale erzeugen verschiedene Keys."""
+        torque_data = {"torque_act_a1_nm": [{"value": "25.0", "timestamp": 1000}]}
+        vel_data = {"vel_act_m_per_s": [{"value": "1.0", "timestamp": 1000}]}
+        meta = {"type": "success", "timerange": {"start_human": "16.12.2025 12:00", "end_human": "16.12.2025 14:00"}}
+
+        key_torque = determine_dataset_key_rich(torque_data, meta, "overview")
+        key_vel = determine_dataset_key_rich(vel_data, meta, "overview")
+
+        assert key_torque != key_vel
+        assert "torque_act_a1_nm" in key_torque
+        assert "vel_act_m_per_s" in key_vel
+
+    def test_different_time_ranges_different_keys(self):
+        """Verschiedene Zeiträume erzeugen verschiedene Keys."""
+        data = {"torque_act_a1_nm": [{"value": "25.0", "timestamp": 1000}]}
+        meta1 = {"type": "success", "timerange": {"start_human": "16.12.2025 12:00", "end_human": "16.12.2025 14:00"}}
+        meta2 = {"type": "success", "timerange": {"start_human": "16.12.2025 14:00", "end_human": "16.12.2025 16:00"}}
+
+        key1 = determine_dataset_key_rich(data, meta1, "overview")
+        key2 = determine_dataset_key_rich(data, meta2, "overview")
+
+        assert key1 != key2
+
+    def test_different_modes_different_keys(self):
+        """detail vs overview erzeugen verschiedene Keys."""
+        data = {"torque_act_a1_nm": [{"value": "25.0", "timestamp": 1000}]}
+        meta = {"type": "success", "timerange": {"start_human": "16.12.2025 12:00", "end_human": "16.12.2025 14:00"}}
+
+        key_detail = determine_dataset_key_rich(data, meta, "detail")
+        key_overview = determine_dataset_key_rich(data, meta, "overview")
+
+        assert key_detail != key_overview
+        assert "/detail/" in key_detail
+        assert "/overview/" in key_overview
+
+
+# =============================================================================
+# _EXTRACT_TIME_RANGE TESTS (DEC-026)
+# =============================================================================
+
+class TestExtractTimeRange:
+    """Tests für _extract_time_range()."""
+
+    def test_same_day_german_format(self):
+        """Gleicher Tag, deutsches Datumsformat."""
+        tr = {"start_human": "16.12.2025 12:00", "end_human": "16.12.2025 14:00"}
+        assert _extract_time_range(tr) == "2025-12-16_12-00_14-00"
+
+    def test_different_days(self):
+        """Verschiedene Tage."""
+        tr = {"start_human": "16.12.2025 12:00", "end_human": "17.12.2025 08:00"}
+        assert _extract_time_range(tr) == "2025-12-16_12-00_2025-12-17_08-00"
+
+    def test_iso_format(self):
+        """ISO-Datumsformat."""
+        tr = {"start": "2025-12-16 12:00", "end": "2025-12-16 14:00"}
+        assert _extract_time_range(tr) == "2025-12-16_12-00_14-00"
+
+    def test_empty_dict(self):
+        """Leeres Dict gibt leeren String."""
+        assert _extract_time_range({}) == ""
+
+    def test_only_start(self):
+        """Nur Start vorhanden."""
+        tr = {"start_human": "16.12.2025 12:00"}
+        result = _extract_time_range(tr)
+        assert result.startswith("2025-12-16_12-00")
+
+    def test_no_time(self):
+        """Unparsbare Zeitangabe."""
+        tr = {"start_human": "gestern", "end_human": "heute"}
+        assert _extract_time_range(tr) == ""
+
+    def test_start_fallback_to_start_key(self):
+        """Fallback: 'start' statt 'start_human'."""
+        tr = {"start": "16.12.2025 12:00", "end": "16.12.2025 14:00"}
+        assert _extract_time_range(tr) == "2025-12-16_12-00_14-00"

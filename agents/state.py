@@ -28,6 +28,30 @@ from typing import Any, Annotated, TypedDict
 from langgraph.graph import MessagesState
 
 
+class TurnDataset(TypedDict, total=False):
+    """Ein Dataset-Block im TurnEntry, gruppiert nach Zeitraum (DEC-029)."""
+    keys: list[str]             # ["torque_act_a1_nm", "torque_act_a2_nm"]
+    timerange: str              # "04.02.2026 14:20 - 15:00"
+
+
+class TurnEntry(TypedDict, total=False):
+    """Strukturierte Zusammenfassung eines Turns für den Supervisor-Kontext (DEC-029)."""
+    user_query: str             # "Korrelation Moment/Position, 3 Achsen..."
+    plan: list[str]             # ["data_agent", "stats_agent"]
+    data_mode: str              # "detail" | "overview"
+    datasets: list[TurnDataset] # Gruppiert nach Zeitraum
+    result_type: str            # "data" | "chart" | "statistics" | "error" | "abstention" | "clarification"
+    result_summary: str         # "Korrelation: A1 r=0.012, A2 r=-0.617"
+
+
+def append_turn_history(existing: list | None, new: list | None) -> list:
+    """Reducer für turn_history: Hängt neue Einträge an, max 20 behalten (DEC-029)."""
+    existing = existing or []
+    if new is None:
+        return existing
+    return (existing + new)[-20:]
+
+
 class DatasetMeta(TypedDict, total=False):
     """
     Metadaten-Referenz für ein Dataset in DuckDB (DEC-025).
@@ -142,12 +166,17 @@ class AgentState(MessagesState):
     # Format: {"krc5/torque/timeseries/2h": DatasetMeta, ...}
     datasets: Annotated[dict[str, Any], merge_datasets] = {}
     
-    # Kurze Zusammenfassung für LLM-Context - AKKUMULIERT
+    # DEPRECATED (DEC-029): Wird für Supervisor durch turn_history ersetzt.
+    # Bleibt aktiv für respond_node und Backward-Compat.
     data_summary: Annotated[str, merge_summaries] = ""
     
     # Pfad zur aktuellen Datendatei (für Viz/Stats Agent)
     # Wird pro Turn überschrieben
     current_data_file: str | None = None
+
+    # === Turn History (DEC-029) ===
+    # Strukturierte Zusammenfassungen vergangener Turns für Supervisor-Kontext
+    turn_history: Annotated[list[dict], append_turn_history] = []
 
     # === Aktive Dataset-Keys für den aktuellen Turn (DEC-026/028) ===
     # Wird vom Data Agent gesetzt (basierend auf check_dataset + get_telemetry).

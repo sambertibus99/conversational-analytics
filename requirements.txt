@@ -27,6 +27,9 @@ numpy>=1.26.0
 pandas>=2.1.0
 scipy>=1.11.0
 
+# === Analytischer Datenspeicher (DEC-025) ===
+duckdb>=1.1.0
+
 # === Utilities ===
 python-dotenv>=1.0.0
 pydantic>=2.5.0

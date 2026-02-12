@@ -159,7 +159,7 @@ class TestDataSummary:
     def test_summary_contains_key_info(self):
         """Prüft dass Summary wichtige Infos enthält."""
         from agents.data_agent import generate_data_summary
-        
+
         meta = {
             "type": "success",
             "statistics": {
@@ -167,13 +167,13 @@ class TestDataSummary:
             },
             "timerange": {"weekday": "Dienstag", "start": "12:00", "end": "12:10"},
         }
-        
+
         summary = generate_data_summary({}, meta)
-        
-        # Sollte Durchschnitt enthalten
-        assert "94" in summary
-        # Sollte Wochentag enthalten
-        assert "Dienstag" in summary
+
+        # Sollte Key-Name enthalten
+        assert "pos_act_x_mm" in summary
+        # Sollte Anzahl Punkte enthalten
+        assert "100" in summary
 
 
 # =============================================================================

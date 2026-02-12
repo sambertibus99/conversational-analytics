@@ -32,6 +32,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import json
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any, Annotated
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -44,6 +45,10 @@ from agents.utils import (
     extract_values_from_data,
     extract_timestamps_from_data,
     extract_user_query,
+    get_data_from_state,
+    get_values_for_key,
+    get_timeseries_for_key,
+    get_available_signal_keys,
 )
 from prompts.stats_agent_prompt import get_stats_agent_prompt
 from config.settings import create_anthropic_client, create_cached_system_message
@@ -68,14 +73,32 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# DEBUG LOGGING (Datei-basiert für Prompt-Analyse)
+# =============================================================================
+
+_DEBUG_LOG_PATH = PROJECT_ROOT / "logs" / "stats_agent_debug.log"
+_DEBUG_LOG_ENABLED = True
+
+
+def _debug_log(text: str) -> None:
+    """Schreibt Debug-Text in die Stats-Agent Log-Datei."""
+    if not _DEBUG_LOG_ENABLED:
+        return
+    try:
+        _DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        pass
+
+
+# =============================================================================
 # HILFSFUNKTIONEN
 # =============================================================================
 
 def get_available_keys(state: dict) -> list[str]:
-    """Extrahiert verfügbare Keys aus dem State."""
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-    return list(data.keys())
+    """Extrahiert verfügbare Keys aus dem State (DEC-025: DuckDB-first)."""
+    return get_available_signal_keys(state)
 
 
 def format_result(result: dict, tool_name: str) -> str:
@@ -107,14 +130,11 @@ def mean_tool(
     """
     logger.debug(f"mean_tool: key={key}")
 
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-
-    if key not in data:
-        available = list(data.keys())
+    available = get_available_signal_keys(state)
+    if key not in available:
         return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
 
-    values = extract_values_from_data(data, key)
+    values = get_values_for_key(state, key)
     if not values:
         return f"Keine gültigen Werte für Key '{key}'"
 
@@ -140,14 +160,11 @@ def std_tool(
     """
     logger.debug(f"std_tool: key={key}")
 
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-
-    if key not in data:
-        available = list(data.keys())
+    available = get_available_signal_keys(state)
+    if key not in available:
         return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
 
-    values = extract_values_from_data(data, key)
+    values = get_values_for_key(state, key)
     if not values:
         return f"Keine gültigen Werte für Key '{key}'"
 
@@ -173,14 +190,11 @@ def min_max_tool(
     """
     logger.debug(f"min_max_tool: key={key}")
 
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-
-    if key not in data:
-        available = list(data.keys())
+    available = get_available_signal_keys(state)
+    if key not in available:
         return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
 
-    values = extract_values_from_data(data, key)
+    values = get_values_for_key(state, key)
     if not values:
         return f"Keine gültigen Werte für Key '{key}'"
 
@@ -216,21 +230,15 @@ def correlation_tool(
     """
     logger.debug(f"correlation_tool: key_x={key_x}, key_y={key_y}")
 
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-
-    # Prüfe ob Keys existieren
-    available = list(data.keys())
-    if key_x not in data:
+    available = get_available_signal_keys(state)
+    if key_x not in available:
         return f"Key '{key_x}' nicht gefunden. Verfügbar: {available[:5]}"
-    if key_y not in data:
+    if key_y not in available:
         return f"Key '{key_y}' nicht gefunden. Verfügbar: {available[:5]}"
 
-    # Extrahiere Werte und Timestamps
-    x_values = extract_values_from_data(data, key_x)
-    x_timestamps = extract_timestamps_from_data(data, key_x)
-    y_values = extract_values_from_data(data, key_y)
-    y_timestamps = extract_timestamps_from_data(data, key_y)
+    # DEC-025: Timestamps und Werte über DuckDB-first Helper
+    x_timestamps, x_values = get_timeseries_for_key(state, key_x)
+    y_timestamps, y_values = get_timeseries_for_key(state, key_y)
 
     if not x_values or not y_values:
         return "Keine gültigen Werte für einen der Keys"
@@ -270,15 +278,11 @@ def trend_tool(
     """
     logger.debug(f"trend_tool: key={key}")
 
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-
-    if key not in data:
-        available = list(data.keys())
+    available = get_available_signal_keys(state)
+    if key not in available:
         return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
 
-    values = extract_values_from_data(data, key)
-    timestamps = extract_timestamps_from_data(data, key)
+    timestamps, values = get_timeseries_for_key(state, key)
 
     if not values:
         return f"Keine gültigen Werte für Key '{key}'"
@@ -305,14 +309,11 @@ def percentiles_tool(
     """
     logger.debug(f"percentiles_tool: key={key}")
 
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-
-    if key not in data:
-        available = list(data.keys())
+    available = get_available_signal_keys(state)
+    if key not in available:
         return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
 
-    values = extract_values_from_data(data, key)
+    values = get_values_for_key(state, key)
     if not values:
         return f"Keine gültigen Werte für Key '{key}'"
 
@@ -340,14 +341,11 @@ def anomaly_tool(
     """
     logger.debug(f"anomaly_tool: key={key}, sigma={sigma_threshold}")
 
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-
-    if key not in data:
-        available = list(data.keys())
+    available = get_available_signal_keys(state)
+    if key not in available:
         return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
 
-    values = extract_values_from_data(data, key)
+    values = get_values_for_key(state, key)
     if not values:
         return f"Keine gültigen Werte für Key '{key}'"
 
@@ -375,15 +373,11 @@ def summary_tool(
     """
     logger.debug(f"summary_tool: key={key}")
 
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-
-    if key not in data:
-        available = list(data.keys())
+    available = get_available_signal_keys(state)
+    if key not in available:
         return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
 
-    values = extract_values_from_data(data, key)
-    timestamps = extract_timestamps_from_data(data, key)
+    timestamps, values = get_timeseries_for_key(state, key)
 
     if not values:
         return f"Keine gültigen Werte für Key '{key}'"
@@ -450,23 +444,19 @@ def prepare_stats_context(state: AgentState) -> str:
 
     WICHTIG: Nur Metadaten, KEINE Werte! (DEC-003/DEC-004)
     Das LLM soll nur wissen welche Keys verfügbar sind.
+
+    DEC-025: Nutzt DuckDB-first Helpers für Key-Auflistung.
     """
     context_parts = []
 
-    # Data Summary
-    if state.get("data_summary"):
-        context_parts.append(f"Geladene Daten: {state['data_summary']}")
+    # Verfügbare Keys (DEC-025: DuckDB-first)
+    available_keys = get_available_signal_keys(state)
 
-    # Verfügbare Keys aus datasets
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-
-    if data:
+    if available_keys:
         context_parts.append("\n## VERFÜGBARE KEYS")
 
-        for key in data.keys():
-            values = extract_values_from_data(data, key)
-            timestamps = extract_timestamps_from_data(data, key)
+        for key in available_keys:
+            timestamps, values = get_timeseries_for_key(state, key)
 
             if values:
                 context_parts.append(f"- {key}: {len(values)} Werte" +
@@ -499,10 +489,28 @@ async def select_and_execute_tool(
         HumanMessage(content=user_query),
     ]
 
+    # Debug: Input loggen
+    _debug_log(f"\n{'#'*80}")
+    _debug_log(f"  STATS AGENT — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    _debug_log(f"{'#'*80}")
+    _debug_log(f"\nUser Query: {user_query}")
+    _debug_log(f"\nDaten-Kontext:\n{data_context}")
+    _debug_log(f"\nSystem-Prompt Länge: {len(system_content)} Zeichen")
+
     logger.debug("LLM wählt Stats Tool...")
     response = await llm_with_tools.ainvoke(messages)
 
+    # Debug: LLM Response loggen
+    _debug_log(f"\n{'='*60}")
+    _debug_log(f"LLM RESPONSE:")
+    _debug_log(f"  Content: {response.content[:500] if response.content else '(leer)'}")
+    _debug_log(f"  Tool-Calls: {len(response.tool_calls)}")
+    for tc in response.tool_calls:
+        args_without_state = {k: v for k, v in tc['args'].items() if k != 'state'}
+        _debug_log(f"    → {tc['name']}({args_without_state})")
+
     if not response.tool_calls:
+        _debug_log("  WARNUNG: Kein Tool gewählt!")
         logger.debug("Kein Tool-Call vom LLM")
         return None, "Keine Analyse angefordert"
 
@@ -522,6 +530,7 @@ async def select_and_execute_tool(
         if tool_name in tool_map:
             result = tool_map[tool_name].invoke(tool_args)
             results.append({"tool": tool_name, "result": result})
+            _debug_log(f"\n  Tool-Ergebnis ({tool_name}): {str(result)[:500]}")
         else:
             results.append({"tool": tool_name, "result": f"Unbekanntes Tool: {tool_name}"})
 
@@ -542,13 +551,12 @@ async def run_stats_agent(state: AgentState) -> dict[str, Any]:
     - State wird manuell in Tool-Args injiziert
     """
     try:
-        logger.debug("Starte Stats Agent (InjectedState Pattern)")
+        logger.debug("Starte Stats Agent (InjectedState Pattern, DEC-025: DuckDB-first)")
 
-        # Prüfe ob Daten vorhanden
-        datasets = state.get("datasets", {})
-        data = extract_data_from_datasets(datasets)
+        # Prüfe ob Daten vorhanden (DEC-025: DuckDB-first)
+        available_keys = get_available_signal_keys(state)
 
-        if not data:
+        if not available_keys:
             return {
                 "messages": [AIMessage(content="Keine Daten für statistische Analyse vorhanden. Bitte erst Daten laden.")],
                 "error": "no_data",
@@ -560,17 +568,15 @@ async def run_stats_agent(state: AgentState) -> dict[str, Any]:
         # User Query extrahieren
         user_query = extract_user_query(state["messages"])
         logger.debug(f"Query: {user_query}")
-        logger.debug(f"Verfügbare Keys: {list(data.keys())}")
+        logger.debug(f"Verfügbare Keys: {available_keys}")
 
         # LLM mit Tools
         llm = create_anthropic_client()
         llm_with_tools = llm.bind_tools(STATS_TOOLS)
 
-        # Tool State vorbereiten (das was die Tools sehen)
-        tool_state = {
-            "datasets": datasets,
-            "data_summary": state.get("data_summary", ""),
-        }
+        # Tool State vorbereiten (DEC-025: session_id durchreichen für DuckDB-Zugriff)
+        tool_state = dict(state)
+        tool_state["datasets"] = state.get("datasets", {})
 
         # Tool auswählen und ausführen
         results, llm_response = await select_and_execute_tool(
@@ -596,18 +602,18 @@ async def run_stats_agent(state: AgentState) -> dict[str, Any]:
                 parsed = json.loads(result_str)
                 statistics[tool_name] = parsed
 
-                # Summary generieren
+                # Summary generieren (Reihenfolge wichtig: spezifische Keys vor generischen!)
                 if "error" in parsed:
                     summaries.append(f"{tool_name}: {parsed['error']}")
+                elif "anomalies_count" in parsed:
+                    summaries.append(f"{parsed.get('key', '?')}: {parsed['anomalies_count']} Anomalien ({parsed.get('anomaly_percentage', '?')}%)")
                 elif "r" in parsed:
                     key_info = f"{parsed.get('key_x', '?')} ↔ {parsed.get('key_y', '?')}"
                     summaries.append(f"Korrelation {key_info}: r={parsed['r']:.3f} ({parsed.get('interpretation', '')})")
-                elif "mean" in parsed:
-                    summaries.append(f"{parsed.get('key', '?')}: Durchschnitt = {parsed['mean']:.4f}")
                 elif "slope" in parsed:
                     summaries.append(f"{parsed.get('key', '?')}: {parsed.get('trend', '')} (slope={parsed['slope']:.4f})")
-                elif "anomalies_count" in parsed:
-                    summaries.append(f"{parsed.get('key', '?')}: {parsed['anomalies_count']} Anomalien")
+                elif "mean" in parsed:
+                    summaries.append(f"{parsed.get('key', '?')}: Durchschnitt = {parsed['mean']:.4f}")
             except json.JSONDecodeError:
                 summaries.append(result_str)
 

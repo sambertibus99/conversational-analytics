@@ -41,7 +41,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from agents.state import AgentState
-from agents.utils import extract_data_from_datasets, get_dataset_meta, get_y_label, extract_user_query
+from agents.utils import extract_data_from_datasets, get_dataset_meta, get_y_label, extract_user_query, get_data_from_state
 from config.settings import DEFAULT_MODEL, api_key_rotator, create_anthropic_client, create_cached_system_message
 from prompts.viz_agent_prompt import VIZ_AGENT_SYSTEM_PROMPT
 
@@ -142,8 +142,10 @@ def shorten_key_name(key: str) -> str:
     return (key
         .replace("torque_act_", "T")
         .replace("axis_act_", "A")
+        .replace("pos_act_", "p")
         .replace("_deg", "°")
         .replace("_nm", "")
+        .replace("_mm", "")
         .replace("vel_act_", "V")
         .replace("_m_per_s", "")
         .replace("acc_axis_", "Acc"))
@@ -336,8 +338,7 @@ async def generate_line_chart_tool(
     """
     logger.debug(f"generate_line_chart_tool: title={title}")
     
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
+    data = get_data_from_state(state)
     
     if not data:
         return "Fehler: Keine Daten im State"
@@ -383,8 +384,7 @@ async def generate_area_chart_tool(
     """
     logger.debug(f"generate_area_chart_tool: title={title}")
     
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
+    data = get_data_from_state(state)
     
     if not data:
         return "Fehler: Keine Daten im State"
@@ -430,8 +430,7 @@ async def generate_column_chart_tool(
     """
     logger.debug(f"generate_column_chart_tool: title={title}")
     
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
+    data = get_data_from_state(state)
     
     if not data:
         return "Fehler: Keine Daten im State"
@@ -475,8 +474,7 @@ async def generate_bar_chart_tool(
     """
     logger.debug(f"generate_bar_chart_tool: title={title}")
     
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
+    data = get_data_from_state(state)
     
     if not data:
         return "Fehler: Keine Daten im State"
@@ -520,8 +518,7 @@ async def generate_scatter_chart_tool(
     """
     logger.debug(f"generate_scatter_chart_tool: title={title}")
     
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
+    data = get_data_from_state(state)
     
     if not data or len(data) < 2:
         return "Fehler: Für Scatter brauche ich mindestens 2 Keys"
@@ -566,8 +563,7 @@ async def generate_boxplot_chart_tool(
     """
     logger.debug(f"generate_boxplot_chart_tool: title={title}")
     
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
+    data = get_data_from_state(state)
     
     if not data:
         return "Fehler: Keine Daten im State"
@@ -611,8 +607,7 @@ async def generate_violin_chart_tool(
     """
     logger.debug(f"generate_violin_chart_tool: title={title}")
     
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
+    data = get_data_from_state(state)
     
     if not data:
         return "Fehler: Keine Daten im State"
@@ -658,8 +653,7 @@ async def generate_histogram_chart_tool(
     """
     logger.debug(f"generate_histogram_chart_tool: title={title}, bins={bin_number}")
     
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
+    data = get_data_from_state(state)
     
     if not data:
         return "Fehler: Keine Daten im State"
@@ -704,8 +698,7 @@ async def generate_pie_chart_tool(
     """
     logger.debug(f"generate_pie_chart_tool: title={title}")
     
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
+    data = get_data_from_state(state)
     
     if not data:
         return "Fehler: Keine Daten im State"
@@ -747,8 +740,7 @@ async def generate_radar_chart_tool(
     """
     logger.debug(f"generate_radar_chart_tool: title={title}")
     
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
+    data = get_data_from_state(state)
     
     if not data:
         return "Fehler: Keine Daten im State"
@@ -800,23 +792,50 @@ CHART_TOOLS = [
 # =============================================================================
 
 def prepare_viz_context(state: AgentState) -> Tuple[dict, str]:
-    """Bereitet Kontext für LLM vor."""
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-    
+    """Bereitet Kontext für LLM vor (DEC-025: DuckDB-first)."""
+    data = get_data_from_state(state)
+
     if not data:
         return {}, ""
-    
+
     keys = list(data.keys())
+    datasets = state.get("datasets", {})
     meta_info = f"Verfügbare Daten: {len(keys)} Keys ({', '.join(keys[:5])}{'...' if len(keys) > 5 else ''})"
     meta_info += f"\nGeladene Datasets: {', '.join(datasets.keys())}"
-    
-    dataset_meta = get_dataset_meta(datasets)
-    if dataset_meta.get("timerange"):
-        tr = dataset_meta["timerange"]
-        meta_info += f"\nZeitraum: {tr.get('weekday', '')} {tr.get('start', '')} - {tr.get('end', '')}"
-    
+
+    # Zeitraum: DuckDB als Source-of-Truth, Fallback auf Dataset-Meta
+    timerange_str = _get_timerange_from_duckdb(state)
+    if timerange_str:
+        meta_info += f"\nZeitraum: {timerange_str}"
+    else:
+        dataset_meta = get_dataset_meta(datasets)
+        if dataset_meta.get("timerange"):
+            tr = dataset_meta["timerange"]
+            meta_info += f"\nZeitraum: {tr.get('weekday', '')} {tr.get('start', '')} - {tr.get('end', '')}"
+
     return data, meta_info
+
+
+def _get_timerange_from_duckdb(state: dict) -> str:
+    """Berechnet den tatsächlichen Zeitraum aus DuckDB-Timestamps."""
+    session_id = state.get("session_id", "default")
+    try:
+        from config.duckdb_store import SessionStore
+        if session_id not in SessionStore._instances:
+            return ""
+        store = SessionStore.get_instance(session_id)
+        rows = store.query("SELECT MIN(ts), MAX(ts) FROM telemetry WHERE ts > 0")
+        if not rows or not rows[0][0]:
+            return ""
+        min_ts, max_ts = rows[0]
+        start = datetime.fromtimestamp(min_ts / 1000)
+        end = datetime.fromtimestamp(max_ts / 1000)
+        weekdays = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+        weekday = weekdays[start.weekday()]
+        return f"{weekday} {start.strftime('%d.%m.%Y %H:%M')} - {end.strftime('%H:%M')}"
+    except Exception as e:
+        logger.debug(f"Zeitraum aus DuckDB nicht ermittelbar: {e}")
+        return ""
 
 
 async def select_and_execute_tool(

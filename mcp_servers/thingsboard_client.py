@@ -406,7 +406,7 @@ class ThingsBoardClient:
         keys: list[str],
         start_ts: int,
         end_ts: int,
-        limit: int = 10000,
+        limit: int = 50000,
     ) -> dict[str, list[dict[str, Any]]]:
         """Holt Telemetrie-Zeitreihen für einen Zeitraum."""
         data = await self._request(

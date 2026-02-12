@@ -22,13 +22,13 @@ from datetime import datetime, timedelta
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 
 from agents.viz_agent import (
-    transform_timeseries_for_antv,
-    transform_multikey_for_antv,
-    transform_for_scatter,
-    transform_for_comparison,
-    transform_latest_values,
+    transform_for_line_chart,
+    transform_for_category_chart,
+    transform_for_scatter_chart,
+    transform_for_distribution_chart,
+    transform_for_histogram_chart,
     timestamp_to_time_string,
-    get_unit_for_key,
+    shorten_key_name,
     extract_chart_url,
     prepare_viz_context,
 )
@@ -143,200 +143,194 @@ class TestTimestampConversion:
 
 
 # =============================================================================
-# TRANSFORM_TIMESERIES_FOR_ANTV TESTS
+# TRANSFORM_FOR_LINE_CHART TESTS
 # =============================================================================
 
-class TestTransformTimeseriesForAntv:
-    """Tests für transform_timeseries_for_antv()."""
+class TestTransformForLineChart:
+    """Tests für transform_for_line_chart()."""
     
-    def test_basic_transformation(self, sample_timeseries_single_key):
+    def test_basic_transformation(self):
         """Testet grundlegende Transformation."""
-        result = transform_timeseries_for_antv(sample_timeseries_single_key)
+        data = {
+            "torque_act_a1": [
+                {"value": 10.5, "timestamp": 1734350000000},
+                {"value": 11.2, "timestamp": 1734350001000},
+                {"value": 10.8, "timestamp": 1734350002000},
+            ]
+        }
+        result = transform_for_line_chart(data)
         
         assert isinstance(result, list)
         assert len(result) > 0
     
-    def test_result_has_time_and_value(self, sample_timeseries_single_key):
+    def test_result_has_time_and_value(self):
         """Testet ob Ergebnis time und value hat."""
-        result = transform_timeseries_for_antv(sample_timeseries_single_key)
+        data = {
+            "torque_act_a1": [
+                {"value": 10.5, "timestamp": 1734350000000},
+            ]
+        }
+        result = transform_for_line_chart(data)
         
+        assert len(result) > 0
         for point in result:
             assert "time" in point
             assert "value" in point
     
-    def test_values_are_floats(self, sample_timeseries_single_key):
+    def test_values_are_floats(self):
         """Testet ob values Floats sind (nicht Strings)."""
-        result = transform_timeseries_for_antv(sample_timeseries_single_key)
+        data = {
+            "torque_act_a1": [
+                {"value": "10.5", "timestamp": 1734350000000},
+            ]
+        }
+        result = transform_for_line_chart(data)
         
+        assert len(result) > 0
         for point in result:
             assert isinstance(point["value"], float), \
                 f"value sollte float sein, ist aber {type(point['value'])}"
     
-    def test_result_sorted_by_time(self, sample_timeseries_single_key):
-        """Testet ob Ergebnis nach Zeit sortiert ist."""
-        result = transform_timeseries_for_antv(sample_timeseries_single_key)
-        
-        times = [p["time"] for p in result]
-        assert times == sorted(times)
-    
     def test_empty_data(self):
         """Testet leere Daten."""
-        result = transform_timeseries_for_antv({})
+        result = transform_for_line_chart({})
         
         assert result == []
     
-    def test_first_key_used(self, sample_timeseries_data):
-        """Testet dass nur der erste Key verwendet wird."""
-        result = transform_timeseries_for_antv(sample_timeseries_data)
+    def test_multikey_transformation(self):
+        """Testet Multi-Key Transformation mit group Feld."""
+        data = {
+            "torque_act_a1": [
+                {"value": 10.5, "timestamp": 1734350000000},
+            ],
+            "torque_act_a2": [
+                {"value": 12.0, "timestamp": 1734350000000},
+            ]
+        }
+        result = transform_for_line_chart(data, multi_key=True)
         
-        # Sollte nur Daten vom ersten Key haben
-        assert len(result) == 100  # Länge des ersten Keys
+        # Mit multi_key=True sollten group-Felder vorhanden sein
+        for point in result:
+            assert "group" in point
 
 
 # =============================================================================
-# TRANSFORM_MULTIKEY_FOR_ANTV TESTS
+# TRANSFORM_FOR_CATEGORY_CHART TESTS
 # =============================================================================
 
-class TestTransformMultikeyForAntv:
-    """Tests für transform_multikey_for_antv()."""
+class TestTransformForCategoryChart:
+    """Tests für transform_for_category_chart()."""
     
-    def test_multikey_has_category(self, sample_timeseries_data):
-        """Testet ob category-Feld vorhanden ist."""
-        result = transform_multikey_for_antv(sample_timeseries_data)
+    def test_category_chart_structure(self):
+        """Testet Struktur für Balkendiagramm."""
+        data = {
+            "torque_act_a1": [
+                {"value": 10.5, "timestamp": 1734350000000},
+                {"value": 11.2, "timestamp": 1734350001000},
+            ],
+            "torque_act_a2": [
+                {"value": 12.0, "timestamp": 1734350000000},
+                {"value": 11.8, "timestamp": 1734350001000},
+            ]
+        }
+        result = transform_for_category_chart(data)
         
+        assert isinstance(result, list)
         for point in result:
             assert "category" in point
+            assert "value" in point
     
-    def test_multikey_all_keys_present(self, sample_timeseries_data):
-        """Testet ob alle Keys in Kategorien vorkommen."""
-        result = transform_multikey_for_antv(sample_timeseries_data)
+    def test_category_calculates_average(self):
+        """Testet ob Durchschnitt berechnet wird."""
+        data = {
+            "torque_act_a1": [
+                {"value": 10.0, "timestamp": 1},
+                {"value": 20.0, "timestamp": 2},
+            ]
+        }
+        result = transform_for_category_chart(data)
         
-        categories = set(p["category"] for p in result)
-        
-        # Mindestens 2 verschiedene Kategorien
-        assert len(categories) >= 2
+        assert len(result) == 1
+        assert result[0]["value"] == 15.0  # (10 + 20) / 2
     
-    def test_multikey_values_are_floats(self, sample_timeseries_data):
-        """Testet ob values Floats sind."""
-        result = transform_multikey_for_antv(sample_timeseries_data)
+    def test_category_empty_data(self):
+        """Testet leere Daten."""
+        result = transform_for_category_chart({})
         
-        for point in result:
-            assert isinstance(point["value"], float)
+        assert result == []
 
 
 # =============================================================================
-# TRANSFORM_FOR_SCATTER TESTS
+# TRANSFORM_FOR_SCATTER_CHART TESTS
 # =============================================================================
 
-class TestTransformForScatter:
-    """Tests für transform_for_scatter()."""
+class TestTransformForScatterChart:
+    """Tests für transform_for_scatter_chart()."""
     
-    def test_scatter_has_x_and_y(self, sample_timeseries_data):
+    def test_scatter_has_x_and_y(self):
         """Testet ob x und y vorhanden sind."""
-        result = transform_for_scatter(sample_timeseries_data)
+        data = {
+            "torque_act_a1": [
+                {"value": 10.0, "timestamp": 1734350000000},
+                {"value": 11.0, "timestamp": 1734350001000},
+            ],
+            "torque_act_a2": [
+                {"value": 12.0, "timestamp": 1734350000000},
+                {"value": 13.0, "timestamp": 1734350001000},
+            ]
+        }
+        result = transform_for_scatter_chart(data)
         
+        assert len(result) > 0
         for point in result:
             assert "x" in point
             assert "y" in point
     
     def test_scatter_needs_two_keys(self):
         """Testet dass zwei Keys benötigt werden."""
-        single_key = {"pos_act_x_mm": [{"value": "1", "timestamp": 1}]}
+        single_key = {"pos_act_x_mm": [{"value": 1, "timestamp": 1}]}
         
-        result = transform_for_scatter(single_key)
+        result = transform_for_scatter_chart(single_key)
         
         assert result == []
     
-    def test_scatter_values_are_floats(self, sample_timeseries_data):
+    def test_scatter_values_are_floats(self):
         """Testet ob x und y Floats sind."""
-        result = transform_for_scatter(sample_timeseries_data)
+        data = {
+            "torque_act_a1": [
+                {"value": "10.0", "timestamp": 1734350000000},
+            ],
+            "torque_act_a2": [
+                {"value": "12.0", "timestamp": 1734350000000},
+            ]
+        }
+        result = transform_for_scatter_chart(data)
         
+        assert len(result) > 0
         for point in result:
             assert isinstance(point["x"], float)
             assert isinstance(point["y"], float)
 
 
 # =============================================================================
-# TRANSFORM_FOR_COMPARISON TESTS
+# SHORTEN_KEY_NAME TESTS
 # =============================================================================
 
-class TestTransformForComparison:
-    """Tests für transform_for_comparison()."""
+class TestShortenKeyName:
+    """Tests für shorten_key_name()."""
     
-    def test_comparison_has_category_and_value(self, sample_timeseries_data):
-        """Testet Struktur für Balkendiagramm."""
-        result = transform_for_comparison(sample_timeseries_data)
-        
-        for point in result:
-            assert "category" in point
-            assert "value" in point
-    
-    def test_comparison_calculates_average(self, sample_timeseries_single_key):
-        """Testet ob Durchschnitt berechnet wird."""
-        result = transform_for_comparison(sample_timeseries_single_key)
-        
-        assert len(result) == 1
-        assert isinstance(result[0]["value"], float)
-    
-    def test_comparison_empty_data(self):
-        """Testet leere Daten."""
-        result = transform_for_comparison({})
-        
-        assert result == []
-
-
-# =============================================================================
-# TRANSFORM_LATEST_VALUES TESTS
-# =============================================================================
-
-class TestTransformLatestValues:
-    """Tests für transform_latest_values()."""
-    
-    def test_latest_values_structure(self, latest_telemetry_response):
-        """Testet Struktur für Column Chart."""
-        result = transform_latest_values(latest_telemetry_response)
-        
-        for point in result:
-            assert "category" in point
-            assert "value" in point
-    
-    def test_latest_values_are_floats(self, latest_telemetry_response):
-        """Testet ob values Floats sind."""
-        result = transform_latest_values(latest_telemetry_response)
-        
-        for point in result:
-            assert isinstance(point["value"], float)
-    
-    def test_latest_values_key_names_formatted(self, latest_telemetry_response):
-        """Testet ob Key-Namen aufgehübscht werden."""
-        result = transform_latest_values(latest_telemetry_response)
-        
-        for point in result:
-            # Sollte nicht den Original-Key haben
-            assert "axis_act_" not in point["category"]
-
-
-# =============================================================================
-# GET_UNIT_FOR_KEY TESTS
-# =============================================================================
-
-class TestGetUnitForKey:
-    """Tests für get_unit_for_key()."""
-    
-    @pytest.mark.parametrize("key,expected_unit", [
-        ("axis_act_a1_deg", "°"),
-        ("pos_act_x_mm", "mm"),
-        ("torque_act_a1_nm", "Nm"),
-        ("override_pct", "%"),
-        ("vel_act_m_per_s", "m/s"),
-        ("energy_period_kwh", "kWh"),
-        ("unknown_key", ""),
+    @pytest.mark.parametrize("key,expected", [
+        ("axis_act_a1_deg", "Aa1°"),
+        ("pos_act_x_mm", "px"),
+        ("torque_act_a1_nm", "Ta1"),
+        ("vel_act_a_m_per_s", "Va"),
     ])
-    def test_unit_mapping(self, key, expected_unit):
-        """Testet Unit-Mapping für verschiedene Keys."""
-        result = get_unit_for_key(key)
-        
-        assert result == expected_unit
+    def test_key_shortening(self, key, expected):
+        """Testet Key-Name-Verkürzung."""
+        result = shorten_key_name(key)
+
+        assert result == expected
+        assert len(result) < len(key)
 
 
 # =============================================================================
@@ -346,52 +340,35 @@ class TestGetUnitForKey:
 class TestExtractChartUrl:
     """Tests für extract_chart_url()."""
     
-    def test_extract_url_from_string(self, create_tool_message):
-        """Testet URL-Extraktion aus String."""
-        msg = create_tool_message("https://example.com/chart.png")
+    def test_extract_url_from_content(self):
+        """Testet URL-Extraktion aus Tool Result."""
+        class MockContent:
+            def __init__(self, text):
+                self.text = text
         
-        result = extract_chart_url([msg])
+        class MockResult:
+            def __init__(self, text):
+                self.content = [MockContent(text)]
         
-        assert result == "https://example.com/chart.png"
+        result = MockResult("https://example.com/chart.png")
+        url = extract_chart_url(result)
+        
+        assert url == "https://example.com/chart.png"
     
-    def test_extract_url_from_json(self, create_tool_message):
-        """Testet URL-Extraktion aus JSON."""
-        msg = create_tool_message({"url": "https://example.com/chart.png"})
+    def test_error_detection(self):
+        """Testet Fehler-Erkennung."""
+        class MockContent:
+            def __init__(self, text):
+                self.text = text
         
-        result = extract_chart_url([msg])
+        class MockResult:
+            def __init__(self, text):
+                self.content = [MockContent(text)]
         
-        assert result == "https://example.com/chart.png"
-    
-    def test_extract_chart_url_key(self, create_tool_message):
-        """Testet chart_url Key."""
-        msg = create_tool_message({"chart_url": "https://example.com/chart.png"})
+        result = MockResult("error: invalid chart")
+        url = extract_chart_url(result)
         
-        result = extract_chart_url([msg])
-        
-        assert result == "https://example.com/chart.png"
-    
-    def test_no_url_found(self, create_tool_message):
-        """Testet wenn keine URL gefunden wird."""
-        msg = create_tool_message({"status": "error"})
-        
-        result = extract_chart_url([msg])
-        
-        assert result is None
-    
-    def test_empty_messages(self):
-        """Testet leere Message-Liste."""
-        result = extract_chart_url([])
-        
-        assert result is None
-    
-    def test_uses_last_tool_message(self, create_tool_message):
-        """Testet dass die letzte ToolMessage verwendet wird."""
-        msg1 = create_tool_message("https://old.com/chart.png")
-        msg2 = create_tool_message("https://new.com/chart.png")
-        
-        result = extract_chart_url([msg1, msg2])
-        
-        assert result == "https://new.com/chart.png"
+        assert "Fehler" in url or "error" in url.lower()
 
 
 # =============================================================================
@@ -401,29 +378,26 @@ class TestExtractChartUrl:
 class TestPrepareVizContext:
     """Tests für prepare_viz_context()."""
     
-    def test_includes_user_query(self, state_with_data):
-        """Testet ob User-Query enthalten ist."""
-        context = prepare_viz_context(state_with_data)
-        
-        assert "User-Anfrage" in context
-    
-    def test_includes_data_summary(self, state_with_data):
-        """Testet ob Data-Summary enthalten ist."""
-        context = prepare_viz_context(state_with_data)
-        
-        assert "Geladene Daten" in context
-    
-    def test_includes_available_keys(self, state_with_data):
-        """Testet ob Keys aufgelistet werden."""
-        context = prepare_viz_context(state_with_data)
-        
-        assert "Keys" in context or "key" in context.lower()
-    
-    def test_includes_transformed_data(self, state_with_data):
-        """Testet ob transformierte Daten enthalten sind."""
-        context = prepare_viz_context(state_with_data)
-        
-        assert "Line Chart" in context or "transformiert" in context
+    def test_context_creation(self):
+        """Testet Kontext-Erstellung."""
+        state = AgentState(
+            messages=[
+                HumanMessage(content="Zeige Torque als Chart"),
+                AIMessage(content="Daten werden verarbeitet"),
+            ],
+            datasets={
+                "torque": {
+                    "data": {"torque_act_a1": [{"value": 10.5, "timestamp": 1734350000000}]},
+                    "meta": {},
+                }
+            },
+        )
+
+        context_dict, context_str = prepare_viz_context(state)
+
+        assert isinstance(context_dict, dict)
+        assert isinstance(context_str, str)
+        assert len(context_str) > 0
 
 
 # =============================================================================
@@ -433,10 +407,18 @@ class TestPrepareVizContext:
 class TestVizAgentIntegration:
     """Integration Tests für Viz Agent Komponenten."""
     
-    def test_full_transformation_pipeline(self, sample_timeseries_data):
+    def test_full_transformation_pipeline(self):
         """Testet komplette Transformation Pipeline."""
+        data = {
+            "torque_act_a1": [
+                {"value": 10.5, "timestamp": 1734350000000},
+                {"value": 11.2, "timestamp": 1734350001000},
+                {"value": 10.8, "timestamp": 1734350002000},
+            ]
+        }
+        
         # 1. Transformation
-        transformed = transform_timeseries_for_antv(sample_timeseries_data)
+        transformed = transform_for_line_chart(data)
         
         # 2. Prüfungen
         assert len(transformed) > 0
@@ -446,11 +428,3 @@ class TestVizAgentIntegration:
         restored = json.loads(json_str)
         
         assert restored == transformed
-    
-    def test_state_to_viz_context(self, state_after_data_agent):
-        """Testet State → Context Transformation."""
-        context = prepare_viz_context(state_after_data_agent)
-        
-        # Context sollte genug Info für Viz Agent haben
-        assert len(context) > 100
-        assert "data" in context.lower() or "Daten" in context

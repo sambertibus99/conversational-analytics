@@ -23,7 +23,7 @@ from agents.supervisor import (
     parse_supervisor_response,
     validate_plan,
     extract_user_query,
-    build_dataset_context,
+    build_turn_context,
 )
 from agents.state import AgentState
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -487,46 +487,140 @@ class TestParseNeedsUserInput:
 
 
 # =============================================================================
-# DEC-028: BUILD_DATASET_CONTEXT (kompakt, nur Summary)
+# DEC-029: BUILD_TURN_CONTEXT (ersetzt build_dataset_context)
 # =============================================================================
 
-class TestBuildDatasetContext:
-    """Tests für build_dataset_context — DEC-028: nur kompakter Summary."""
+class TestBuildTurnContext:
+    """Tests für build_turn_context — DEC-029: turn_history statt data_summary."""
 
-    def test_empty_datasets_and_summary(self):
-        """Testet leere Datasets und leeren Summary."""
-        result = build_dataset_context({}, "")
+    def test_empty_history_and_datasets(self):
+        """Leere History + leere Datasets → leerer String."""
+        result = build_turn_context([], {})
 
         assert result == ""
 
-    def test_shows_summary_only(self):
-        """DEC-028: Zeigt nur data_summary, keine Dataset-Keys."""
-        datasets = {
-            "krc5/torque_actual/timeseries/overview": {
-                "dataset_key": "krc5/torque_actual/timeseries/overview",
-                "keys": ["torque_act_a1_nm"],
-                "point_count": 240,
-            }
-        }
+    def test_single_turn(self):
+        """Einzelner Turn → korrektes Format."""
+        history = [{
+            "user_query": "Zeige Drehmomente",
+            "plan": ["data_agent"],
+            "datasets": [{"keys": ["torque_act_a1_nm"], "timerange": "14:00 - 15:00"}],
+            "result_type": "data",
+            "result_summary": "Drehmomente: 240 Punkte",
+        }]
 
-        result = build_dataset_context(datasets, "Drehmomente: 240 Punkte")
+        result = build_turn_context(history, {})
 
+        assert "BISHERIGER VERLAUF" in result
+        assert 'Turn 1: "Zeige Drehmomente"' in result
+        assert "torque_act_a1_nm" in result
+        assert "14:00 - 15:00" in result
         assert "Drehmomente: 240 Punkte" in result
-        assert "data_agent" in result  # Hinweis dass data_agent entscheidet
-        # Keine detaillierten Keys mehr:
-        assert "torque_act_a1_nm" not in result
 
-    def test_with_datasets_no_summary(self):
-        """Testet mit Datasets aber ohne Summary."""
-        datasets = {"some_key": {"dataset_key": "some_key"}}
+    def test_multiple_turns(self):
+        """Mehrere Turns → alle dargestellt."""
+        history = [
+            {"user_query": "Zeige Drehmomente", "plan": ["data_agent"], "result_type": "data"},
+            {"user_query": "Zeig als Chart", "plan": ["data_agent", "viz_agent"], "result_type": "chart"},
+        ]
 
-        result = build_dataset_context(datasets, "")
+        result = build_turn_context(history, {})
 
+        assert "Turn 1" in result
+        assert "Turn 2" in result
+        assert "Zeige Drehmomente" in result
+        assert "Zeig als Chart" in result
+
+    def test_max_15_turns_displayed(self):
+        """Max 15 Turns angezeigt (bei 20 gespeicherten)."""
+        history = [{"user_query": f"Query {i}", "plan": [], "result_type": "data"} for i in range(20)]
+
+        result = build_turn_context(history, {})
+
+        # Nur die letzten 15 angezeigt
+        assert "Turn 15" in result
+        assert "Turn 16" not in result
+        # Erste 5 abgeschnitten — Turn 1 zeigt Query 5 (0-indexed)
+        assert 'Turn 1: "Query 5"' in result
+
+    def test_fallback_datasets_without_history(self):
+        """Fallback: Datasets ohne History → 'Daten vorhanden'."""
+        datasets = {"krc5/torque/ts": {"dataset_key": "krc5/torque/ts"}}
+
+        result = build_turn_context([], datasets)
+
+        assert "VORHANDENE DATEN" in result
         assert "Daten vorhanden" in result
-        assert "data_agent" in result
 
-    def test_no_datasets_with_summary(self):
-        """Testet ohne Datasets aber mit Summary (aus vorherigem Turn)."""
-        result = build_dataset_context({}, "Torque: 120 Punkte")
+    def test_datasets_same_timerange(self):
+        """Turn mit gleichem Zeitraum → eine 'Daten:'-Zeile."""
+        history = [{
+            "user_query": "Korrelation",
+            "plan": ["data_agent", "stats_agent"],
+            "datasets": [
+                {"keys": ["torque_act_a1_nm", "axis_act_a1_deg"], "timerange": "14:00 - 15:00"},
+            ],
+            "result_type": "statistics",
+        }]
 
-        assert result == ""  # Kein Kontext wenn keine Datasets
+        result = build_turn_context(history, {})
+
+        # Beide Keys in einer Zeile
+        assert "torque_act_a1_nm, axis_act_a1_deg" in result
+        assert result.count("Daten:") == 1
+
+    def test_datasets_different_timeranges(self):
+        """Turn mit verschiedenen Zeiträumen → separate 'Daten:'-Zeilen."""
+        history = [{
+            "user_query": "Vergleiche",
+            "plan": ["data_agent", "stats_agent"],
+            "datasets": [
+                {"keys": ["torque_act_a1_nm"], "timerange": "11.02. 00:00-23:59"},
+                {"keys": ["vel_act_m_per_s"], "timerange": "10.02. 00:00-23:59"},
+            ],
+            "result_type": "statistics",
+        }]
+
+        result = build_turn_context(history, {})
+
+        assert result.count("Daten:") == 2
+        assert "torque_act_a1_nm" in result
+        assert "vel_act_m_per_s" in result
+
+    def test_keys_truncated_at_8(self):
+        """Maximal 8 Keys pro Daten-Zeile."""
+        many_keys = [f"key_{i}" for i in range(12)]
+        history = [{
+            "user_query": "Alle Keys",
+            "plan": ["data_agent"],
+            "datasets": [{"keys": many_keys, "timerange": "14:00 - 15:00"}],
+            "result_type": "data",
+        }]
+
+        result = build_turn_context(history, {})
+
+        # key_0 bis key_7 sollen drin sein, key_8+ nicht
+        assert "key_7" in result
+        assert "key_8" not in result
+
+    def test_plan_shown(self):
+        """Plan wird angezeigt."""
+        history = [{
+            "user_query": "Test",
+            "plan": ["data_agent", "stats_agent"],
+            "result_type": "data",
+        }]
+
+        result = build_turn_context(history, {})
+
+        assert "['data_agent', 'stats_agent']" in result
+
+    def test_history_takes_precedence_over_fallback(self):
+        """Wenn History vorhanden, wird Fallback nicht gezeigt."""
+        history = [{"user_query": "Test", "plan": [], "result_type": "data"}]
+        datasets = {"key": {"dataset_key": "key"}}
+
+        result = build_turn_context(history, datasets)
+
+        assert "BISHERIGER VERLAUF" in result
+        assert "VORHANDENE DATEN" not in result
