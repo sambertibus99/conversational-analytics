@@ -353,8 +353,6 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
             "statistics_summary": None,
             "error": None,
             "error_count": 0,
-            "should_abstain": False,
-            "abstain_reason": None,
             "messages": [AIMessage(content=f"Plan erstellt: {final_plan}")],
         }
     

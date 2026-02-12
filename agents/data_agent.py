@@ -1319,7 +1319,6 @@ def build_result(
         "messages": result.get("messages", []),
         "datasets": new_datasets,
         "data_summary": summary,
-        "current_data_file": data_file,
         "active_dataset_keys": active_keys or None,  # DEC-028
         "needs_user_input": needs_input,
         "user_input_reason": input_reason,

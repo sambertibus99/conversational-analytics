@@ -170,10 +170,6 @@ class AgentState(MessagesState):
     # Bleibt aktiv für respond_node und Backward-Compat.
     data_summary: Annotated[str, merge_summaries] = ""
     
-    # Pfad zur aktuellen Datendatei (für Viz/Stats Agent)
-    # Wird pro Turn überschrieben
-    current_data_file: str | None = None
-
     # === Turn History (DEC-029) ===
     # Strukturierte Zusammenfassungen vergangener Turns für Supervisor-Kontext
     turn_history: Annotated[list[dict], append_turn_history] = []
@@ -202,8 +198,5 @@ class AgentState(MessagesState):
     # === Error Handling (DEC-017) ===
     error: str | None = None
     error_count: int = 0  # Anzahl aufgetretener Fehler
-    should_abstain: bool = False
-    abstain_reason: str | None = None
-    
     # === Cycle Guard (DEC-017) ===
     max_steps: int = 10  # Maximale Schritte bevor Notfall-Exit
