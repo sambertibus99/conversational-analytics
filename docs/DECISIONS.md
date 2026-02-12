@@ -2158,9 +2158,13 @@ if needs_data and not has_data_agent:
 # Neue Daten geladen → Keys der neuen Datasets
 active_keys = [key for key in new_datasets]
 
-# Keine neuen Daten (check_dataset: vorhanden) → found-Keys als Fallback
-if not active_keys and check_dataset_keys:
-    active_keys = check_dataset_keys
+# check_dataset found-Keys IMMER mergen (nicht nur Fallback!)
+# Szenario: check_dataset findet Key A in DuckDB, Data Agent lädt Key B neu.
+# Ohne Merge fehlt Key A in active_dataset_keys → Stats/Viz Agent sieht ihn nicht.
+if check_dataset_keys:
+    for ck in check_dataset_keys:
+        if ck not in active_keys:
+            active_keys.append(ck)
 ```
 
 **4. Lifecycle pro Turn:**

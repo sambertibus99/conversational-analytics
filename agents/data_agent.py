@@ -1237,10 +1237,14 @@ def build_result(
         new_datasets[key] = meta_entry
         active_keys.append(key)
 
-    # DEC-028: Wenn keine neuen Daten geladen → check_dataset found-Keys verwenden
-    if not active_keys and check_dataset_keys:
-        active_keys = check_dataset_keys
-        logger.info(f"active_dataset_keys aus check_dataset: {active_keys}")
+    # DEC-028: check_dataset found-Keys IMMER mergen (nicht nur Fallback!)
+    # Szenario: check_dataset findet Key A in DuckDB, Data Agent lädt Key B neu.
+    # Ohne Merge fehlt Key A in active_dataset_keys → Stats/Viz Agent sieht ihn nicht.
+    if check_dataset_keys:
+        for ck in check_dataset_keys:
+            if ck not in active_keys:
+                active_keys.append(ck)
+        logger.info(f"active_dataset_keys nach check_dataset merge: {active_keys}")
 
     return {
         "messages": result.get("messages", []),
