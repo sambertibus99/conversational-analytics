@@ -63,12 +63,12 @@ User → Chainlit (app.py) → LangGraph (graph.py)
 
 **Agent Routing:** Supervisor creates plan like `["data_agent", "viz_agent"]` or `["data_agent", "stats_agent"]`. Agents execute sequentially, sharing data via `AgentState`. Supervisor sets `data_retrieval_mode`: `"raw"` for stats/correlation queries, `"aggregated"` for visualization (DEC-023). Data Agent always runs when viz/stats are planned (DEC-028).
 
-**Multi-Turn Persistence (DEC-013):** `app.py` generates a UUID `thread_id` per chat session and passes it as `config={"configurable": {"thread_id": ...}}` to `graph.ainvoke()`. The `InMemorySaver` checkpointer keeps `datasets` and `data_summary` across turns via custom reducers (`merge_datasets`, `merge_summaries`).
+**Multi-Turn Persistence (DEC-013):** `app.py` generates a UUID `thread_id` per chat session and passes it as `config={"configurable": {"thread_id": ...}}` to `graph.ainvoke()`. The `InMemorySaver` checkpointer keeps `datasets` and `turn_history` across turns via custom reducers (`merge_datasets`, `append_turn_history`).
 
 **State Flow (DEC-013, DEC-025):**
 1. Agents write to `AgentState` (state.py) with reducers:
    - `datasets`: Dict of `DatasetMeta` references (e.g., `{"krc5/torque/timeseries": DatasetMeta}`) - **accumulates across turns**
-   - `data_summary`: Short text for LLM context - **accumulates across turns**
+   - `turn_history`: Structured turn summaries for supervisor context - **accumulates across turns**
    - `chart_url`, `statistics`: Per-turn outputs - **overwritten each turn**
    - `session_id`: DuckDB SessionStore ID (set by app.py, matches thread_id)
 2. Raw data stored in DuckDB `SessionStore` (in-memory, per session) — only `DatasetMeta` in State (DEC-025)

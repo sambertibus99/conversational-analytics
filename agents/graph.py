@@ -580,7 +580,7 @@ async def run_query(
         session_id: DuckDB SessionStore ID (DEC-025, default: thread_id)
 
     Returns:
-        dict mit response, plan, data_summary, statistics, chart_url, etc.
+        dict mit response, plan, statistics, chart_url, etc.
     """
     graph = get_graph()
 
@@ -626,7 +626,6 @@ async def run_query(
         "response": final_response,
         "plan": result.get("plan", []),
         "reasoning": result.get("reasoning"),
-        "data_summary": result.get("data_summary"),
         "statistics": result.get("statistics"),
         "statistics_summary": result.get("statistics_summary"),
         "chart_url": result.get("chart_url"),
@@ -669,9 +668,6 @@ async def test_graph():
             print(f"\n📋 Plan: {result['plan']}")
             if result.get('reasoning'):
                 print(f"💭 Reasoning: {result['reasoning']}")
-            
-            if result.get('data_summary'):
-                print(f"📊 Daten: {result['data_summary']}")
             
             if result.get('chart_url'):
                 print(f"🖼️  Chart: {result['chart_url']}")

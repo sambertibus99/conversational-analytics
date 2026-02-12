@@ -107,29 +107,6 @@ def merge_datasets(existing: dict[str, Any] | None, new: dict[str, Any] | None) 
     return {**existing, **new}
 
 
-def merge_summaries(existing: str | None, new: str | None) -> str:
-    """
-    Reducer für data_summary: Kombiniert Zusammenfassungen.
-    
-    Beispiel:
-        existing = "Drehmomente: 210 Punkte"
-        new = "Geschwindigkeit: 35 Punkte"
-        result = "Drehmomente: 210 Punkte | Geschwindigkeit: 35 Punkte"
-    """
-    if existing is None and new is None:
-        return ""
-    if existing is None or existing == "":
-        return new or ""
-    if new is None or new == "":
-        return existing
-    
-    # Kombiniere mit Separator, vermeide Duplikate
-    existing_parts = set(existing.split(" | "))
-    new_parts = set(new.split(" | "))
-    combined = existing_parts | new_parts
-    return " | ".join(sorted(combined))
-
-
 class AgentState(MessagesState):
     """
     Gemeinsamer State für alle Agents.
@@ -137,8 +114,8 @@ class AgentState(MessagesState):
     Erbt von MessagesState, das bereits `messages: list[BaseMessage]` enthält
     mit add_messages Reducer (akkumuliert automatisch).
     
-    WICHTIG: 
-    - datasets und data_summary haben Reducer → akkumulieren über Turns
+    WICHTIG:
+    - datasets und turn_history haben Reducer → akkumulieren über Turns
     - Andere Felder werden überschrieben (plan, chart_url, etc.)
     """
     
@@ -165,10 +142,6 @@ class AgentState(MessagesState):
     # DEC-025: Nur noch DatasetMeta (Referenzen), Rohdaten in DuckDB SessionStore
     # Format: {"krc5/torque/timeseries/2h": DatasetMeta, ...}
     datasets: Annotated[dict[str, Any], merge_datasets] = {}
-    
-    # DEPRECATED (DEC-029): Wird für Supervisor durch turn_history ersetzt.
-    # Bleibt aktiv für respond_node und Backward-Compat.
-    data_summary: Annotated[str, merge_summaries] = ""
     
     # === Turn History (DEC-029) ===
     # Strukturierte Zusammenfassungen vergangener Turns für Supervisor-Kontext

@@ -1,7 +1,7 @@
 """
 Tests für Data Agent Parsing-Funktionen.
 
-Testet extract_data_from_parsed() und generate_data_summary()
+Testet extract_data_from_parsed()
 mit allen bekannten Response-Formaten.
 
 Referenz: docs/AP9_DEBUGGING_TESTING.md Abschnitt 2
@@ -19,7 +19,6 @@ from unittest.mock import patch, MagicMock
 
 from agents.data_agent import (
     extract_data_from_parsed,
-    generate_data_summary,
     extract_text_from_tool_content,
     parse_json_safe,
     load_data_from_file,
@@ -324,91 +323,6 @@ class TestExtractEdgeCases:
 # =============================================================================
 # GENERATE_DATA_SUMMARY TESTS
 # =============================================================================
-
-class TestGenerateDataSummary:
-    """Tests für generate_data_summary()."""
-    
-    def test_no_data_summary(self):
-        """Testet Summary für no_data."""
-        meta = {
-            "type": "no_data",
-            "message": "Keine Daten gefunden",
-            "requested_timerange": {
-                "weekday": "Mittwoch",
-                "start": "17.12.2025 13:00",
-                "end": "17.12.2025 13:10",
-            },
-        }
-
-        summary = generate_data_summary(None, meta)
-
-        assert "KEINE DATEN" in summary
-        assert "Keine Daten gefunden" in summary
-
-    def test_data_availability_summary(self):
-        """Testet Summary für data_availability."""
-        meta = {
-            "type": "data_availability",
-            "data_range": {
-                "first_data": "16.12.2025 11:56",
-                "first_weekday": "Dienstag",
-                "last_data": "16.12.2025 18:36",
-                "last_weekday": "Dienstag",
-            },
-            "total_points": 24000,
-        }
-
-        summary = generate_data_summary({}, meta)
-
-        assert "VERFÜGBAR" in summary
-        assert "16.12.2025" in summary
-
-    def test_success_with_statistics_summary(self):
-        """Testet Summary für success mit Statistiken."""
-        meta = {
-            "type": "success",
-            "timerange": {
-                "weekday": "Dienstag",
-                "start": "16.12.2025 12:00",
-                "end": "16.12.2025 12:10",
-            },
-            "statistics": {
-                "pos_act_x_mm": {
-                    "avg": 94.789,
-                    "min": 94.123,
-                    "max": 95.456,
-                    "count": 627,
-                }
-            },
-        }
-
-        summary = generate_data_summary({"pos_act_x_mm": []}, meta)
-
-        assert "pos_act_x_mm" in summary
-        assert "627" in summary
-
-    def test_latest_telemetry_summary(self, latest_telemetry_response):
-        """Testet Summary für latest telemetry."""
-        meta = {"type": "latest", "data_points": {"axis_act_a1_deg": 1}}
-
-        summary = generate_data_summary(latest_telemetry_response, meta)
-
-        assert "Aktuelle Werte" in summary
-
-    def test_list_summary(self, telemetry_keys_response):
-        """Testet Summary für Listen."""
-        meta = {"type": "list", "count": len(telemetry_keys_response)}
-
-        summary = generate_data_summary(telemetry_keys_response, meta)
-
-        assert len(summary) > 0
-    
-    def test_none_data_none_meta(self):
-        """Testet Summary für None/None."""
-        summary = generate_data_summary(None, None)
-        
-        assert "Keine Daten" in summary
-
 
 # =============================================================================
 # LOAD_DATA_FROM_FILE TESTS

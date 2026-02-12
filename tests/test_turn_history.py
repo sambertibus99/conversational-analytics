@@ -337,7 +337,6 @@ class TestBuildTurnEntry:
             messages=[HumanMessage(content="Zeige aktuelle Drehmomente")],
             plan=["data_agent"],
             data_retrieval_mode="overview",
-            data_summary="Drehmomente: 100 Punkte",
         )
 
         entry = _build_turn_entry(state)
@@ -580,7 +579,6 @@ class TestTurnHistoryIntegration:
             messages=[HumanMessage(content="Zeige Drehmomente A1 vom 4. Februar 14:20-15:00")],
             plan=["data_agent"],
             data_retrieval_mode="overview",
-            data_summary="Drehmomente: 240 Punkte",
             datasets={
                 "krc5/torque/ts": {
                     "dataset_key": "krc5/torque/ts",

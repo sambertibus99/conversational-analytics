@@ -49,8 +49,8 @@ class TestDataAgentHappyPath:
         assert result.get("error") is None, f"Fehler: {result.get('error')}"
         
         # Daten oder Summary vorhanden
-        has_data = result.get("data") is not None or result.get("data_summary") is not None
-        assert has_data, "Weder data noch data_summary vorhanden"
+        has_data = result.get("data") is not None or result.get("datasets")
+        assert has_data, "Weder data noch datasets vorhanden"
     
     async def test_list_telemetry_keys(self):
         """Testet Auflistung der Telemetrie-Keys."""
@@ -85,10 +85,10 @@ class TestDataAgentHappyPath:
         
         assert result.get("error") is None
         
-        # Summary sollte Zeitraum oder "keine Daten" enthalten
-        summary = result.get("data_summary", "")
-        has_info = "VERFÜGBAR" in summary or "keine" in summary.lower() or "Daten" in summary
-        assert has_info, f"Summary enthält keine Zeitraum-Info: {summary}"
+        # Meta sollte Info über Verfügbarkeit enthalten
+        meta = result.get("data_meta", {})
+        has_info = meta.get("type") in ("data_availability", "no_data", "success") or result.get("datasets")
+        assert has_info, f"Keine Zeitraum-Info. Meta: {meta}"
 
 
 # =============================================================================
@@ -130,7 +130,6 @@ class TestDataVizPipeline:
         viz_state = AgentState(
             messages=[HumanMessage(content="Zeig als Liniendiagramm")],
             data=data_result.get("data"),
-            data_summary=data_result.get("data_summary"),
             data_meta=data_result.get("data_meta"),
         )
         
@@ -205,7 +204,6 @@ class TestStatsAgentHappyPath:
         state = AgentState(
             messages=[HumanMessage(content="Was ist die Durchschnittstemperatur?")],
             data=test_data,
-            data_summary="50 Temperaturwerte",
         )
         
         result = await run_stats_agent(state)

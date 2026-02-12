@@ -127,53 +127,6 @@ class TestLargeDatasets:
 # SUMMARY TESTS
 # =============================================================================
 
-class TestDataSummary:
-    """Tests für Daten-Zusammenfassungen."""
-    
-    def test_summary_size_limit(self):
-        """Prüft dass Summary < 500 Bytes ist."""
-        from agents.data_agent import generate_data_summary
-        
-        meta = {
-            "type": "success",
-            "statistics": {
-                "pos_act_x_mm": {
-                    "avg": 94.789,
-                    "min": 94.123,
-                    "max": 95.456,
-                    "count": 10000,
-                }
-            },
-            "timerange": {
-                "weekday": "Dienstag",
-                "start": "16.12.2025 12:00",
-                "end": "16.12.2025 18:00",
-            },
-        }
-        
-        summary = generate_data_summary({"pos_act_x_mm": []}, meta)
-        
-        assert len(summary.encode('utf-8')) < 500, \
-            f"Summary ist {len(summary.encode('utf-8'))} bytes, sollte < 500 sein"
-    
-    def test_summary_contains_key_info(self):
-        """Prüft dass Summary wichtige Infos enthält."""
-        from agents.data_agent import generate_data_summary
-
-        meta = {
-            "type": "success",
-            "statistics": {
-                "pos_act_x_mm": {"avg": 94.789, "min": 94.0, "max": 95.0, "count": 100}
-            },
-            "timerange": {"weekday": "Dienstag", "start": "12:00", "end": "12:10"},
-        }
-
-        summary = generate_data_summary({}, meta)
-
-        # Sollte Key-Name enthalten
-        assert "pos_act_x_mm" in summary
-        # Sollte Anzahl Punkte enthalten
-        assert "100" in summary
 
 
 # =============================================================================
@@ -230,10 +183,6 @@ class TestStateDataFlow:
         """Prüft dass Viz Agent Daten aus State liest."""
         # state.data sollte gefüllt sein
         assert state_after_data_agent.get("data") is not None
-        
-        # data_summary sollte kurz sein
-        summary = state_after_data_agent.get("data_summary", "")
-        assert len(summary) < 500
 
 
 # =============================================================================
@@ -252,23 +201,3 @@ class TestMemoryEstimates:
         
         assert 900 <= estimated_tokens <= 1100
     
-    def test_summary_fits_in_context(self):
-        """Prüft dass Summary in Context passt."""
-        from agents.data_agent import generate_data_summary
-        
-        # Maximale Summary generieren
-        meta = {
-            "type": "success",
-            "statistics": {
-                f"key_{i}": {"avg": i, "min": 0, "max": 100, "count": 1000}
-                for i in range(10)  # 10 Keys
-            },
-            "timerange": {"weekday": "Dienstag", "start": "12:00", "end": "18:00"},
-        }
-        
-        summary = generate_data_summary({}, meta)
-        estimated_tokens = len(summary) / 4
-        
-        # Sollte < 500 tokens sein (von ~100k Context)
-        assert estimated_tokens < 500, \
-            f"Summary verbraucht ~{estimated_tokens} tokens"

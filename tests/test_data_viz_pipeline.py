@@ -45,7 +45,7 @@ async def run_pipeline_test(query: str, viz_instruction: str = "Zeig das als Lin
     
     data_result = await run_data_agent(data_state)
     
-    print(f"   Summary: {data_result.get('data_summary', 'N/A')}")
+    print(f"   Datasets: {list(data_result.get('datasets', {}).keys())}")
     print(f"   Meta: {data_result.get('data_meta', 'N/A')}")
     
     if data_result.get("error"):
@@ -74,11 +74,10 @@ async def run_pipeline_test(query: str, viz_instruction: str = "Zeig das als Lin
     viz_state = AgentState(
         messages=[
             HumanMessage(content=query),
-            AIMessage(content=data_result.get("data_summary", "Daten geladen")),
+            AIMessage(content="Daten geladen"),
             HumanMessage(content=viz_instruction),
         ],
         data=data_result.get("data"),
-        data_summary=data_result.get("data_summary"),
         data_meta=data_result.get("data_meta"),
     )
     

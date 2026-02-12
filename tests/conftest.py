@@ -310,7 +310,6 @@ def state_with_data(sample_timeseries_data):
     return AgentState(
         messages=[HumanMessage(content="Zeig mir die TCP Position")],
         data=sample_timeseries_data,
-        data_summary="100 Datenpunkte für pos_act_x_mm, pos_act_y_mm",
         data_meta={
             "type": "success",
             "data_points": {"pos_act_x_mm": 100, "pos_act_y_mm": 100},
@@ -345,7 +344,6 @@ def state_after_data_agent(sample_timeseries_data):
         plan=["data_agent", "viz_agent"],
         current_step=1,
         data=sample_timeseries_data,
-        data_summary="100 Datenpunkte geladen",
         data_meta={"type": "success", "data_points": {"pos_act_x_mm": 100}},
     )
 

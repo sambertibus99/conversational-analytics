@@ -97,14 +97,11 @@ async def run_single_test(query, verbose: bool = True) -> TestResult:
         result.response = graph_result.get("response", "")
         result.plan = graph_result.get("plan", [])
         result.chart_url = graph_result.get("chart_url")
-        result.data_summary = graph_result.get("data_summary")
         result.statistics_summary = graph_result.get("statistics_summary")
         result.error = graph_result.get("error")
         
         if verbose:
             print(f"\n📋 Plan: {result.plan}")
-            if result.data_summary:
-                print(f"📊 Daten: {result.data_summary[:100]}...")
             if result.chart_url:
                 print(f"🖼️  Chart: {result.chart_url}")
             print(f"\n🤖 Response:\n{result.response[:300]}...")

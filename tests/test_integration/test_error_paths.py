@@ -45,18 +45,17 @@ class TestNoDataHandling:
         result = await run_data_agent(state)
         
         # Sollte keine Daten haben oder Fehler melden
-        summary = result.get("data_summary", "")
-        
+        meta = result.get("data_meta", {})
+
         # Entweder "keine Daten" oder error
         has_no_data_msg = (
-            "keine" in summary.lower() or 
-            "no_data" in str(result.get("data_meta", {})) or
+            "no_data" in str(meta) or
             result.get("data") is None
         )
-        
+
         # WICHTIG: Sollte nicht versucht haben, anderen Zeitraum zu holen!
         assert has_no_data_msg, \
-            f"Agent sollte 'keine Daten' melden, nicht automatisch anderen Zeitraum probieren. Summary: {summary}"
+            f"Agent sollte 'keine Daten' melden, nicht automatisch anderen Zeitraum probieren. Meta: {meta}"
     
     async def test_no_data_for_night_time(self):
         """
@@ -76,16 +75,14 @@ class TestNoDataHandling:
         
         # Meta sollte no_data anzeigen
         meta = result.get("data_meta", {})
-        summary = result.get("data_summary", "")
-        
+
         is_no_data = (
             meta.get("type") == "no_data" or
-            "keine" in summary.lower() or
             result.get("data") is None
         )
-        
+
         assert is_no_data, \
-            f"Sollte no_data sein für Nachtzeit. Meta: {meta}, Summary: {summary}"
+            f"Sollte no_data sein für Nachtzeit. Meta: {meta}"
     
     async def test_no_data_stops_immediately(self):
         """

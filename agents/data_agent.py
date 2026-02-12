@@ -509,72 +509,6 @@ def _extract_time_range(timerange: dict) -> str:
         return f"{start}_{end}"
 
 
-def generate_data_summary(
-    data: Any, 
-    meta: Optional[dict], 
-    quality: Optional[dict] = None
-) -> str:
-    """Generiert eine kurze Zusammenfassung der Daten."""
-    
-    # Qualitätsproblem melden
-    if quality and not quality.get("valid", True):
-        error_pct = quality.get("error_percentage", 100)
-        error_keys = quality.get("error_keys", [])
-        valid_pts = quality.get("valid_points", 0)
-        total_pts = quality.get("total_points", 0)
-        
-        if error_pct >= 95:
-            keys_str = ", ".join(error_keys[:3])
-            return f"FEHLERHAFTE DATEN: {keys_str} ({error_pct:.0f}% fehlerhaft)"
-        elif error_pct > 50:
-            return f"DATENQUALITÄT EINGESCHRÄNKT: {valid_pts}/{total_pts} gültig"
-    
-    # ERROR
-    if meta and meta.get("type") == "error":
-        return f"FEHLER: {meta.get('message', 'Unbekannter Fehler')}"
-    
-    # NO_DATA
-    if meta and meta.get("type") == "no_data":
-        return f"KEINE DATEN: {meta.get('message', 'Keine Daten gefunden')}"
-    
-    # DATA_AVAILABILITY
-    if meta and meta.get("type") == "data_availability":
-        data_range = meta.get("data_range", {})
-        return f"VERFÜGBAR: {data_range.get('first_data', '?')} bis {data_range.get('last_data', '?')}"
-    
-    # ERROR_DATAPOINTS
-    if meta and meta.get("type") == "error_datapoints":
-        return f"ZU VIELE PUNKTE: {meta.get('message', '')}"
-    
-    if data is None:
-        return "Keine Daten"
-    
-    # Statistiken vorhanden
-    if meta and meta.get("statistics"):
-        stats = meta["statistics"]
-        keys = meta.get("keys", list(stats.keys())[:3])
-        
-        summaries = []
-        for key in keys[:3]:
-            stat = stats.get(key, {})
-            if isinstance(stat, dict):
-                count = stat.get("count", "?")
-                summaries.append(f"{key}: {count} Punkte")
-        
-        if summaries:
-            return "; ".join(summaries)
-    
-    # Aktuellste Werte
-    if meta and meta.get("type") == "latest":
-        return f"Aktuelle Werte: {len(data)} Keys"
-    
-    # Fallback
-    if isinstance(data, dict):
-        return f"{len(data)} Keys geladen"
-    
-    return "Daten geladen"
-
-
 # =============================================================================
 # HILFSFUNKTIONEN - USER INPUT DETECTION
 # =============================================================================
@@ -1276,13 +1210,6 @@ def build_result(
     - Keine neuen Daten (check_dataset: vorhanden) → found-Keys aus check_dataset
     """
 
-    # Summary nur für echte Telemetrie generieren (nicht check_dataset Responses)
-    if data and isinstance(data, dict) and _is_telemetry_data(data):
-        summary = generate_data_summary(data, meta, quality)
-        logger.info(f"Summary: {summary}")
-    else:
-        summary = ""  # merge_summaries Reducer behält vorherigen Wert
-
     new_datasets: dict[str, DatasetMeta] = {}
     active_keys: list[str] = []  # DEC-026: Keys dieses Turns
 
@@ -1318,7 +1245,6 @@ def build_result(
     return {
         "messages": result.get("messages", []),
         "datasets": new_datasets,
-        "data_summary": summary,
         "active_dataset_keys": active_keys or None,  # DEC-028
         "needs_user_input": needs_input,
         "user_input_reason": input_reason,
@@ -1580,7 +1506,7 @@ async def test_data_agent():
         
         result = await run_data_agent(state)
         
-        print(f"\n📊 Data Summary: {result.get('data_summary', 'N/A')}")
+        print(f"\n📊 Datasets: {list(result.get('datasets', {}).keys())}")
         print(f"📁 Datasets: {list(result.get('datasets', {}).keys())}")
         
         if result.get("error"):

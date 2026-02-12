@@ -34,7 +34,6 @@ class TestResult:
     response: str = ""
     plan: list[str] = field(default_factory=list)
     chart_url: str | None = None
-    data_summary: str | None = None
     statistics_summary: str | None = None
     
     # Metriken (manuell oder automatisch bewertet)
@@ -247,11 +246,10 @@ def evaluate_data_faithfulness(result: dict) -> bool:
     Returns:
         True wenn keine Halluzinationen erkannt
     """
-    # Wenn Daten geladen wurden, prüfe ob sie erwähnt werden
-    if result.get("data_summary"):
-        # Vereinfachte Prüfung: Wenn data_summary existiert, ist es OK
+    # Vereinfachte Prüfung: Wenn Datasets vorhanden, wurden Daten geladen
+    if result.get("datasets"):
         return True
-    
+
     # Wenn keine Daten nötig waren
     return True
 

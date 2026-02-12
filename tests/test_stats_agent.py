@@ -272,7 +272,6 @@ class TestStatsAgent:
         state = AgentState(
             messages=[HumanMessage(content="Was ist die Durchschnittstemperatur?")],
             data=test_data,
-            data_summary="3 Temperaturwerte",
         )
         
         result = await run_stats_agent(state)

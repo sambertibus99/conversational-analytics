@@ -682,7 +682,6 @@ async def test_stats_agent():
     state = AgentState(
         messages=[HumanMessage(content="Gibt es eine Korrelation zwischen torque_a1 und position_a1?")],
         datasets=test_datasets,
-        data_summary="50 Drehmoment-Werte, 48 Position-Werte",
     )
 
     result = await run_stats_agent(state)
