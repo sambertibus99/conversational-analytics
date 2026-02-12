@@ -285,11 +285,11 @@ def calculate_auto_interval(start_dt: datetime, end_dt: datetime) -> tuple[int, 
     elif duration_hours <= 24:
         # ≤ 1 Tag → 10 Minuten Intervall (~144 Punkte max)
         return 600000, "10 Minuten", f"Zeitraum {duration_hours:.1f}h → 10-Minuten-Intervall"
-    elif duration_hours <= 168:  # 7 Tage
-        # ≤ 1 Woche → 1 Stunde Intervall (~168 Punkte max)
+    elif duration_hours <= 336:  # 14 Tage
+        # ≤ 2 Wochen → 1 Stunde Intervall (~336 Punkte max)
         return 3600000, "1 Stunde", f"Zeitraum {duration_hours/24:.1f} Tage → 1-Stunden-Intervall"
     else:
-        # > 1 Woche → 1 Tag Intervall
+        # > 2 Wochen → 1 Tag Intervall
         days = duration_hours / 24
         return 86400000, "1 Tag", f"Zeitraum {days:.0f} Tage → 1-Tages-Intervall"
 
@@ -908,8 +908,8 @@ async def get_telemetry(
     Wenn interval=None, wird automatisch berechnet:
     - ≤ 1 Stunde → 1m (1 Minute)
     - ≤ 1 Tag → 10m (10 Minuten)
-    - ≤ 1 Woche → 1h (1 Stunde)
-    - > 1 Woche → 1d (1 Tag)
+    - ≤ 2 Wochen → 1h (1 Stunde)
+    - > 2 Wochen → 1d (1 Tag)
 
     RAW MODUS (DEC-023):
     Bei raw=True werden Rohdaten OHNE Aggregation geholt - wichtig für:

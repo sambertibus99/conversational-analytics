@@ -104,8 +104,8 @@ Heute ist {current_weekday} (Wochentag {now.weekday()}, 0=Montag).
 Daten werden automatisch aggregiert um die Datenmenge zu begrenzen:
 - ≤ 1 Stunde → 1 Minute Durchschnitt (~60 Punkte)
 - ≤ 1 Tag → 10 Minuten Durchschnitt (~144 Punkte)
-- ≤ 1 Woche → 1 Stunde Durchschnitt (~168 Punkte)
-- > 1 Woche → 1 Tag Durchschnitt
+- ≤ 2 Wochen → 1 Stunde Durchschnitt (~336 Punkte max)
+- > 2 Wochen → 1 Tag Durchschnitt
 
 Nach dem Datenabruf informiere den User über:
 1. Welcher Zeitraum abgerufen wurde

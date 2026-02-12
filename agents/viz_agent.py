@@ -129,10 +129,18 @@ async def get_antv_tools() -> list:
 # DATEN-TRANSFORMATION HELPERS
 # =============================================================================
 
-def timestamp_to_time_string(ts: int) -> str:
-    """Konvertiert Timestamp zu lesbarem Zeit-String."""
+def timestamp_to_time_string(ts: int, include_date: bool = False) -> str:
+    """Konvertiert Timestamp zu lesbarem Zeit-String.
+
+    Args:
+        ts: Unix-Timestamp in Millisekunden
+        include_date: True für mehrtägige Daten (Format: "DD.MM. HH:MM")
+    """
     try:
-        return datetime.fromtimestamp(ts / 1000).strftime("%H:%M:%S")
+        dt = datetime.fromtimestamp(ts / 1000)
+        if include_date:
+            return dt.strftime("%d.%m. %H:%M")
+        return dt.strftime("%H:%M:%S")
     except:
         return str(ts)
 
@@ -179,12 +187,25 @@ def sample_data(data: list, max_points: int = 500) -> list:
 
 def transform_for_line_chart(data: dict[str, list], multi_key: bool = False) -> list[dict]:
     """Transformiert Daten für Line/Area Chart: [{time, value, group?}]"""
+    # Zeitspanne ermitteln um passendes Format zu wählen
+    all_timestamps = []
+    for values in data.values():
+        if isinstance(values, list):
+            for point in values:
+                if isinstance(point, dict) and "timestamp" in point:
+                    all_timestamps.append(point["timestamp"])
+
+    include_date = False
+    if all_timestamps:
+        span_hours = (max(all_timestamps) - min(all_timestamps)) / (1000 * 3600)
+        include_date = span_hours > 24
+
     result = []
-    
+
     for key, values in data.items():
         if not isinstance(values, list):
             continue
-            
+
         for point in values:
             if isinstance(point, dict):
                 ts = point.get("timestamp", 0)
@@ -192,17 +213,17 @@ def transform_for_line_chart(data: dict[str, list], multi_key: bool = False) -> 
                     val = float(point.get("value", 0))
                 except (ValueError, TypeError):
                     continue
-                
-                entry = {"time": timestamp_to_time_string(ts), "value": val}
-                
+
+                entry = {"time": timestamp_to_time_string(ts, include_date), "value": val}
+
                 if multi_key:
                     entry["group"] = shorten_key_name(key)
-                
+
                 result.append(entry)
-        
+
         if not multi_key:
             break
-    
+
     result.sort(key=lambda x: (x["time"], x.get("group", "")))
     return sample_data(result)
 
