@@ -345,32 +345,34 @@ def extract_chart_url(result) -> str:
 @tool
 async def generate_line_chart_tool(
     title: str,
+    value_label: str,
     state: Annotated[dict, InjectedState],
 ) -> str:
     """
     Erstellt ein Liniendiagramm für Zeitreihen-Daten.
-    
+
     WANN BENUTZEN:
     - Verlauf über Zeit, Trends, Historie
     - Kontinuierliche Messwerte
-    
+
     Args:
         title: Beschreibender Titel, z.B. "Drehmomente - 16.12.2025"
+        value_label: Achsenbeschriftung, z.B. "Drehmoment (Nm)" oder "Korrelationskoeffizient (r)"
     """
-    logger.debug(f"generate_line_chart_tool: title={title}")
-    
+    logger.debug(f"generate_line_chart_tool: title={title}, value_label={value_label}")
+
     data = get_data_from_state(state)
-    
+
     if not data:
         return "Fehler: Keine Daten im State"
-    
+
     keys = list(data.keys())
     multi_key = len(keys) > 1
     transformed = transform_for_line_chart(data, multi_key)
-    
+
     if not transformed:
         return "Fehler: Keine gültigen Datenpunkte"
-    
+
     session = await get_antv_session()
     result = await session.call_tool(
         "generate_line_chart",
@@ -378,45 +380,47 @@ async def generate_line_chart_tool(
             "data": transformed,
             "title": title,
             "axisXTitle": "Zeit",
-            "axisYTitle": get_y_label(keys),
+            "axisYTitle": value_label,
             "width": 800,
             "height": 500,
         }
     )
-    
+
     return extract_chart_url(result)
 
 
 @tool
 async def generate_area_chart_tool(
     title: str,
+    value_label: str,
     state: Annotated[dict, InjectedState],
 ) -> str:
     """
     Erstellt ein Flächendiagramm für kumulative Zeitreihen.
-    
+
     WANN BENUTZEN:
     - Kumulative Daten über Zeit
     - Betonung der Gesamtmenge
     - Gestapelte Vergleiche mehrerer Serien
-    
+
     Args:
         title: Beschreibender Titel
+        value_label: Achsenbeschriftung, z.B. "Drehmoment (Nm)"
     """
-    logger.debug(f"generate_area_chart_tool: title={title}")
-    
+    logger.debug(f"generate_area_chart_tool: title={title}, value_label={value_label}")
+
     data = get_data_from_state(state)
-    
+
     if not data:
         return "Fehler: Keine Daten im State"
-    
+
     keys = list(data.keys())
     multi_key = len(keys) > 1
     transformed = transform_for_line_chart(data, multi_key)
-    
+
     if not transformed:
         return "Fehler: Keine gültigen Datenpunkte"
-    
+
     session = await get_antv_session()
     result = await session.call_tool(
         "generate_area_chart",
@@ -424,100 +428,108 @@ async def generate_area_chart_tool(
             "data": transformed,
             "title": title,
             "axisXTitle": "Zeit",
-            "axisYTitle": get_y_label(keys),
+            "axisYTitle": value_label,
             "stack": multi_key,
             "width": 800,
             "height": 500,
         }
     )
-    
+
     return extract_chart_url(result)
 
 
 @tool
 async def generate_column_chart_tool(
     title: str,
+    value_label: str,
+    category_label: str,
     state: Annotated[dict, InjectedState],
 ) -> str:
     """
     Erstellt ein vertikales Säulendiagramm zum Vergleich.
-    
+
     WANN BENUTZEN:
     - Vergleich zwischen Kategorien
     - Durchschnittswerte nebeneinander
-    
+
     Args:
         title: Beschreibender Titel
+        value_label: Wert-Achsenbeschriftung, z.B. "Drehmoment (Nm)"
+        category_label: Kategorie-Achsenbeschriftung, z.B. "Achse" oder "Signal"
     """
-    logger.debug(f"generate_column_chart_tool: title={title}")
-    
+    logger.debug(f"generate_column_chart_tool: title={title}, value_label={value_label}, category_label={category_label}")
+
     data = get_data_from_state(state)
-    
+
     if not data:
         return "Fehler: Keine Daten im State"
-    
+
     transformed = transform_for_category_chart(data)
-    
+
     if not transformed:
         return "Fehler: Keine gültigen Datenpunkte"
-    
+
     session = await get_antv_session()
     result = await session.call_tool(
         "generate_column_chart",
         arguments={
             "data": transformed,
             "title": title,
-            "axisXTitle": "Kategorie",
-            "axisYTitle": get_y_label(list(data.keys())),
+            "axisXTitle": category_label,
+            "axisYTitle": value_label,
             "width": 800,
             "height": 500,
         }
     )
-    
+
     return extract_chart_url(result)
 
 
 @tool
 async def generate_bar_chart_tool(
     title: str,
+    value_label: str,
+    category_label: str,
     state: Annotated[dict, InjectedState],
 ) -> str:
     """
     Erstellt ein horizontales Balkendiagramm zum Vergleich.
-    
+
     WANN BENUTZEN:
     - Horizontaler Vergleich
     - Lange Kategorie-Namen
     - Ranking-Darstellung
-    
+
     Args:
         title: Beschreibender Titel
+        value_label: Wert-Achsenbeschriftung, z.B. "Korrelationskoeffizient (r)"
+        category_label: Kategorie-Achsenbeschriftung, z.B. "Achsen-Moment" oder "Signal"
     """
-    logger.debug(f"generate_bar_chart_tool: title={title}")
-    
+    logger.debug(f"generate_bar_chart_tool: title={title}, value_label={value_label}, category_label={category_label}")
+
     data = get_data_from_state(state)
-    
+
     if not data:
         return "Fehler: Keine Daten im State"
-    
+
     transformed = transform_for_category_chart(data)
-    
+
     if not transformed:
         return "Fehler: Keine gültigen Datenpunkte"
-    
+
     session = await get_antv_session()
     result = await session.call_tool(
         "generate_bar_chart",
         arguments={
             "data": transformed,
             "title": title,
-            "axisXTitle": get_y_label(list(data.keys())),
-            "axisYTitle": "Kategorie",
+            "axisXTitle": category_label,
+            "axisYTitle": value_label,
             "width": 800,
             "height": 500,
         }
     )
-    
+
     return extract_chart_url(result)
 
 
@@ -569,121 +581,131 @@ async def generate_scatter_chart_tool(
 @tool
 async def generate_boxplot_chart_tool(
     title: str,
+    value_label: str,
+    category_label: str,
     state: Annotated[dict, InjectedState],
 ) -> str:
     """
     Erstellt ein Boxplot für statistische Verteilung.
-    
+
     WANN BENUTZEN:
     - Verteilung der Werte anzeigen
     - Median, Quartile, Ausreißer sichtbar
     - Vergleich mehrerer Kategorien
-    
+
     Args:
         title: Beschreibender Titel
+        value_label: Wert-Achsenbeschriftung, z.B. "Drehmoment (Nm)"
+        category_label: Kategorie-Achsenbeschriftung, z.B. "Achse" oder "Signal"
     """
-    logger.debug(f"generate_boxplot_chart_tool: title={title}")
-    
+    logger.debug(f"generate_boxplot_chart_tool: title={title}, value_label={value_label}, category_label={category_label}")
+
     data = get_data_from_state(state)
-    
+
     if not data:
         return "Fehler: Keine Daten im State"
-    
+
     transformed = transform_for_distribution_chart(data)
-    
+
     if not transformed:
         return "Fehler: Keine gültigen Datenpunkte"
-    
+
     session = await get_antv_session()
     result = await session.call_tool(
         "generate_boxplot_chart",
         arguments={
             "data": transformed,
             "title": title,
-            "axisXTitle": "Kategorie",
-            "axisYTitle": get_y_label(list(data.keys())),
+            "axisXTitle": category_label,
+            "axisYTitle": value_label,
             "width": 800,
             "height": 500,
         }
     )
-    
+
     return extract_chart_url(result)
 
 
 @tool
 async def generate_violin_chart_tool(
     title: str,
+    value_label: str,
+    category_label: str,
     state: Annotated[dict, InjectedState],
 ) -> str:
     """
     Erstellt ein Violin-Chart für Dichteverteilung.
-    
+
     WANN BENUTZEN:
     - Verteilung mit Dichtekurve
     - Detaillierter als Boxplot
     - Vergleich von Verteilungen
-    
+
     Args:
         title: Beschreibender Titel
+        value_label: Wert-Achsenbeschriftung, z.B. "Drehmoment (Nm)"
+        category_label: Kategorie-Achsenbeschriftung, z.B. "Achse" oder "Signal"
     """
-    logger.debug(f"generate_violin_chart_tool: title={title}")
-    
+    logger.debug(f"generate_violin_chart_tool: title={title}, value_label={value_label}, category_label={category_label}")
+
     data = get_data_from_state(state)
-    
+
     if not data:
         return "Fehler: Keine Daten im State"
-    
+
     transformed = transform_for_distribution_chart(data)
-    
+
     if not transformed:
         return "Fehler: Keine gültigen Datenpunkte"
-    
+
     session = await get_antv_session()
     result = await session.call_tool(
         "generate_violin_chart",
         arguments={
             "data": transformed,
             "title": title,
-            "axisXTitle": "Kategorie",
-            "axisYTitle": get_y_label(list(data.keys())),
+            "axisXTitle": category_label,
+            "axisYTitle": value_label,
             "width": 800,
             "height": 500,
         }
     )
-    
+
     return extract_chart_url(result)
 
 
 @tool
 async def generate_histogram_chart_tool(
     title: str,
+    value_label: str,
     state: Annotated[dict, InjectedState],
     bin_number: int = 10,
 ) -> str:
     """
     Erstellt ein Histogramm für Häufigkeitsverteilung.
-    
+
     WANN BENUTZEN:
     - Wie oft kommen bestimmte Werte vor?
     - Normalverteilung prüfen
     - Datenkonzentration erkennen
-    
+
     Args:
         title: Beschreibender Titel
+        value_label: Achsenbeschriftung, z.B. "Drehmoment (Nm)"
         bin_number: Anzahl der Intervalle (default: 10)
     """
-    logger.debug(f"generate_histogram_chart_tool: title={title}, bins={bin_number}")
-    
+    logger.debug(f"generate_histogram_chart_tool: title={title}, value_label={value_label}, bins={bin_number}")
+
     data = get_data_from_state(state)
-    
+
     if not data:
         return "Fehler: Keine Daten im State"
-    
+
     transformed = transform_for_histogram_chart(data)
-    
+
     if not transformed:
         return "Fehler: Keine gültigen Datenpunkte"
-    
+
     session = await get_antv_session()
     result = await session.call_tool(
         "generate_histogram_chart",
@@ -691,13 +713,13 @@ async def generate_histogram_chart_tool(
             "data": transformed,
             "title": title,
             "binNumber": bin_number,
-            "axisXTitle": get_y_label(list(data.keys())),
+            "axisXTitle": value_label,
             "axisYTitle": "Häufigkeit",
             "width": 800,
             "height": 500,
         }
     )
-    
+
     return extract_chart_url(result)
 
 
@@ -888,6 +910,7 @@ async def select_and_execute_tool(
         keys = list(tool_state.get("datasets", {}).keys())
         chart_url = await generate_line_chart_tool.ainvoke({
             "title": f"{', '.join(keys[:2])} - Verlauf",
+            "value_label": get_y_label(keys),
             "state": tool_state,
         })
         return chart_url, "generate_line_chart_tool"
