@@ -73,7 +73,7 @@ Wähle den passenden Chart-Typ und erstelle eine Visualisierung.
 | "Violin", "Dichte" | generate_violin_chart_tool |
 | "Histogramm", "Häufigkeit", "wie oft" | generate_histogram_chart_tool |
 | "Anteile", "Prozent", "Kuchen", "Pie" | generate_pie_chart_tool |
-| "Radar", "Spinne", "alle Achsen/Dimensionen" | generate_radar_chart_tool |
+| "Radar", "Spinne", "Spider" (NUR bei explizitem Radar-Wunsch!) | generate_radar_chart_tool |
 | Standard für Zeitreihen | generate_line_chart_tool |
 
 </decision_rules>
@@ -101,7 +101,7 @@ User: "Gibt es Ausreißer bei den Drehmomenten?"
 User: "Wie oft lag das Drehmoment bei 20-30 Nm?"
 → generate_histogram_chart_tool mit Titel "Drehmoment-Häufigkeit"
 
-User: "Zeig alle 6 Achsen im Überblick"
+User: "Zeig alle 6 Achsen als Radar-Chart"
 → generate_radar_chart_tool mit Titel "Achsen-Übersicht"
 
 </examples>

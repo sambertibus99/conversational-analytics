@@ -17,18 +17,34 @@ logger = logging.getLogger(__name__)
 
 def get_data_from_state(state: dict) -> dict[str, list]:
     """
-    DEC-025/026: Holt Daten aus DuckDB (primär) oder Legacy-State (Fallback).
+    DEC-025/026/030: Holt Daten aus DuckDB (primär) oder Legacy-State (Fallback).
 
-    DEC-026: Wenn active_dataset_keys gesetzt ist, werden nur Daten für
-    diese Keys geladen. Sonst alle Daten (Fallback).
+    Prioritäten:
+    1. DEC-030: Stats-Daten wenn active_stats_keys gesetzt (aus statistics-Tabelle)
+    2. DEC-026: Telemetrie-Daten gefiltert nach active_dataset_keys
+    3. Fallback: Alle Telemetrie-Daten
 
     Returns:
         Daten im ThingsBoard-Format: {"signal_key": [{"value": ..., "timestamp": ...}, ...]}
     """
     session_id = state.get("session_id", "default")
+    active_stats = state.get("active_stats_keys")  # DEC-030
     active_keys = state.get("active_dataset_keys")  # DEC-026
 
-    # Versuch 1: DuckDB SessionStore
+    # PRIORITÄT 1 (DEC-030): Stats-Daten wenn active_stats_keys gesetzt
+    if active_stats:
+        try:
+            from config.duckdb_store import SessionStore
+            if session_id in SessionStore._instances:
+                store = SessionStore.get_instance(session_id)
+                data = store.get_multi_statistics_as_chart_data(active_stats)
+                if data:
+                    logger.debug(f"DEC-030: Stats-Daten geladen: {len(data)} keys aus {len(active_stats)} stats datasets")
+                    return data
+        except Exception as e:
+            logger.debug(f"DEC-030: Stats-Daten nicht verfügbar: {e}")
+
+    # PRIORITÄT 2: DuckDB Telemetrie-Daten
     try:
         from config.duckdb_store import SessionStore
         if session_id in SessionStore._instances:
@@ -45,7 +61,7 @@ def get_data_from_state(state: dict) -> dict[str, list]:
     except Exception as e:
         logger.debug(f"DuckDB nicht verfügbar: {e}")
 
-    # Versuch 2: Legacy-Format aus State
+    # Versuch 3: Legacy-Format aus State
     datasets = state.get("datasets", {})
     return extract_data_from_datasets(datasets)
 
@@ -388,6 +404,39 @@ def extract_user_query(messages: list) -> str:
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             return msg.content
+    return ""
+
+
+# =============================================================================
+# STATS LABEL (für Stats-Viz-Flow)
+# =============================================================================
+
+STATS_LABEL_MAP = {
+    "correlation": "Korrelationskoeffizient (r)",
+    "mean": "Durchschnitt",
+    "std": "Standardabweichung",
+    "min_max": "Min/Max",
+    "trend": "Trend (Steigung)",
+    "percentiles": "Perzentile",
+    "anomaly": "Anomalie-Score",
+    "summary": "Statistik-Übersicht",
+}
+
+
+def get_stats_label(active_stats_keys: list[str]) -> str:
+    """Bestimmt Y-Achsen-Label aus Stats-Dataset-Keys.
+
+    Leitet aus dem UNS-Key den Analyse-Typ ab:
+    "krc5/stats/correlation/..." → "Korrelationskoeffizient (r)"
+    "krc5/stats/mean/..." → "Durchschnitt"
+    """
+    if not active_stats_keys:
+        return ""
+    first_key = active_stats_keys[0]
+    parts = first_key.split("/")
+    if len(parts) >= 3 and parts[1] == "stats":
+        analysis_type = parts[2]
+        return STATS_LABEL_MAP.get(analysis_type, analysis_type)
     return ""
 
 

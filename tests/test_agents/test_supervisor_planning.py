@@ -158,20 +158,20 @@ class TestValidatePlan:
 
         assert is_valid
 
-    def test_repair_stats_without_data_no_datasets(self):
-        """Testet dass stats ohne data repariert wird (data_agent wird eingefügt)."""
+    def test_stats_alone_is_valid_resolve_mode(self):
+        """Stats Agent allein ist valide (Resolve-Modus: löst bestehende Stats aus DuckDB auf)."""
         is_valid, msg, repaired = validate_plan(["stats_agent"], has_datasets=False)
 
         assert is_valid
-        assert "repariert" in msg.lower()
-        assert repaired == ["data_agent", "stats_agent"]
+        assert "stats-resolve" in msg.lower()
+        assert repaired == ["stats_agent"]
 
-    def test_repair_stats_without_data_with_datasets(self):
-        """DEC-028: data_agent wird IMMER eingefügt, auch wenn Datasets vorhanden."""
+    def test_stats_alone_valid_with_datasets(self):
+        """Stats Agent allein auch mit Datasets valide (Resolve-Modus)."""
         is_valid, msg, repaired = validate_plan(["stats_agent"], has_datasets=True)
 
         assert is_valid
-        assert repaired == ["data_agent", "stats_agent"]
+        assert repaired == ["stats_agent"]
 
     def test_repair_viz_without_data_no_datasets(self):
         """Testet dass viz ohne data repariert wird (data_agent wird eingefügt)."""
@@ -360,13 +360,13 @@ class TestSupervisorEdgeCases:
 class TestPlanRepair:
     """Tests für Plan-Reparatur (validate_plan repariert automatisch)."""
 
-    def test_repair_stats_without_data(self):
-        """Testet ob data_agent vor stats_agent automatisch eingefügt wird."""
+    def test_stats_alone_valid_resolve_mode(self):
+        """Stats Agent allein ist valide (Resolve-Modus, kein data_agent nötig)."""
         is_valid, msg, repaired = validate_plan(["stats_agent"], has_datasets=False)
 
         assert is_valid
-        assert repaired == ["data_agent", "stats_agent"]
-        assert "repariert" in msg.lower()
+        assert repaired == ["stats_agent"]
+        assert "stats-resolve" in msg.lower()
 
     def test_repair_viz_without_data(self):
         """Testet ob data_agent vor viz_agent automatisch eingefügt wird."""
@@ -376,12 +376,20 @@ class TestPlanRepair:
         assert repaired == ["data_agent", "viz_agent"]
         assert "repariert" in msg.lower()
 
-    def test_repair_even_when_datasets_exist(self):
-        """DEC-028: data_agent wird IMMER eingefügt wenn stats/viz geplant."""
+    def test_stats_alone_valid_even_with_datasets(self):
+        """Stats Agent allein valide auch mit Datasets (Resolve-Modus)."""
         is_valid, msg, repaired = validate_plan(["stats_agent"], has_datasets=True)
 
         assert is_valid
-        assert repaired == ["data_agent", "stats_agent"]
+        assert repaired == ["stats_agent"]
+
+    def test_stats_viz_without_data_valid(self):
+        """Stats + Viz ohne Data Agent ist valide (Stats-Resolve + Viz)."""
+        is_valid, msg, repaired = validate_plan(["stats_agent", "viz_agent"], has_datasets=False)
+
+        assert is_valid
+        assert repaired == ["stats_agent", "viz_agent"]
+        assert "stats-resolve" in msg.lower()
 
 
 # =============================================================================

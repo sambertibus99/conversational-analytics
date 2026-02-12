@@ -155,11 +155,12 @@ Erstellt Visualisierungen aus vorhandenen Daten.
 {telemetry_section}
 <rules>
 
-1. data_agent MUSS immer im Plan sein wenn stats_agent oder viz_agent geplant ist
+1. data_agent MUSS im Plan sein wenn viz_agent ohne stats_agent geplant ist
 2. data_agent kommt IMMER zuerst — er prüft und wählt die relevanten Daten
 3. stats_agent und viz_agent können nur arbeiten, wenn Daten vorhanden sind
 4. Bei Mehrdeutigkeit: Rückfrage an User stellen
 5. Bei Follow-up-Anfragen ("zeig das als Chart", "berechne Korrelation"): Nutze den BISHERIGEN VERLAUF um die richtigen Keys und Zeiträume in data_instructions anzugeben
+6. Stats-Resolve: Wenn User Stats-Ergebnisse visualisieren will (z.B. "zeig als Chart") UND stats_dataset_keys im Verlauf vorhanden sind → Plan: ["stats_agent", "viz_agent"] (stats_agent löst bestehende Stats aus DuckDB auf, KEIN data_agent nötig)
 
 </rules>
 
@@ -173,6 +174,7 @@ Erstellt Visualisierungen aus vorhandenen Daten.
 | Daten + Statistik + Visualisierung | ["data_agent", "stats_agent", "viz_agent"] |
 | Vorhandene Daten visualisieren | ["data_agent", "viz_agent"] |
 | Vorhandene Daten analysieren | ["data_agent", "stats_agent"] |
+| Stats-Ergebnisse visualisieren (DEC-030) | ["stats_agent", "viz_agent"] |
 | User will nur Werte sehen | [] |
 | Keine IIoT-Anfrage | [] |
 
@@ -236,6 +238,21 @@ Turn 1: "Zeig mir die Drehmomente der letzten Stunde"
 
 Anfrage: "Berechne den Durchschnitt"
 {{"plan": ["data_agent", "stats_agent"], "reasoning": "User will Statistik für Drehmomente aus Turn 1. Detail-Modus nötig.", "data_mode": "detail", "data_instructions": "Hole torque_act_a1_nm, torque_act_a2_nm für 2026-02-11 13:00-14:00 als detail (raw=True)."}}
+
+---
+
+### Stats-Ergebnisse visualisieren (DEC-030)
+
+## BISHERIGER VERLAUF
+
+Turn 1: "Korrelation z-Position und alle Achsen?"
+  Plan: ["data_agent", "stats_agent"]
+  Daten: pos_act_z_mm, axis_act_a1_deg, axis_act_a2_deg, axis_act_a3_deg (11.02. 15:55-17:55)
+  Ergebnis (statistics): Korrelation A1 r=-0.664, A2 r=0.312, A3 r=-0.087
+  Stats-Datasets: krc5/stats/correlation/pos_act_z_mm-axis_act_a1_deg/2026-02-11_15-55_17-55, krc5/stats/correlation/pos_act_z_mm-axis_act_a2_deg/2026-02-11_15-55_17-55, krc5/stats/correlation/pos_act_z_mm-axis_act_a3_deg/2026-02-11_15-55_17-55
+
+Anfrage: "Zeig als Balkendiagramm"
+{{"plan": ["stats_agent", "viz_agent"], "reasoning": "Stats-Ergebnisse aus Turn 1 als Chart — stats_agent löst aus DuckDB auf", "data_mode": "overview"}}
 
 ---
 

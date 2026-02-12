@@ -117,13 +117,18 @@ def parse_supervisor_response(response: str) -> dict[str, Any]:
         return {"plan": [], "reasoning": f"JSON Parse Error: {str(e)}", "data_mode": "overview"}
 
 
-def validate_plan(plan: list[str], has_datasets: bool) -> Tuple[bool, str, list[str]]:
+def validate_plan(
+    plan: list[str],
+    has_datasets: bool,
+) -> Tuple[bool, str, list[str]]:
     """
     Validiert den Plan auf logische Konsistenz.
 
-    DEC-028: data_agent wird IMMER eingefügt wenn stats/viz geplant ist,
-    auch wenn Datasets vorhanden sind. Der Data Agent entscheidet selbst
-    über active_dataset_keys (check_dataset).
+    DEC-028: data_agent wird eingefügt wenn viz_agent ohne data_agent und ohne
+    stats_agent geplant ist. Der Data Agent entscheidet selbst über active_dataset_keys.
+
+    Stats Agent als Gatekeeper: stats_agent darf ohne data_agent laufen (Resolve-Modus).
+    stats_agent + viz_agent ohne data_agent ist ebenfalls valide (Stats löst aus DuckDB auf).
 
     Returns:
         Tuple von (is_valid, message, repaired_plan)
@@ -138,25 +143,35 @@ def validate_plan(plan: list[str], has_datasets: bool) -> Tuple[bool, str, list[
         if agent not in VALID_AGENTS:
             return False, f"Ungültiger Agent: {agent}", []
 
-    # DEC-028: data_agent IMMER wenn stats/viz geplant
-    needs_data = "stats_agent" in plan or "viz_agent" in plan
     has_data_agent = "data_agent" in plan
+    has_stats_agent = "stats_agent" in plan
+    has_viz_agent = "viz_agent" in plan
 
-    if needs_data and not has_data_agent:
+    # Stats Agent darf allein laufen (Resolve bestehender Stats) → OK
+    # Stats + Viz ohne Data → Stats löst aus DuckDB auf, Viz visualisiert → OK
+    if has_stats_agent and not has_data_agent:
+        if has_viz_agent:
+            logger.debug("Plan valide: Stats-Resolve + Viz (kein Data Agent nötig)")
+        else:
+            logger.debug("Plan valide: Stats-Resolve (kein Data Agent nötig)")
+        return True, "Plan ist valide (Stats-Resolve)", repaired
+
+    # DEC-028: viz_agent allein ohne stats_agent und ohne data_agent → data_agent einfügen
+    if has_viz_agent and not has_data_agent and not has_stats_agent:
         repaired = ["data_agent"] + repaired
-        logger.debug("Plan repariert: data_agent hinzugefügt (DEC-028: wird immer gebraucht)")
+        logger.debug("Plan repariert: data_agent hinzugefügt (DEC-028: Viz braucht Daten)")
         return True, "Plan repariert", repaired
-    
+
     # Prüfe Reihenfolge
     if has_data_agent:
         data_idx = repaired.index("data_agent")
-        
-        if "stats_agent" in repaired and repaired.index("stats_agent") < data_idx:
+
+        if has_stats_agent and repaired.index("stats_agent") < data_idx:
             return False, "stats_agent muss nach data_agent kommen", []
-        
-        if "viz_agent" in repaired and repaired.index("viz_agent") < data_idx:
+
+        if has_viz_agent and repaired.index("viz_agent") < data_idx:
             return False, "viz_agent muss nach data_agent kommen", []
-    
+
     return True, "Plan ist valide", repaired
 
 
@@ -193,6 +208,10 @@ def build_turn_context(turn_history: list, datasets: dict) -> str:
                     parts.append(f"  Daten: {', '.join(keys[:8])} ({tr})")
             if result_summary:
                 parts.append(f"  Ergebnis ({result_type}): {result_summary}")
+            # DEC-030: Stats-Dataset-Keys anzeigen
+            stats_keys = turn.get("stats_dataset_keys", [])
+            if stats_keys:
+                parts.append(f"  Stats-Datasets: {', '.join(stats_keys[:5])}")
             parts.append("")
     elif datasets:
         # Fallback für alte Sessions ohne turn_history
@@ -298,8 +317,8 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
         
         # 5. Plan validieren und ggf. reparieren
         is_valid, validation_msg, repaired_plan = validate_plan(
-            result["plan"], 
-            has_datasets=bool(datasets)
+            result["plan"],
+            has_datasets=bool(datasets),
         )
         
         if not is_valid:
@@ -334,6 +353,7 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
                 "needs_user_input": True,
                 "user_input_reason": input_reason,
                 "active_dataset_keys": None,  # DEC-028: Reset
+                "active_stats_keys": None,  # DEC-030: Reset
                 "messages": [AIMessage(content=input_reason)],
             }
 
@@ -344,6 +364,7 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
             "data_retrieval_mode": data_mode,  # DEC-023
             "data_instructions": data_instructions,
             "active_dataset_keys": None,  # DEC-028: Reset — Data Agent setzt neu
+            "active_stats_keys": None,  # Reset — Stats Agent setzt (analog DEC-028)
             "needs_user_input": False,  # Explizit zurücksetzen (Checkpointer persistiert!)
             "user_input_reason": None,
             # Per-Turn Outputs resetten (Checkpointer persistiert alte Werte!)

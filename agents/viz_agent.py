@@ -41,7 +41,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from agents.state import AgentState
-from agents.utils import extract_data_from_datasets, get_dataset_meta, get_y_label, extract_user_query, get_data_from_state
+from agents.utils import extract_data_from_datasets, get_dataset_meta, get_y_label, get_stats_label, extract_user_query, get_data_from_state
 from config.settings import DEFAULT_MODEL, api_key_rotator, create_anthropic_client, create_cached_system_message
 from prompts.viz_agent_prompt import VIZ_AGENT_SYSTEM_PROMPT
 
@@ -833,6 +833,14 @@ def prepare_viz_context(state: AgentState) -> Tuple[dict, str]:
         if dataset_meta.get("timerange"):
             tr = dataset_meta["timerange"]
             meta_info += f"\nZeitraum: {tr.get('weekday', '')} {tr.get('start', '')} - {tr.get('end', '')}"
+
+    # Stats-Label hinzufügen wenn Stats-Daten aktiv sind (Stats-Viz-Flow)
+    active_stats = state.get("active_stats_keys")
+    if active_stats:
+        label = get_stats_label(active_stats)
+        if label:
+            meta_info += f"\nDaten-Typ: Statistik-Ergebnisse ({label})"
+            meta_info += f"\nEmpfohlene Y-Achse: {label}"
 
     return data, meta_info
 

@@ -96,6 +96,33 @@ def _debug_log(text: str) -> None:
 # HILFSFUNKTIONEN
 # =============================================================================
 
+def _resolve_existing_stats(session_id: str, signal_keys: list[str]) -> list[str]:
+    """
+    Prüft welche Stats-Ergebnisse bereits in DuckDB vorliegen.
+    Analog zu check_dataset im Data Agent — aber deterministisch (kein LLM nötig).
+
+    Args:
+        session_id: DuckDB Session-ID
+        signal_keys: Verfügbare Signal-Keys aus Telemetrie-Daten
+
+    Returns:
+        Liste der gefundenen stats_dataset_keys, oder leere Liste.
+    """
+    from config.duckdb_store import SessionStore
+
+    if session_id not in SessionStore._instances:
+        return []
+
+    store = SessionStore.get_instance(session_id)
+    existing = store.list_statistics()  # [{"dataset_key": ..., "analysis_type": ...}]
+
+    if not existing:
+        return []
+
+    # Alle Stats-Keys zurückgeben (sie gehören zur Session, also sind sie relevant)
+    return [entry["dataset_key"] for entry in existing]
+
+
 def get_available_keys(state: dict) -> list[str]:
     """Extrahiert verfügbare Keys aus dem State (DEC-025: DuckDB-first)."""
     return get_available_signal_keys(state)
@@ -408,6 +435,142 @@ def summary_tool(
 
 
 # =============================================================================
+# DUCKDB PERSISTIERUNG (DEC-030)
+# =============================================================================
+
+def _extract_time_range_from_state(state: dict) -> str:
+    """Extrahiert den Zeitraum aus den aktiven Datasets im State."""
+    datasets = state.get("datasets", {})
+    active_keys = state.get("active_dataset_keys", [])
+
+    for dk in (active_keys or []):
+        ds = datasets.get(dk)
+        if isinstance(ds, dict):
+            tr = ds.get("timerange", {})
+            start = tr.get("start_human") or tr.get("start", "")
+            end = tr.get("end_human") or tr.get("end", "")
+            if start and end:
+                # Format: "2026-02-11_15-55_17-55" (kompakt für Keys)
+                s = str(start).replace(" ", "_").replace(":", "-")
+                e = str(end).replace(" ", "_").replace(":", "-")
+                return f"{s}_{e}"
+
+    return ""
+
+
+def _determine_analysis_type(tool_name: str) -> str:
+    """Mappt Tool-Name auf analysis_type für DuckDB-Key."""
+    mapping = {
+        "mean_tool": "mean",
+        "std_tool": "std",
+        "min_max_tool": "min_max",
+        "correlation_tool": "correlation",
+        "trend_tool": "trend",
+        "percentiles_tool": "percentiles",
+        "anomaly_tool": "anomaly",
+        "summary_tool": "summary",
+    }
+    return mapping.get(tool_name, tool_name.replace("_tool", ""))
+
+
+def _stats_to_chart_data(analysis_type: str, parsed_result: dict) -> dict[str, list[dict]]:
+    """
+    Konvertiert Stats-Ergebnisse in ThingsBoard-Format für DuckDB (DEC-030).
+
+    Korrelation: {"axis_act_a1_deg": [{"value": "-0.664", "timestamp": 0}], ...}
+    Mean:        {"torque_act_a1_nm": [{"value": "25.3", "timestamp": 0}]}
+    """
+    if analysis_type == "correlation" and "r" in parsed_result:
+        key_y = parsed_result.get("key_y", "correlation")
+        return {key_y: [{"value": str(parsed_result["r"]), "timestamp": 0}]}
+
+    key = parsed_result.get("key", "value")
+
+    if "mean" in parsed_result:
+        return {key: [{"value": str(parsed_result["mean"]), "timestamp": 0}]}
+    if "std" in parsed_result:
+        return {key: [{"value": str(parsed_result["std"]), "timestamp": 0}]}
+    if "min" in parsed_result and "max" in parsed_result:
+        return {
+            f"{key}_min": [{"value": str(parsed_result["min"]), "timestamp": 0}],
+            f"{key}_max": [{"value": str(parsed_result["max"]), "timestamp": 0}],
+        }
+    if "slope" in parsed_result:
+        return {key: [{"value": str(parsed_result["slope"]), "timestamp": 0}]}
+
+    return {}
+
+
+def _store_stats_in_duckdb(
+    state: dict,
+    results: list[dict],
+    statistics: dict[str, Any],
+) -> tuple[None, list[str]]:
+    """
+    Speichert Stats-Ergebnisse in DuckDB (DEC-030).
+
+    Persistenz läuft NUR über DuckDB statistics-Tabelle + turn_history.
+    Keine DatasetMeta in state.datasets (bleibt nur für Telemetrie).
+
+    Returns:
+        Tuple (None, active_stats_keys):
+        - None (kein datasets_dict mehr)
+        - active_stats_keys: Liste der erzeugten Stats-Keys
+    """
+    from config.duckdb_store import SessionStore, generate_stats_dataset_key
+
+    session_id = state.get("session_id", "default")
+    time_range = _extract_time_range_from_state(state)
+    active_keys: list[str] = []
+
+    try:
+        store = SessionStore.get_instance(session_id)
+    except Exception as e:
+        logger.warning(f"DuckDB nicht verfügbar für Stats-Speicherung: {e}")
+        return None, []
+
+    for r in results:
+        tool_name = r["tool"]
+        result_str = r["result"]
+
+        try:
+            parsed = json.loads(result_str)
+        except json.JSONDecodeError:
+            continue
+
+        if "error" in parsed:
+            continue
+
+        analysis_type = _determine_analysis_type(tool_name)
+
+        # Reference-Key bestimmen
+        if analysis_type == "correlation":
+            key_x = parsed.get("key_x", "x")
+            key_y = parsed.get("key_y", "y")
+            reference_key = f"{key_x}-{key_y}"
+        else:
+            reference_key = parsed.get("key", "unknown")
+
+        dataset_key = generate_stats_dataset_key(
+            device_id="krc5",
+            analysis_type=analysis_type,
+            reference_key=reference_key,
+            time_range=time_range,
+        )
+
+        # In DuckDB speichern
+        metadata = {
+            "source_dataset_keys": state.get("active_dataset_keys", []),
+            "time_range": time_range,
+        }
+        store.store_statistics(dataset_key, analysis_type, parsed, metadata)
+        active_keys.append(dataset_key)
+        logger.debug(f"Stats in DuckDB: {dataset_key}")
+
+    return None, active_keys
+
+
+# =============================================================================
 # TOOL LISTE
 # =============================================================================
 
@@ -553,6 +716,25 @@ async def run_stats_agent(state: AgentState) -> dict[str, Any]:
     try:
         logger.debug("Starte Stats Agent (InjectedState Pattern, DEC-025: DuckDB-first)")
 
+        session_id = state.get("session_id", "default")
+
+        # GATEKEEPER: Wenn active_dataset_keys is None → kein Data Agent lief → Resolve-Modus
+        # Analog zu DEC-028 (Data Agent Gatekeeper): Stats Agent entscheidet selbst über active_stats_keys
+        if state.get("active_dataset_keys") is None:
+            resolved = _resolve_existing_stats(session_id, [])
+            if resolved:
+                logger.info(f"Stats Gatekeeper: {len(resolved)} Stats aus DuckDB aufgelöst")
+                return {
+                    "messages": [AIMessage(content="Statistiken aus vorheriger Berechnung übernommen.")],
+                    "active_stats_keys": resolved,
+                }
+            else:
+                logger.warning("Stats Gatekeeper: Keine bestehenden Stats in DuckDB gefunden")
+                return {
+                    "messages": [AIMessage(content="Keine Statistik-Ergebnisse vorhanden. Bitte erst eine Analyse durchführen.")],
+                    "error": "no_stats",
+                }
+
         # Prüfe ob Daten vorhanden (DEC-025: DuckDB-first)
         available_keys = get_available_signal_keys(state)
 
@@ -620,14 +802,29 @@ async def run_stats_agent(state: AgentState) -> dict[str, Any]:
         stats_summary = "; ".join(summaries)
         logger.info(f"Stats berechnet: {stats_summary[:100]}")
 
+        # DEC-030: Ergebnisse in DuckDB persistieren (nur DuckDB + active_stats_keys, nicht in datasets)
+        _, active_stats_keys = _store_stats_in_duckdb(
+            state, results, statistics
+        )
+        if active_stats_keys:
+            logger.info(f"DEC-030: {len(active_stats_keys)} Stats-Datasets in DuckDB gespeichert")
+
         # Antwort generieren
         response_text = f"Statistische Analyse:\n\n{stats_summary}"
 
-        return {
+        result_state = {
             "messages": [AIMessage(content=response_text)],
             "statistics": statistics,
             "statistics_summary": stats_summary,
         }
+
+        # DEC-030: active_stats_keys für Viz-Zugriff im Folge-Turn
+        # Persistenz läuft über turn_history (stats_dataset_keys) + DuckDB statistics-Tabelle.
+        # datasets bleibt nur für Telemetrie — Stats-DatasetMeta nicht in datasets.
+        if active_stats_keys:
+            result_state["active_stats_keys"] = active_stats_keys
+
+        return result_state
 
     except Exception as e:
         error_msg = f"Fehler bei der statistischen Analyse: {str(e)}"
