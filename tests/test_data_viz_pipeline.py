@@ -45,7 +45,7 @@ async def run_pipeline_test(query: str, viz_instruction: str = "Zeig das als Lin
     
     data_result = await run_data_agent(data_state)
     
-    print(f"   Datasets: {list(data_result.get('datasets', {}).keys())}")
+    print(f"   Active Keys: {data_result.get('active_dataset_keys', [])}")
     print(f"   Meta: {data_result.get('data_meta', 'N/A')}")
     
     if data_result.get("error"):

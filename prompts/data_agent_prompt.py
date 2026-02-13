@@ -59,7 +59,12 @@ def get_data_agent_prompt(data_mode: str = "overview") -> str:
     example_workday_day = example_workday.strftime('%d.%m.')
 
     # DEC-023: Data Mode Text
-    if data_mode == "detail":
+    if data_mode == "latest":
+        data_mode_text = """latest = Nur den aktuellsten Wert pro Signal.
+- Nutze get_latest_telemetry statt get_telemetry
+- Holt nur den letzten Datenpunkt pro Key (kein Zeitraum nötig)
+- Für Fragen wie "aktuelle Position", "aktueller Wert", "wie ist gerade..."."""
+    elif data_mode == "detail":
         data_mode_text = """detail = Hohe Auflösung, möglichst viele Datenpunkte.
 - Setze raw=True bei get_telemetry
 - Holt Rohdaten ohne Aggregation
@@ -117,7 +122,7 @@ Nach dem Datenabruf informiere den User über:
 Am Ende des System-Prompts stehen <supervisor_instructions> mit dem konkreten Auftrag:
 - Welche Keys zu laden sind
 - Welcher Zeitraum
-- Welcher Modus (detail/overview)
+- Welcher Modus (latest/detail/overview)
 Folge diesen Anweisungen. Nutze check_dataset um zu prüfen was bereits in der DB liegt.
 
 Falls KEINE <supervisor_instructions> vorhanden sind:

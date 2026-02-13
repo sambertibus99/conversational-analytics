@@ -1,6 +1,6 @@
 # AKTUELLER STAND
 
-> **Letzte Aktualisierung:** 04. Februar 2026 (DEC-025 DuckDB + data_instructions + Re-Plan Konzept)
+> **Letzte Aktualisierung:** 13. Februar 2026 (Reasoning-basierter EVAL Prompt)
 
 ---
 
@@ -18,6 +18,51 @@ Das System ist funktionsfähig und getestet:
 ---
 
 ## ✅ Abgeschlossene Sessions
+
+### Session 10: Reasoning-basierter EVAL Prompt (13.02.2026)
+
+**Problem:** Hart-kodierte Regeln im Supervisor EVAL Prompt (DEC-032) verursachten eine endlose Replan-Schleife beim DEC-030 Stats-to-Viz Flow. Wenn der User nach einer Korrelationsanalyse "Zeig mir das Ergebnis in einem Diagramm" fragte, plante der Supervisor `["stats_agent", "viz_agent"]`. Die EVAL-Regel "Stats-vor-Viz Konflikt" erkannte den fehlenden `data_agent` als Fehler und löste einen Replan aus — obwohl der Gatekeeper-Modus (DEC-030) genau diesen Flow vorsieht. Ergebnis: viz_agent wurde nie ausgeführt.
+
+**Lösung:** `get_supervisor_eval_prompt()` von hart-kodierten Wenn-Dann-Regeln auf reasoning-basierte Agent-Capability-Beschreibungen umgestellt. Neuer Prompt beschreibt:
+- `<agents>`: Fähigkeiten, Inputs, Outputs und Modi jedes Agents (inkl. Gatekeeper-Modus)
+- `<data_flow>`: 4 typische Datenflüsse durch das System (inkl. Flow 4: stats Gatekeeper → viz ohne data_agent)
+- `<task>`: Evaluierungsauftrag ohne starre Regeln — LLM reasoned selbst ob der Plan valide ist
+
+Ansatz basiert auf Anthropics Context Engineering Guide ("Goldilocks Zone"): Spezifisch genug um zu leiten, flexibel genug für Model-Reasoning.
+
+**Änderungen:**
+- `prompts/supervisor_prompt.py` — `get_supervisor_eval_prompt()` komplett neu geschrieben: 3 hart-kodierte Regeln → reasoning-basierte `<agents>` + `<data_flow>` + `<task>` Struktur
+
+**Test-Ergebnis:**
+- 351 Tests bestanden, 0 Fehler
+- Pattern-Review: 0 Verstöße, 15 Patterns korrekt eingehalten (DEC-015, DEC-021, DEC-022, DEC-030, DEC-032 u.a.)
+
+---
+
+### Session 9: DuckDB Single Source of Truth + Supervisor-Replan-Loop (13.02.2026)
+
+**Problem:** DatasetMeta wurde doppelt gehalten (AgentState `datasets` + DuckDB `dataset_meta`), was zu Sync-Problemen führte. Komplexe Multi-Goal-Queries ("Finde die stärkste Belastung und zeig den Zeitraum im Detail") erforderten mehrere manuelle User-Turns.
+
+**Lösung (DEC-031):** Strangler-Fig-Migration in 3 Schritten: Dual-Write → DuckDB-first mit Fallback → `datasets`-Feld komplett entfernt. DuckDB ist jetzt einzige Source of Truth für DatasetMeta. `merge_datasets` Reducer gelöscht.
+
+**Lösung (DEC-032):** Supervisor-Replan-Loop für Multi-Goal-Queries. `replan_bridge` Node erstellt Snapshot der Phase-Ergebnisse und routet zurück zum Supervisor. Max 2 Replans (3 Phasen total). Supervisor plant basierend auf `replan_context` die nächste Phase.
+
+**Änderungen:**
+- `config/duckdb_store.py` — `dataset_meta` Tabelle mit CRUD-Methoden (`store_dataset_meta`, `get_dataset_meta`, `get_dataset_metas`, `get_all_dataset_metas`)
+- `agents/state.py` — `datasets`-Feld + `merge_datasets` Reducer entfernt. 3 neue Felder: `pending_goals`, `replan_count`, `replan_context`
+- `agents/data_agent.py` — `"datasets"` aus Return entfernt, `existing_datasets` via DuckDB
+- `agents/utils.py` — `get_dataset_meta_from_duckdb()` Helper, Legacy-Fallbacks entfernt
+- `agents/graph.py` — `replan_bridge()` Node, Replan-Routing in `get_next_agent()`, `DEFAULT_MAX_STEPS=15`, `recursion_limit=30`, respond_node mit Vorherige-Phase-Kontext
+- `agents/supervisor.py` — `_get_per_turn_reset()`, `_build_replan_context()`, `pending_goals` Extraktion
+- `agents/viz_agent.py` — DuckDB-first für Meta, Legacy-Fallbacks entfernt
+- `agents/stats_agent.py` — DuckDB-first für Meta, Legacy-Fallbacks entfernt, `calculate_min_max` temporal-aware
+- `prompts/supervisor_prompt.py` — `<replan>` Sektion, `pending_goals` in Output-Format, Replan-Beispiele
+- `tools/stats_functions.py` — `calculate_min_max(values, timestamps)` mit optionalen Timestamps
+- `docs/DECISIONS.md` — DEC-031 + DEC-032 dokumentiert
+
+**Test-Ergebnis:** 333 Tests bestanden (34 neue Tests für DuckDB dataset_meta, Replan-Loop, temporal-aware Stats)
+
+---
 
 ### Session 8: DEC-025 DuckDB Reference-only State + Bugfixes + Re-Plan Konzept (04.02.2026)
 
@@ -264,7 +309,7 @@ Session-Typ B: Implementierung
 
 ---
 
-## 🧠 Entscheidungs-Patterns (25 total)
+## 🧠 Entscheidungs-Patterns (30 total)
 
 | ID | Pattern | Anwenden bei | Status |
 |----|---------|--------------|--------|

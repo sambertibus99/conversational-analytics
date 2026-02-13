@@ -3,7 +3,6 @@ Zentraler State für das Multi-Agent System.
 
 Der State wird zwischen allen Agents geteilt und enthält:
 - messages: Chat-Verlauf (akkumuliert via add_messages)
-- datasets: DatasetMeta-Referenzen (akkumuliert via merge_datasets)
 - plan: Ausführungsplan vom Supervisor
 - statistics: Berechnete Statistiken
 - chart_url: URL/Pfad zum generierten Chart
@@ -19,9 +18,10 @@ DEC-017: Graph Best Practices
 DEC-023: Query-Typ-basierte Datenstrategie
 - data_retrieval_mode: "detail" für Stats, "overview" für Viz
 
-DEC-025: Reference-only State — Rohdaten in DuckDB, nur Metadaten im State
-- datasets enthält nur noch DatasetMeta (kein "data" Key mehr)
-- Rohdaten werden über SessionStore (DuckDB) abgefragt
+DEC-025/031: DuckDB als Single Source of Truth
+- DatasetMeta liegt ausschließlich in DuckDB dataset_meta Tabelle
+- Rohdaten in DuckDB telemetry Tabelle
+- Zugriff über get_dataset_meta_from_duckdb() in agents/utils.py
 
 DEC-030: Stats-Ergebnisse als persistente DuckDB-Datasets
 - active_stats_keys: Analog zu active_dataset_keys, aber für Stats-Ergebnisse
@@ -89,27 +89,6 @@ class DatasetMeta(TypedDict, total=False):
     meta: dict                # Originale Meta-Daten vom MCP Server
 
 
-def merge_datasets(existing: dict[str, Any] | None, new: dict[str, Any] | None) -> dict[str, Any]:
-    """
-    Reducer für datasets: Merged neue Datensätze in bestehende.
-    
-    Beispiel:
-        existing = {"torque": {...}, "velocity": {...}}
-        new = {"position": {...}}
-        result = {"torque": {...}, "velocity": {...}, "position": {...}}
-    
-    Bei gleichem Key wird der neue Wert genommen (Update).
-    """
-    if existing is None and new is None:
-        return {}
-    if existing is None:
-        return new or {}
-    if new is None:
-        return existing
-    
-    # Merge: existing + new (new überschreibt bei Konflikt)
-    return {**existing, **new}
-
 
 class AgentState(MessagesState):
     """
@@ -119,8 +98,9 @@ class AgentState(MessagesState):
     mit add_messages Reducer (akkumuliert automatisch).
     
     WICHTIG:
-    - datasets und turn_history haben Reducer → akkumulieren über Turns
+    - turn_history hat Reducer → akkumuliert über Turns
     - Andere Felder werden überschrieben (plan, chart_url, etc.)
+    - DEC-031: DatasetMeta liegt in DuckDB, nicht mehr im State
     """
     
     # === DuckDB Session (DEC-025) ===
@@ -140,12 +120,6 @@ class AgentState(MessagesState):
     # === Data Instructions (vom Supervisor an Data Agent) ===
     # Konkrete Anweisungen was der Data Agent laden soll
     data_instructions: str | None = None
-    
-    # === Daten (vom Data Agent) ===
-    # AKKUMULIERT über Turns via merge_datasets Reducer
-    # DEC-025: Nur noch DatasetMeta (Referenzen), Rohdaten in DuckDB SessionStore
-    # Format: {"krc5/torque/timeseries/2h": DatasetMeta, ...}
-    datasets: Annotated[dict[str, Any], merge_datasets] = {}
     
     # === Turn History (DEC-029) ===
     # Strukturierte Zusammenfassungen vergangener Turns für Supervisor-Kontext
@@ -183,3 +157,8 @@ class AgentState(MessagesState):
     error_count: int = 0  # Anzahl aufgetretener Fehler
     # === Cycle Guard (DEC-017) ===
     max_steps: int = 10  # Maximale Schritte bevor Notfall-Exit
+
+    # === Replan-Loop (DEC-032) ===
+    pending_goals: list[str] | None = None   # Offene Ziele nach Phase
+    replan_count: int = 0                     # Anzahl bisheriger Replans
+    replan_context: dict | None = None        # Snapshot der vorherigen Phase

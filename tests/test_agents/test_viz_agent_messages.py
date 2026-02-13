@@ -379,25 +379,32 @@ class TestPrepareVizContext:
     """Tests für prepare_viz_context()."""
     
     def test_context_creation(self):
-        """Testet Kontext-Erstellung."""
-        state = AgentState(
-            messages=[
-                HumanMessage(content="Zeige Torque als Chart"),
-                AIMessage(content="Daten werden verarbeitet"),
-            ],
-            datasets={
-                "torque": {
-                    "data": {"torque_act_a1": [{"value": 10.5, "timestamp": 1734350000000}]},
-                    "meta": {},
-                }
-            },
-        )
+        """Testet Kontext-Erstellung mit DuckDB-Daten (DEC-031)."""
+        from config.duckdb_store import SessionStore
 
-        context_dict, context_str = prepare_viz_context(state)
+        session_id = "test_viz_context"
+        store = SessionStore.get_instance(session_id)
+        try:
+            store.store_dataset(
+                dataset_key="krc5/torque/timeseries",
+                data={"torque_act_a1": [{"value": 10.5, "timestamp": 1734350000000}]},
+            )
+            state = AgentState(
+                messages=[
+                    HumanMessage(content="Zeige Torque als Chart"),
+                    AIMessage(content="Daten werden verarbeitet"),
+                ],
+                session_id=session_id,
+                active_dataset_keys=["krc5/torque/timeseries"],
+            )
 
-        assert isinstance(context_dict, dict)
-        assert isinstance(context_str, str)
-        assert len(context_str) > 0
+            context_dict, context_str = prepare_viz_context(state)
+
+            assert isinstance(context_dict, dict)
+            assert isinstance(context_str, str)
+            assert len(context_str) > 0
+        finally:
+            SessionStore.destroy(session_id)
 
 
 # =============================================================================

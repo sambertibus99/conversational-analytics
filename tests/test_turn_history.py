@@ -322,10 +322,45 @@ def _make_state(**overrides) -> dict:
         "messages": [HumanMessage(content="Test-Anfrage")],
         "plan": ["data_agent"],
         "data_retrieval_mode": "overview",
-        "datasets": {},
+        "session_id": "default",
     }
     base.update(overrides)
     return base
+
+
+def _make_state_with_duckdb(dataset_metas: dict, session_id: str = "test_turn_history", **overrides) -> dict:
+    """Erstellt State mit DuckDB dataset_meta (DEC-031).
+
+    Args:
+        dataset_metas: Dict von dataset_key -> meta dict mit keys, timerange, etc.
+        session_id: DuckDB Session-ID für Isolation
+        **overrides: Weitere State-Felder
+
+    Returns:
+        State-Dict mit session_id und active_dataset_keys gesetzt
+    """
+    from config.duckdb_store import SessionStore
+
+    store = SessionStore.get_instance(session_id)
+    for key, meta in dataset_metas.items():
+        store.store_dataset_meta({
+            "dataset_key": key,
+            "device_id": meta.get("device_id", "krc5"),
+            "keys": meta.get("keys", []),
+            "point_count": meta.get("point_count", 0),
+            "timerange": meta.get("timerange", {}),
+            "retrieval_mode": meta.get("retrieval_mode", "overview"),
+            "unit": meta.get("unit", ""),
+            "created_at": meta.get("created_at", "2026-02-12T00:00:00"),
+            "meta": meta.get("meta", {}),
+        })
+
+    active_keys = overrides.pop("active_dataset_keys", list(dataset_metas.keys()))
+    return _make_state(
+        session_id=session_id,
+        active_dataset_keys=active_keys,
+        **overrides,
+    )
 
 
 class TestBuildTurnEntry:
@@ -423,78 +458,90 @@ class TestBuildTurnEntry:
 
     def test_only_active_dataset_keys(self):
         """Nur active_dataset_keys erscheinen in datasets."""
-        state = _make_state(
-            datasets={
-                "krc5/torque/ts": {
-                    "dataset_key": "krc5/torque/ts",
-                    "keys": ["torque_a1"],
-                    "timerange": {"start_human": "14:00", "end_human": "15:00"},
+        from config.duckdb_store import SessionStore
+        sid = "test_active_keys"
+        try:
+            state = _make_state_with_duckdb(
+                {
+                    "krc5/torque/ts": {
+                        "keys": ["torque_a1"],
+                        "timerange": {"start_human": "14:00", "end_human": "15:00"},
+                    },
+                    "krc5/velocity/ts": {
+                        "keys": ["vel_a1"],
+                        "timerange": {"start_human": "14:00", "end_human": "15:00"},
+                    },
                 },
-                "krc5/velocity/ts": {
-                    "dataset_key": "krc5/velocity/ts",
-                    "keys": ["vel_a1"],
-                    "timerange": {"start_human": "14:00", "end_human": "15:00"},
-                },
-            },
-            active_dataset_keys=["krc5/torque/ts"],
-        )
+                session_id=sid,
+                active_dataset_keys=["krc5/torque/ts"],
+            )
 
-        entry = _build_turn_entry(state)
+            entry = _build_turn_entry(state)
 
-        assert "datasets" in entry
-        all_keys = []
-        for ds in entry["datasets"]:
-            all_keys.extend(ds["keys"])
-        assert "torque_a1" in all_keys
-        assert "vel_a1" not in all_keys
+            assert "datasets" in entry
+            all_keys = []
+            for ds in entry["datasets"]:
+                all_keys.extend(ds["keys"])
+            assert "torque_a1" in all_keys
+            assert "vel_a1" not in all_keys
+        finally:
+            SessionStore.destroy(sid)
 
     def test_grouping_same_timerange(self):
         """Gleicher Zeitraum → ein Eintrag mit kombinierten Keys."""
-        state = _make_state(
-            datasets={
-                "krc5/torque/ts": {
-                    "dataset_key": "krc5/torque/ts",
-                    "keys": ["torque_a1"],
-                    "timerange": {"start_human": "14:00", "end_human": "15:00"},
+        from config.duckdb_store import SessionStore
+        sid = "test_group_same_tr"
+        try:
+            state = _make_state_with_duckdb(
+                {
+                    "krc5/torque/ts": {
+                        "keys": ["torque_a1"],
+                        "timerange": {"start_human": "14:00", "end_human": "15:00"},
+                    },
+                    "krc5/velocity/ts": {
+                        "keys": ["vel_a1"],
+                        "timerange": {"start_human": "14:00", "end_human": "15:00"},
+                    },
                 },
-                "krc5/velocity/ts": {
-                    "dataset_key": "krc5/velocity/ts",
-                    "keys": ["vel_a1"],
-                    "timerange": {"start_human": "14:00", "end_human": "15:00"},
-                },
-            },
-        )
+                session_id=sid,
+            )
 
-        entry = _build_turn_entry(state)
+            entry = _build_turn_entry(state)
 
-        assert "datasets" in entry
-        assert len(entry["datasets"]) == 1
-        ds = entry["datasets"][0]
-        assert "torque_a1" in ds["keys"]
-        assert "vel_a1" in ds["keys"]
-        assert ds["timerange"] == "14:00 - 15:00"
+            assert "datasets" in entry
+            assert len(entry["datasets"]) == 1
+            ds = entry["datasets"][0]
+            assert "torque_a1" in ds["keys"]
+            assert "vel_a1" in ds["keys"]
+            assert ds["timerange"] == "14:00 - 15:00"
+        finally:
+            SessionStore.destroy(sid)
 
     def test_grouping_different_timeranges(self):
         """Verschiedene Zeiträume → separate Einträge."""
-        state = _make_state(
-            datasets={
-                "krc5/torque/ts": {
-                    "dataset_key": "krc5/torque/ts",
-                    "keys": ["torque_a1"],
-                    "timerange": {"start_human": "14:00", "end_human": "15:00"},
+        from config.duckdb_store import SessionStore
+        sid = "test_group_diff_tr"
+        try:
+            state = _make_state_with_duckdb(
+                {
+                    "krc5/torque/ts": {
+                        "keys": ["torque_a1"],
+                        "timerange": {"start_human": "14:00", "end_human": "15:00"},
+                    },
+                    "krc5/velocity/ts": {
+                        "keys": ["vel_a1"],
+                        "timerange": {"start_human": "10:00", "end_human": "12:00"},
+                    },
                 },
-                "krc5/velocity/ts": {
-                    "dataset_key": "krc5/velocity/ts",
-                    "keys": ["vel_a1"],
-                    "timerange": {"start_human": "10:00", "end_human": "12:00"},
-                },
-            },
-        )
+                session_id=sid,
+            )
 
-        entry = _build_turn_entry(state)
+            entry = _build_turn_entry(state)
 
-        assert "datasets" in entry
-        assert len(entry["datasets"]) == 2
+            assert "datasets" in entry
+            assert len(entry["datasets"]) == 2
+        finally:
+            SessionStore.destroy(sid)
 
 
 class TestFormatTimerange:
@@ -545,22 +592,38 @@ class TestDetermineResultType:
 
 
 class TestGroupDatasetsByTimerange:
-    """Tests für _group_datasets_by_timerange."""
+    """Tests für _group_datasets_by_timerange (DEC-031: DuckDB-only)."""
 
-    def test_empty_datasets(self):
-        result = _group_datasets_by_timerange({"datasets": {}})
+    def test_no_duckdb_session(self):
+        """Ohne DuckDB-Session → leere Liste."""
+        result = _group_datasets_by_timerange({"session_id": "nonexistent"})
         assert result == []
 
-    def test_non_dict_values_skipped(self):
-        result = _group_datasets_by_timerange({"datasets": {"key": "not_a_dict"}})
+    def test_no_active_keys(self):
+        """Ohne active_dataset_keys → leere Liste (kein DuckDB)."""
+        result = _group_datasets_by_timerange({"session_id": "nonexistent", "active_dataset_keys": None})
         assert result == []
 
-    def test_no_keys_skipped(self):
-        """Dataset ohne keys wird nicht aufgenommen."""
-        result = _group_datasets_by_timerange({
-            "datasets": {"key": {"timerange": {"start": "a", "end": "b"}, "keys": []}},
-        })
-        assert result == []
+    def test_with_duckdb_data(self):
+        """Mit DuckDB-Daten → korrekte Gruppierung."""
+        from config.duckdb_store import SessionStore
+        sid = "test_group_ds"
+        try:
+            store = SessionStore.get_instance(sid)
+            store.store_dataset_meta({
+                "dataset_key": "krc5/torque/ts",
+                "keys": ["torque_a1"],
+                "timerange": {"start_human": "14:00", "end_human": "15:00"},
+                "created_at": "2026-02-12T00:00:00",
+            })
+            result = _group_datasets_by_timerange({
+                "session_id": sid,
+                "active_dataset_keys": ["krc5/torque/ts"],
+            })
+            assert len(result) == 1
+            assert "torque_a1" in result[0]["keys"]
+        finally:
+            SessionStore.destroy(sid)
 
 
 # =============================================================================
@@ -573,97 +636,95 @@ class TestTurnHistoryIntegration:
     def test_full_flow_data_turn(self):
         """Voller Flow: State → _build_turn_entry → build_turn_context."""
         from agents.supervisor import build_turn_context
-
-        # 1. State nach einem Data-Turn
-        state = _make_state(
-            messages=[HumanMessage(content="Zeige Drehmomente A1 vom 4. Februar 14:20-15:00")],
-            plan=["data_agent"],
-            data_retrieval_mode="overview",
-            datasets={
-                "krc5/torque/ts": {
-                    "dataset_key": "krc5/torque/ts",
-                    "keys": ["torque_act_a1_nm"],
-                    "timerange": {"start_human": "04.02. 14:20", "end_human": "04.02. 15:00"},
+        from config.duckdb_store import SessionStore
+        sid = "test_full_flow_data"
+        try:
+            # 1. State nach einem Data-Turn (DEC-031: DuckDB)
+            state = _make_state_with_duckdb(
+                {
+                    "krc5/torque/ts": {
+                        "keys": ["torque_act_a1_nm"],
+                        "timerange": {"start_human": "04.02. 14:20", "end_human": "04.02. 15:00"},
+                    },
                 },
-            },
-        )
+                session_id=sid,
+                messages=[HumanMessage(content="Zeige Drehmomente A1 vom 4. Februar 14:20-15:00")],
+                plan=["data_agent"],
+                data_retrieval_mode="overview",
+            )
 
-        # 2. _build_turn_entry erzeugt TurnEntry
-        entry = _build_turn_entry(state)
+            # 2. _build_turn_entry erzeugt TurnEntry
+            entry = _build_turn_entry(state)
 
-        assert entry["user_query"] == "Zeige Drehmomente A1 vom 4. Februar 14:20-15:00"
-        assert entry["plan"] == ["data_agent"]
-        assert entry["result_type"] == "data"
-        assert "datasets" in entry
-        assert entry["datasets"][0]["keys"] == ["torque_act_a1_nm"]
+            assert entry["user_query"] == "Zeige Drehmomente A1 vom 4. Februar 14:20-15:00"
+            assert entry["plan"] == ["data_agent"]
+            assert entry["result_type"] == "data"
+            assert "datasets" in entry
+            assert entry["datasets"][0]["keys"] == ["torque_act_a1_nm"]
 
-        # 3. build_turn_context formatiert für Supervisor
-        context = build_turn_context([entry], {})
+            # 3. build_turn_context formatiert für Supervisor
+            context = build_turn_context([entry])
 
-        assert "BISHERIGER VERLAUF" in context
-        assert "torque_act_a1_nm" in context
-        assert "04.02. 14:20 - 04.02. 15:00" in context
+            assert "BISHERIGER VERLAUF" in context
+            assert "torque_act_a1_nm" in context
+            assert "04.02. 14:20 - 04.02. 15:00" in context
+        finally:
+            SessionStore.destroy(sid)
 
     def test_full_flow_multi_turn(self):
         """Voller Flow über 2 Turns: Korrelation → dann als Chart."""
         from agents.supervisor import build_turn_context
-
-        # Turn 1: Korrelation
-        state_t1 = _make_state(
-            messages=[HumanMessage(content="Korrelation Moment/Position, A1-A3, 4.Feb 14:20-15:00")],
-            plan=["data_agent", "stats_agent"],
-            data_retrieval_mode="detail",
-            statistics_summary="Korrelation A1 r=0.012, A2 r=-0.617, A3 r=0.303",
-            datasets={
-                "krc5/torque/ts": {
-                    "dataset_key": "krc5/torque/ts",
-                    "keys": ["torque_act_a1_nm", "torque_act_a2_nm", "torque_act_a3_nm"],
-                    "timerange": {"start_human": "04.02. 14:20", "end_human": "04.02. 15:00"},
+        from config.duckdb_store import SessionStore
+        sid = "test_full_flow_multi"
+        try:
+            # Turn 1: Korrelation (DEC-031: DuckDB)
+            state_t1 = _make_state_with_duckdb(
+                {
+                    "krc5/torque/ts": {
+                        "keys": ["torque_act_a1_nm", "torque_act_a2_nm", "torque_act_a3_nm"],
+                        "timerange": {"start_human": "04.02. 14:20", "end_human": "04.02. 15:00"},
+                    },
+                    "krc5/axis/ts": {
+                        "keys": ["axis_act_a1_deg", "axis_act_a2_deg", "axis_act_a3_deg"],
+                        "timerange": {"start_human": "04.02. 14:20", "end_human": "04.02. 15:00"},
+                    },
                 },
-                "krc5/axis/ts": {
-                    "dataset_key": "krc5/axis/ts",
-                    "keys": ["axis_act_a1_deg", "axis_act_a2_deg", "axis_act_a3_deg"],
-                    "timerange": {"start_human": "04.02. 14:20", "end_human": "04.02. 15:00"},
-                },
-            },
-        )
-        entry_t1 = _build_turn_entry(state_t1)
+                session_id=sid,
+                messages=[HumanMessage(content="Korrelation Moment/Position, A1-A3, 4.Feb 14:20-15:00")],
+                plan=["data_agent", "stats_agent"],
+                data_retrieval_mode="detail",
+                statistics_summary="Korrelation A1 r=0.012, A2 r=-0.617, A3 r=0.303",
+            )
+            entry_t1 = _build_turn_entry(state_t1)
 
-        # Turn 2: Chart
-        state_t2 = _make_state(
-            messages=[HumanMessage(content="Zeig mir die Daten in einem Diagramm")],
-            plan=["data_agent", "viz_agent"],
-            data_retrieval_mode="overview",
-            chart_url="http://example.com/chart.png",
-            chart_type="multi_line",
-        )
-        entry_t2 = _build_turn_entry(state_t2)
+            # Turn 2: Chart (kein neues DuckDB-Setup nötig, Entry hat kein dataset)
+            state_t2 = _make_state(
+                messages=[HumanMessage(content="Zeig mir die Daten in einem Diagramm")],
+                plan=["data_agent", "viz_agent"],
+                data_retrieval_mode="overview",
+                chart_url="http://example.com/chart.png",
+                chart_type="multi_line",
+            )
+            entry_t2 = _build_turn_entry(state_t2)
 
-        # Supervisor sieht beide Turns
-        context = build_turn_context([entry_t1, entry_t2], {})
+            # Supervisor sieht beide Turns
+            context = build_turn_context([entry_t1, entry_t2])
 
-        assert "Turn 1" in context
-        assert "Turn 2" in context
-        assert "Korrelation" in context
-        assert "Diagramm" in context
-        assert "torque_act_a1_nm" in context
+            assert "Turn 1" in context
+            assert "Turn 2" in context
+            assert "Korrelation" in context
+            assert "Diagramm" in context
+            assert "torque_act_a1_nm" in context
+        finally:
+            SessionStore.destroy(sid)
 
-    def test_backward_compat_datasets_without_history(self):
-        """Backward-Compat: State mit Datasets aber ohne turn_history."""
+    def test_no_history_no_duckdb(self):
+        """DEC-031: Ohne turn_history und ohne DuckDB → leerer String."""
         from agents.supervisor import build_turn_context
 
-        # Alte Session: Datasets vorhanden, aber kein turn_history
-        datasets = {
-            "krc5/torque/ts": {
-                "dataset_key": "krc5/torque/ts",
-                "keys": ["torque_act_a1_nm"],
-            },
-        }
+        context = build_turn_context([])
 
-        context = build_turn_context([], datasets)
-
-        assert "VORHANDENE DATEN" in context
-        assert "Daten vorhanden" in context
+        assert context == ""
         assert "BISHERIGER VERLAUF" not in context
 
     def test_reducer_accumulates_across_turns(self):

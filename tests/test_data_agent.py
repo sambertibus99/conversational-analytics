@@ -42,11 +42,11 @@ async def test_latest_telemetry(cleanup_mcp_after_test):
     # Daten vorhanden
     assert result.get("data") is not None, "Keine Daten erhalten"
     
-    # Datasets vorhanden (DEC-025: DatasetMeta statt data_summary)
-    assert result.get("datasets"), "Keine Datasets"
+    # DEC-031: active_dataset_keys statt datasets (DuckDB ist Source of Truth)
+    assert result.get("active_dataset_keys"), "Keine active_dataset_keys"
 
     print(f"✅ Latest Telemetry Test bestanden")
-    print(f"   Datasets: {list(result.get('datasets', {}).keys())}")
+    print(f"   Active Keys: {result.get('active_dataset_keys', [])}")
 
 
 @pytest.mark.integration
@@ -72,13 +72,13 @@ async def test_timeseries(cleanup_mcp_after_test):
     # - Oder "keine" im Summary
     meta = result.get("data_meta") or {}
 
-    has_data = result.get("data") is not None or result.get("datasets")
+    has_data = result.get("data") is not None or result.get("active_dataset_keys")
     is_no_data = meta.get("type") == "no_data"
 
     assert has_data or is_no_data, f"Weder Daten noch no_data. Meta: {meta}"
 
     print(f"✅ Timeseries Test bestanden")
-    print(f"   Datasets: {list(result.get('datasets', {}).keys())}")
+    print(f"   Active Keys: {result.get('active_dataset_keys', [])}")
     if is_no_data:
         print(f"   (no_data - Roboter war nicht aktiv)")
 
@@ -126,13 +126,13 @@ async def test_multiple_keys(cleanup_mcp_after_test):
     # Agent muss IRGENDEINE sinnvolle Response geben
     meta = result.get("data_meta") or {}
 
-    has_data = result.get("data") is not None or result.get("datasets")
+    has_data = result.get("data") is not None or result.get("active_dataset_keys")
     is_no_data = meta.get("type") == "no_data"
 
     assert has_data or is_no_data, f"Weder Daten noch no_data. Meta: {meta}"
 
     print(f"✅ Multiple Keys Test bestanden")
-    print(f"   Datasets: {list(result.get('datasets', {}).keys())}")
+    print(f"   Active Keys: {result.get('active_dataset_keys', [])}")
     if is_no_data:
         print(f"   (no_data - Roboter war nicht aktiv)")
 
@@ -164,7 +164,7 @@ async def interactive_test():
         print("\n⏳ Verarbeite...")
         result = await run_data_agent(state)
         
-        print(f"\n📊 Datasets: {list(result.get('datasets', {}).keys())}")
+        print(f"\n📊 Active Keys: {result.get('active_dataset_keys', [])}")
         
         if result.get("error"):
             print(f"❌ Error: {result['error']}")
@@ -206,7 +206,7 @@ if __name__ == "__main__":
                 return False
             
             print(f"✅ Test erfolgreich!")
-            print(f"   Datasets: {list(result.get('datasets', {}).keys())}")
+            print(f"   Active Keys: {result.get('active_dataset_keys', [])}")
             return True
         
         success = asyncio.run(quick_test())

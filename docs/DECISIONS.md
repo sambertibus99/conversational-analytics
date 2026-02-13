@@ -2,7 +2,7 @@
 
 > **Zweck:** Wiederverwendbare Patterns aus Projekt-Entscheidungen
 > **Für:** Claude erkennt ähnliche Probleme und schlägt bewährte Lösungen vor
-> **Stand:** 11. Februar 2026
+> **Stand:** 13. Februar 2026
 
 ---
 
@@ -38,6 +38,9 @@
 | DEC-028 | Data Agent als Daten-Gatekeeper | Supervisor hat zu viel Detail-Wissen über Datasets | Data Agent läuft immer, setzt active_dataset_keys | Alle Turns mit Viz/Stats Agent |
 | DEC-029 | Supervisor als Kontext-Instanz | Follow-up-Queries scheitern weil Konversationskontext fehlt | Strukturierte turn_history + Telemetrie-Referenz im Prompt | Multi-Turn Konversationen |
 | DEC-030 | Stats als persistente DuckDB-Datasets | Stats-Ergebnisse gehen nach Turn verloren | Eigene statistics-Tabelle + active_stats_keys | Stats→Viz Multi-Turn Flow |
+| DEC-031 | DuckDB Single Source of Truth | DatasetMeta doppelt in State + DuckDB | datasets-Feld entfernt, nur noch DuckDB | Alle DatasetMeta-Zugriffe |
+| DEC-032 | Supervisor-Replan-Loop | Multi-Goal-Query braucht mehrere Phasen | replan_bridge + pending_goals + max 2 Replans | Komplexe abhängige Analyse-Anfragen |
+| DEC-033 | Reasoning-basierter EVAL Prompt | Hart-kodierte EVAL-Regeln verursachen falsche Replans | Agent-Capabilities + Datenflüsse statt If-Then-Regeln | Supervisor EVAL, Agent-Orchestrierung |
 
 ---
 
@@ -2408,6 +2411,407 @@ Turn N+1: "Zeig als Balkendiagramm"
 
 ---
 
+## DEC-031: DuckDB als Single Source of Truth für DatasetMeta
+
+### Problem
+DatasetMeta wurde doppelt gehalten: im AgentState (`datasets`-Feld mit `merge_datasets` Reducer) und in DuckDB (`dataset_meta`-Tabelle). Bei Multi-Turn-Konversationen führte das zu Inkonsistenzen — der State akkumulierte Metas über Turns, aber DuckDB wurde erst in Phase 2 (DEC-025) als Dual-Write hinzugefügt. Zwei Quellen der Wahrheit für die gleichen Daten erhöhten die Komplexität und Fehleranfälligkeit.
+
+### Kontext
+- DEC-025 führte DuckDB als Datenspeicher ein, aber `datasets` blieb im State
+- `merge_datasets` Reducer akkumulierte DatasetMeta über Turns via InMemorySaver Checkpointer
+- 14 Stellen in 7 Dateien lasen aus `state["datasets"]`
+- DuckDB `dataset_meta`-Tabelle existierte seit Phase 2 mit identischem Schema
+
+| Alternative | Pro | Contra |
+|------------|-----|--------|
+| **A: DuckDB als einzige SoT** | Eine Quelle, kein Sync nötig | Migration aller Leser nötig |
+| B: State als einzige SoT | Kein DuckDB-Lookup nötig | Token-Limits bei vielen Datasets, kein SQL |
+| C: Dual-Write beibehalten | Keine Migration | Zwei Quellen, Sync-Bugs möglich |
+
+### Entscheidung
+**DatasetMeta wird ausschließlich in DuckDB `dataset_meta`-Tabelle gespeichert. Das `datasets`-Feld und der `merge_datasets` Reducer wurden aus dem AgentState entfernt (Strangler-Fig-Migration). Alle Leser nutzen `get_dataset_meta_from_duckdb()` statt `state["datasets"]`.**
+
+### Pattern
+
+**1. Strangler-Fig-Migration (3 Phasen)**
+```
+Phase 2: Dual-Write (DuckDB + State)
+Phase 3: DuckDB-first mit State-Fallback
+Phase 4: State-Feld entfernen, nur DuckDB
+```
+
+**2. DuckDB dataset_meta Schema**
+```sql
+CREATE TABLE IF NOT EXISTS dataset_meta (
+    dataset_key    TEXT PRIMARY KEY,
+    device_id      TEXT DEFAULT 'krc5',
+    keys           TEXT NOT NULL,       -- JSON array
+    point_count    INTEGER DEFAULT 0,
+    timerange      TEXT,                -- JSON dict
+    retrieval_mode TEXT DEFAULT 'overview',
+    unit           TEXT DEFAULT '',
+    created_at     TEXT NOT NULL,       -- ISO 8601
+    data_file      TEXT,
+    meta           TEXT                 -- JSON dict
+)
+```
+
+**3. Meta-Zugriff über Helper**
+```python
+from agents.utils import get_dataset_meta_from_duckdb
+
+session_id = state.get("session_id", "default")
+active_keys = state.get("active_dataset_keys")
+datasets = get_dataset_meta_from_duckdb(session_id, active_keys)
+```
+
+**4. Data Agent Dual-Write (Phase 2-3, jetzt nur DuckDB)**
+```python
+# In _store_dataset_in_duckdb():
+store.store_dataset(dataset_key, signal_key, timestamps, values, unit)
+store.store_dataset_meta(dict(dataset_meta))  # Einziger Schreibpfad
+```
+
+### Begründung
+- **Eine Quelle der Wahrheit:** Eliminiert Sync-Probleme zwischen State und DuckDB
+- **Token-Einsparung:** DatasetMeta nicht mehr im LangGraph Checkpointer-State serialisiert
+- **SQL-Zugriff:** Meta-Queries (z.B. "alle Datasets mit Zeitraum X") über DuckDB möglich
+- **Strangler Fig:** Schrittweise Migration mit Fallback — kein Big Bang, jeder Schritt testbar
+
+### Implementierung
+
+| Datei | Änderung |
+|-------|----------|
+| `config/duckdb_store.py` | `dataset_meta`-Tabelle, CRUD-Methoden (`store_dataset_meta`, `get_dataset_meta`, `get_dataset_metas`, `get_all_dataset_metas`), `_row_to_dataset_meta` |
+| `agents/state.py` | `datasets`-Feld und `merge_datasets` Reducer entfernt, `DatasetMeta` TypedDict bleibt als Schema |
+| `agents/data_agent.py` | `"datasets"` aus Return entfernt, `existing_datasets` via DuckDB |
+| `agents/utils.py` | `get_dataset_meta_from_duckdb()` Helper, Legacy-Fallbacks in `get_data_from_state()` etc. entfernt |
+| `agents/graph.py` | `respond_node`, `_group_datasets_by_timerange`, `_determine_result_summary` lesen aus DuckDB |
+| `agents/viz_agent.py` | `prepare_viz_context()` liest Meta aus DuckDB |
+| `agents/stats_agent.py` | `_extract_time_range_from_state()` liest Meta aus DuckDB |
+| `agents/supervisor.py` | `build_turn_context()` DuckDB-Check statt State-Fallback |
+
+### Anwenden bei
+- Alle Stellen die DatasetMeta lesen → `get_dataset_meta_from_duckdb()` verwenden
+- Neue Agents die Datasets referenzieren → DuckDB statt State
+- Kein `state["datasets"]` oder `state.get("datasets")` mehr verwenden
+
+### Referenz
+- `config/duckdb_store.py:store_dataset_meta()` — Schreibt Meta in DuckDB
+- `config/duckdb_store.py:get_dataset_meta()` — Liest einzelnes Meta
+- `agents/utils.py:get_dataset_meta_from_duckdb()` — Helper für Agents
+- `agents/data_agent.py:_store_dataset_in_duckdb()` — Einziger Schreibpfad
+
+---
+
+## DEC-032: Supervisor-Replan-Loop für Multi-Goal-Queries
+
+### Problem
+Komplexe User-Anfragen wie "Finde die stärkste Belastung und zeig den Zeitraum im Detail" erfordern mehrere abhängige Schritte: erst Statistik berechnen (Min/Max finden), dann basierend auf dem Ergebnis eine Detail-Visualisierung erstellen. Der Supervisor konnte bisher nur einen einzigen Plan pro Turn erstellen — Multi-Goal-Queries mussten vom User in mehrere Turns aufgeteilt werden.
+
+### Kontext
+- Supervisor erstellt pro Turn einen Plan wie `["data_agent", "stats_agent"]`
+- Ergebnis der ersten Phase (z.B. Peak-Zeitpunkt) wird für den zweiten Plan benötigt
+- Ohne Replan musste der User manuell nachfragen: "Zeig den Zeitraum um den Peak"
+- LangGraph unterstützt Zyklen im Graph — ein Node kann zurück zum Supervisor routen
+
+| Alternative | Pro | Contra |
+|------------|-----|--------|
+| **A: Replan-Loop im Graph** | Automatisch, Graph-nativ, Snapshot-basiert | Komplexität, Safety-Limit nötig |
+| B: Supervisor plant alles voraus | Einfacher Graph | Supervisor kennt Stats-Ergebnis nicht im Voraus |
+| C: Meta-Agent über Supervisor | Maximale Flexibilität | Over-Engineering, zusätzlicher LLM-Call |
+
+### Entscheidung
+**Multi-Goal-Queries werden in bis zu 3 Phasen bearbeitet (1 Initial-Plan + max 2 Replans). Der Supervisor arbeitet im Dual-Mode: PLAN-Modus (neuen Plan erstellen) und EVAL-Modus (nach jedem Agent-Schritt per LLM-Call evaluieren ob der verbleibende Plan noch sinnvoll ist). Agents routen per fester Edge zurück zum Supervisor. Ein `replan_bridge` Node erstellt einen Snapshot der Phase-Ergebnisse und routet zurück zum Supervisor. Safety-Limit: max 2 Replans.**
+
+### Pattern
+
+**1. Neue State-Felder**
+```python
+# In AgentState:
+pending_goals: list[str] | None = None   # Offene Ziele nach Phase
+replan_count: int = 0                     # Anzahl bisheriger Replans
+replan_context: dict | None = None        # Snapshot der vorherigen Phase
+```
+
+**2. Supervisor Dual-Mode (PLAN vs EVAL)**
+```python
+class EvalDecision(BaseModel):
+    """Strukturierte Entscheidung des Supervisor-LLM nach Agent-Ausführung."""
+    action: Literal["continue", "replan", "respond"]
+    reasoning: str
+    pending_goals: list[str] | None = None  # Nur bei action='replan'
+
+def _is_eval_mode(state: dict) -> bool:
+    """EVAL: plan gesetzt + step > 0 + kein replan_context. PLAN: alle anderen Fälle."""
+    plan = state.get("plan")
+    if plan is None or plan == []:
+        return False
+    if state.get("replan_context") is not None:
+        return False           # Replan-Phase → PLAN-Modus
+    if state.get("current_step", 0) > 0:
+        return True            # Nach Agent-Ausführung → EVAL-Modus
+    return False
+
+async def supervisor_node(state: AgentState) -> dict[str, Any]:
+    if _is_eval_mode(state):
+        return await run_supervisor_eval(state)   # LLM mit Structured Output
+    return await run_supervisor(state)             # Normaler PLAN-Modus
+```
+
+**3. EVAL: LLM-Call mit Structured Output**
+```python
+async def run_supervisor_eval(state: AgentState) -> dict[str, Any]:
+    # Plan fertig → kein LLM-Call nötig
+    if current_step >= len(plan):
+        return {}
+
+    # Eval-Kontext aus State aufbauen
+    eval_context = f"Plan: {plan}\nAusgeführt: {plan[:step]}\nVerbleibend: {plan[step:]}\n..."
+
+    # LLM mit EvalDecision via with_structured_output (Sonnet, nicht Opus)
+    structured_llm = llm.with_structured_output(EvalDecision)
+    decision = await structured_llm.ainvoke(messages)
+
+    if decision.action == "replan":
+        return {"pending_goals": decision.pending_goals, "current_step": len(plan)}
+    if decision.action == "respond":
+        return {"current_step": len(plan), "pending_goals": None}
+    return {}  # continue → kein State-Change
+```
+
+**4. Graph-Routing: Feste Edges Agent → Supervisor**
+```python
+# Agents routen per fester Edge zurück zum Supervisor (nicht conditional)
+for agent in AGENT_NODES:
+    graph.add_edge(agent, "supervisor")  # Agent → Supervisor (DEC-032)
+
+# Supervisor routet weiter via get_next_agent (conditional edge)
+graph.add_conditional_edges("supervisor", get_next_agent, ROUTING_MAP)
+```
+
+**5. replan_bridge Node (Snapshot)**
+```python
+async def replan_bridge(state: AgentState) -> dict[str, Any]:
+    return {
+        "replan_count": state.get("replan_count", 0) + 1,
+        "replan_context": {
+            "phase": state.get("replan_count", 0) + 1,
+            "plan": state.get("plan", []),
+            "active_dataset_keys": state.get("active_dataset_keys"),
+            "active_stats_keys": state.get("active_stats_keys"),
+            "statistics_summary": state.get("statistics_summary"),
+            "data_retrieval_mode": state.get("data_retrieval_mode"),
+        },
+    }
+```
+
+**6. Routing-Logik in get_next_agent**
+```python
+if current_step >= len(plan):
+    if state.get("pending_goals") and state.get("replan_count", 0) < 2:
+        return "replan_bridge"  # → Supervisor für nächste Phase
+    return "respond"            # → Antwort generieren
+```
+
+**7. Per-Turn Reset (replan_mode-abhängig)**
+```python
+def _get_per_turn_reset(replan_mode: bool = False) -> dict:
+    reset = {
+        "active_dataset_keys": None, "active_stats_keys": None,
+        "chart_url": None, "chart_type": None,
+        "error": None, "error_count": 0,
+        "pending_goals": None,
+        "replan_context": None,     # IMMER zurücksetzen (nach Verbrauch durch Supervisor)
+        # ...
+    }
+    if not replan_mode:
+        reset["replan_count"] = 0           # Nur bei neuem Turn zurücksetzen
+        reset["statistics"] = None          # Stats-Ergebnisse nur bei neuem Turn löschen
+        reset["statistics_summary"] = None  # (bei Replan werden sie für respond bewahrt)
+    return reset
+```
+
+**8. respond_node Reset (Multi-Turn-Fix)**
+```python
+async def respond_node(state: AgentState) -> dict[str, Any]:
+    # Plan und Step zurücksetzen damit der nächste Turn sauber im PLAN-Modus startet
+    turn_reset = {"plan": None, "current_step": 0}
+    return {**turn_reset, "messages": [...], "turn_history": [...]}
+```
+
+### Datenfluss
+```
+User: "Wann war das Moment am höchsten und zeig Korrelation + Diagramm"
+
+Phase 1:
+  Supervisor(PLAN) → plan: ["data_agent", "stats_agent"]
+  data_agent → Daten laden → Supervisor(EVAL: continue)
+  stats_agent → Max: 3.33 Nm, r=-0.997 → Supervisor(EVAL: plan fertig)
+  get_next_agent → pending_goals vorhanden → "replan_bridge"
+
+replan_bridge:
+  → replan_context: {phase: 1, statistics_summary: "Max: 3.33 Nm..., r=-0.997"}
+  → replan_count: 1
+
+Phase 2:
+  Supervisor(PLAN, sieht replan_context) → plan: ["data_agent", "viz_agent"]
+  data_agent → Overview-Daten um Peak laden → Supervisor(EVAL: continue)
+  viz_agent → Chart generieren → Supervisor(EVAL: plan fertig)
+  get_next_agent → keine pending_goals → "respond"
+
+respond_node → Antwort mit Stats + Chart (statistics aus Phase 1 bewahrt)
+            → plan: None, current_step: 0 (Clean State für nächsten Turn)
+```
+
+### Graph-Architektur
+```
+                    ┌──────────────────────────┐
+                    ▼                          │
+START → supervisor(PLAN/EVAL) → get_next_agent │
+              ▲         │            │         │
+              │    ┌────┤       pending_goals?  │
+              │    ▼    ▼            │         │
+              │  agents(feste Edge)──┘    ┌────┘
+              │         ▲                ▼
+              │         │          replan_bridge
+              │         │                │
+              └─────────┴────────────────┘
+                                    respond → END
+```
+
+### Begründung
+- **LLM-Eval nach jedem Agent:** Supervisor erkennt Datenkonflikte (Stats-vor-Viz) automatisch statt hardcoded Regeln
+- **Dual-Mode:** Ein Node (supervisor_node) für beide Aufgaben — kein zusätzlicher Graph-Node nötig
+- **Feste Edges:** Agents routen immer zum Supervisor zurück — einfacher Graph, EVAL entscheidet über Fortgang
+- **Structured Output:** `EvalDecision` via `with_structured_output()` — typsichere 3-Wege-Entscheidung
+- **Snapshot-Ansatz:** `replan_context` speichert Ergebnisse BEVOR Supervisor per-turn Reset macht
+- **Stats-Bewahrung:** `statistics`/`statistics_summary` überleben Replan-Phasen (für respond_node)
+- **Safety-Limit:** Max 2 Replans (3 Phasen total) verhindert Endlosschleifen
+- **Graceful Degradation:** Bei LLM-Fehler im EVAL → `{}` (continue als Fallback)
+
+### Implementierung
+
+| Datei | Änderung |
+|-------|----------|
+| `agents/state.py` | `pending_goals`, `replan_count`, `replan_context` Felder |
+| `agents/supervisor.py` | `EvalDecision` Model, `_is_eval_mode()`, `supervisor_node()` Dual-Mode, `run_supervisor_eval()` mit Structured Output, `_get_per_turn_reset(replan_mode)` mit Stats-Bewahrung, `_build_replan_context()` |
+| `agents/graph.py` | `replan_bridge()` Node, `get_next_agent()` Routing, feste Edges `add_edge(agent, "supervisor")`, `respond_node()` mit `plan: None, current_step: 0` Reset, `DEFAULT_MAX_STEPS=15`, `recursion_limit=30` |
+| `prompts/supervisor_prompt.py` | `get_supervisor_eval_prompt()` Reasoning-basiert (DEC-033), `<replan>` Sektion, `pending_goals` in `<output_format>`, Replan-Beispiele |
+
+### Anwenden bei
+- Multi-Goal-Queries: "Finde X und zeig Y basierend auf dem Ergebnis"
+- Queries die Stats-Ergebnisse für Folge-Visualisierung brauchen
+- Komplexe Analyse-Anfragen die sequentielle Abhängigkeiten haben
+- Stats-vor-Viz Konflikte (active_stats_keys verdeckt Zeitreihendaten)
+
+### Referenz
+- `agents/supervisor.py:supervisor_node()` — Dual-Mode Dispatch (PLAN/EVAL)
+- `agents/supervisor.py:run_supervisor_eval()` — EVAL mit Structured Output (EvalDecision)
+- `agents/supervisor.py:_is_eval_mode()` — Mode-Erkennung
+- `agents/supervisor.py:_get_per_turn_reset()` — Per-Turn Reset mit replan_mode Parameter
+- `agents/graph.py:replan_bridge()` — Snapshot-Node
+- `agents/graph.py:get_next_agent()` — Replan-Routing-Logik
+- `agents/graph.py:respond_node()` — Plan/Step Reset für Multi-Turn
+- `prompts/supervisor_prompt.py:get_supervisor_eval_prompt()` — EVAL-Prompt
+- `tests/test_agents/test_replan_loop.py` — 21 Tests (IsEvalMode, ReplanCountBugfix, RunSupervisorEval, SupervisorNodeDualMode)
+
+---
+
+## DEC-033: Reasoning-basierter EVAL Prompt statt hart-kodierter Regeln
+
+### Problem
+Der EVAL-Prompt im Supervisor (DEC-032) verwendete hart-kodierte If-Then-Regeln wie "Stats-vor-Viz Konflikt". Diese Regeln verursachten falsche Replans beim DEC-030 Stats-Gatekeeper-Flow: `["stats_agent", "viz_agent"]` (ohne `data_agent`) wurde fälschlich als Fehler erkannt, obwohl der Gatekeeper-Modus genau diesen Flow vorsieht. Ergebnis: Endlose Replan-Schleife, viz_agent wurde nie ausgeführt.
+
+### Kontext
+- EVAL-Prompt hatte 3 hart-kodierte Regeln in einer `<system_knowledge>` Sektion
+- Jede neue Agent-Kombination oder neuer Datenfluss erforderte eine neue Regel
+- Regeln konnten sich widersprechen (DEC-030 Flow vs. "Stats-vor-Viz Konflikt"-Regel)
+- Anthropics Context Engineering Guide empfiehlt: "Goldilocks Zone" — spezifisch genug um zu leiten, flexibel genug für Model-Reasoning
+- Opus 4.6 (EVAL nutzt Sonnet) ist intelligent genug, um aus Capability-Beschreibungen korrekte Schlüsse zu ziehen
+
+| Alternative | Pro | Contra |
+|------------|-----|--------|
+| A: Mehr Regeln + Ausnahmen | Deterministisch, vorhersagbar | Kombinatorische Explosion, fragil bei neuen Flows |
+| **B: Agent-Capabilities beschreiben** | Skaliert mit neuen Agents/Flows, kein Regel-Wartungsaufwand | Weniger deterministisch, Vertrauen ins LLM nötig |
+| C: Regeln + Capabilities hybrid | Sicherheit + Flexibilität | Komplexer Prompt, Regeln können Reasoning überschreiben |
+
+### Entscheidung
+**EVAL-Prompt beschreibt Agent-Fähigkeiten, Inputs/Outputs und typische Datenflüsse statt hart-kodierter Wenn-Dann-Regeln. Das LLM reasoned selbst ob der nächste Agent im Plan die benötigten Daten hat.**
+
+### Pattern
+
+**1. Agent-Capabilities als `<agents>` Sektion**
+```python
+"""<agents>
+
+### data_agent
+- Holt Zeitreihendaten von ThingsBoard und speichert sie in DuckDB
+- Setzt active_dataset_keys auf die Keys der geladenen Datasets
+- Ergebnis: Zeitreihen mit Timestamps und Werten
+- Gatekeeper: Prüft via check_dataset ob Daten schon vorliegen
+
+### stats_agent
+- Berechnet Statistiken aus Zeitreihen: Korrelation, Trend, Min/Max, ...
+- Braucht: Zeitreihendaten in DuckDB (via active_dataset_keys)
+- Ergebnis: active_stats_keys + statistics_summary
+- Gatekeeper-Modus (active_dataset_keys=None): Löst bestehende Stats auf
+
+### viz_agent
+- Erstellt Charts: Line, Area, Column, Bar, Scatter, Boxplot, ...
+- Kann Zeitreihen ODER Statistik-Aggregate visualisieren
+- Priorisiert active_stats_keys wenn vorhanden
+
+</agents>"""
+```
+
+**2. Datenflüsse als `<data_flow>` Sektion**
+```python
+"""<data_flow>
+
+1. data → viz: Zeitreihen laden → zeitbasiertes Chart
+2. data → stats: Zeitreihen laden → Statistik berechnen
+3. data → stats → viz: Zeitreihen → Statistik → Zeitreihen-Chart
+4. stats (Gatekeeper) → viz: Bestehende Stats auflösen → Vergleichs-Chart
+
+Wichtig: Im Gatekeeper-Modus (Flow 4) lief KEIN data_agent.
+Das ist korrekt wenn der User Stats-Ergebnisse visualisieren will.
+
+</data_flow>"""
+```
+
+**3. Offene Aufgabe statt Regelwerk**
+```python
+"""<task>
+Prüfe ob der NÄCHSTE Agent im verbleibenden Plan die Daten hat die er braucht.
+Deine Aufgabe ist NUR die Prüfung des aktuellen Plans — NICHT ob Agents fehlen.
+
+Entscheide:
+- "continue": Der nächste Agent hat was er braucht. (DEFAULT — im Zweifelsfall wählen)
+- "replan": Ein konkretes Problem verhindert die Ausführung.
+- "respond": Alle Ziele bereits erfüllt, restliche Schritte überflüssig.
+</task>"""
+```
+
+### Begründung
+- **Skalierbarkeit:** Neue Agents oder Datenflüsse erfordern nur eine Zeile in `<agents>` bzw. `<data_flow>` — keine neue Regel + Ausnahmen
+- **Kein Regel-Widerspruch:** Hart-kodierte Regeln können sich bei neuen Flows widersprechen (DEC-030 vs. "Stats-vor-Viz"-Regel). Reasoning aus Capabilities ist konsistenter
+- **Anthropic Best Practice:** Context Engineering Guide empfiehlt "reserve reasoning for ambiguity" — deterministische Arbeit als Workflow, Ambiguität durch LLM-Reasoning lösen
+- **Wartbarkeit:** Beim Hinzufügen eines neuen Agents genügt eine Capability-Beschreibung. Keine Analyse nötig welche Regeln betroffen sein könnten
+- **Validiert:** 351 Tests bestanden, Pattern-Review zeigt 0 Verstöße gegen alle 29 DECs
+
+### Anwenden bei
+- Supervisor EVAL-Prompt (DEC-032): Prüfung ob verbleibender Plan valide ist
+- Jede Form von Agent-Orchestrierung wo Entscheidungen über Agenten-Reihenfolge getroffen werden
+- Allgemein: Wenn hart-kodierte Regeln in Prompts zu Konflikten bei neuen Datenflüssen führen
+
+### Referenz
+- `prompts/supervisor_prompt.py:get_supervisor_eval_prompt()` — Reasoning-basierter EVAL-Prompt
+- `agents/supervisor.py:run_supervisor_eval()` — Nutzt den EVAL-Prompt mit Structured Output (EvalDecision)
+- Anthropic Context Engineering Guide: "Goldilocks Zone" zwischen zu wenig und zu viel Spezifität
+
+---
+
 ## 💡 IDEEN (noch nicht umgesetzt)
 
 ### IDEE-001: Dynamic Telemetry Key Discovery
@@ -2464,3 +2868,6 @@ Wenn der User nach Daten fragt, die du nicht in TELEMETRIE-KEYS findest:
 | 2026-02-11 | DEC-028 (Data Agent als Daten-Gatekeeper) - IMPLEMENTIERT: Data Agent setzt active_dataset_keys, Supervisor bekommt nur Summary |
 | 2026-02-11 | DEC-029 (Supervisor als Kontext-Instanz) - IMPLEMENTIERT: turn_history, Telemetrie-Referenz, Opus-Modell, build_turn_context() |
 | 2026-02-12 | DEC-030 (Stats als persistente DuckDB-Datasets) - IMPLEMENTIERT: statistics-Tabelle, active_stats_keys, Stats→Viz Multi-Turn Flow |
+| 2026-02-13 | DEC-031 (DuckDB Single Source of Truth) - IMPLEMENTIERT: datasets-Feld aus AgentState entfernt, DuckDB dataset_meta als einzige Quelle |
+| 2026-02-13 | DEC-032 (Supervisor-Replan-Loop) - IMPLEMENTIERT: replan_bridge Node, pending_goals, max 2 Replans für Multi-Goal-Queries |
+| 2026-02-13 | DEC-033 (Reasoning-basierter EVAL Prompt) - Hart-kodierte EVAL-Regeln durch Agent-Capability-Beschreibungen ersetzt (Fix: Replan-Loop bei DEC-030 Flow) |

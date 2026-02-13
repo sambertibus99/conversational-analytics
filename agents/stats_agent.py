@@ -46,6 +46,7 @@ from agents.utils import (
     extract_timestamps_from_data,
     extract_user_query,
     get_data_from_state,
+    get_dataset_meta_from_duckdb,
     get_values_for_key,
     get_timeseries_for_key,
     get_available_signal_keys,
@@ -221,11 +222,11 @@ def min_max_tool(
     if key not in available:
         return f"Key '{key}' nicht gefunden. Verfügbar: {available[:5]}"
 
-    values = get_values_for_key(state, key)
+    timestamps, values = get_timeseries_for_key(state, key)
     if not values:
         return f"Keine gültigen Werte für Key '{key}'"
 
-    result = calculate_min_max(values)
+    result = calculate_min_max(values, timestamps if timestamps else None)
     result["key"] = key
     return format_result(result, "min_max")
 
@@ -440,8 +441,10 @@ def summary_tool(
 
 def _extract_time_range_from_state(state: dict) -> str:
     """Extrahiert den Zeitraum aus den aktiven Datasets im State."""
-    datasets = state.get("datasets", {})
+    # DuckDB-first (DEC-031)
+    session_id = state.get("session_id", "default")
     active_keys = state.get("active_dataset_keys", [])
+    datasets = get_dataset_meta_from_duckdb(session_id, active_keys)
 
     for dk in (active_keys or []):
         ds = datasets.get(dk)
@@ -758,7 +761,6 @@ async def run_stats_agent(state: AgentState) -> dict[str, Any]:
 
         # Tool State vorbereiten (DEC-025: session_id durchreichen für DuckDB-Zugriff)
         tool_state = dict(state)
-        tool_state["datasets"] = state.get("datasets", {})
 
         # Tool auswählen und ausführen
         results, llm_response = await select_and_execute_tool(
@@ -792,6 +794,15 @@ async def run_stats_agent(state: AgentState) -> dict[str, Any]:
                 elif "r" in parsed:
                     key_info = f"{parsed.get('key_x', '?')} ↔ {parsed.get('key_y', '?')}"
                     summaries.append(f"Korrelation {key_info}: r={parsed['r']:.3f} ({parsed.get('interpretation', '')})")
+                elif "min" in parsed and "max" in parsed and "mean" not in parsed:
+                    # min_max_tool: Mit formatierten Timestamps wenn vorhanden
+                    parts = [f"{parsed.get('key', '?')}: Min={parsed['min']:.4f}"]
+                    if parsed.get("min_timestamp_human"):
+                        parts.append(f"am {parsed['min_timestamp_human']}")
+                    parts.append(f", Max={parsed['max']:.4f}")
+                    if parsed.get("max_timestamp_human"):
+                        parts.append(f"am {parsed['max_timestamp_human']}")
+                    summaries.append("".join(parts))
                 elif "slope" in parsed:
                     summaries.append(f"{parsed.get('key', '?')}: {parsed.get('trend', '')} (slope={parsed['slope']:.4f})")
                 elif "mean" in parsed:
@@ -857,28 +868,29 @@ async def test_stats_agent():
 
     now = datetime.now()
 
-    # Testdaten: Zwei Keys mit leicht unterschiedlichen Timestamps
-    test_datasets = {
-        "test": {
-            "data": {
-                "torque_a1": [
-                    {"value": str(25.0 + random.gauss(0, 2)), "timestamp": int((now - timedelta(minutes=50-i)).timestamp() * 1000)}
-                    for i in range(50)
-                ],
-                "position_a1": [
-                    {"value": str(45.0 + random.gauss(0, 3)), "timestamp": int((now - timedelta(minutes=50-i)).timestamp() * 1000 + random.randint(-100, 100))}
-                    for i in range(48)  # Absichtlich 2 weniger!
-                ],
-            },
-            "meta": {},
-        }
+    # DEC-031: Testdaten in DuckDB speichern statt in State
+    from config.duckdb_store import SessionStore
+    session_id = "test_stats_agent"
+    store = SessionStore.get_instance(session_id)
+
+    test_data = {
+        "torque_a1": [
+            {"value": str(25.0 + random.gauss(0, 2)), "timestamp": int((now - timedelta(minutes=50-i)).timestamp() * 1000)}
+            for i in range(50)
+        ],
+        "position_a1": [
+            {"value": str(45.0 + random.gauss(0, 3)), "timestamp": int((now - timedelta(minutes=50-i)).timestamp() * 1000 + random.randint(-100, 100))}
+            for i in range(48)  # Absichtlich 2 weniger!
+        ],
     }
+    store.store_dataset(dataset_key="test/correlation", data=test_data)
 
     print(f"📊 Test-Daten: torque_a1 (50 Punkte), position_a1 (48 Punkte)")
 
     state = AgentState(
         messages=[HumanMessage(content="Gibt es eine Korrelation zwischen torque_a1 und position_a1?")],
-        datasets=test_datasets,
+        session_id=session_id,
+        active_dataset_keys=["test/correlation"],
     )
 
     result = await run_stats_agent(state)

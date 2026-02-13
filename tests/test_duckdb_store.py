@@ -506,3 +506,130 @@ class TestDuckDBFeatures:
         """)
 
         assert len(result) >= 3  # Mindestens 3 Matches
+
+
+# =============================================================================
+# DATASET-META TESTS (DEC-031)
+# =============================================================================
+
+class TestDatasetMeta:
+    """Tests für dataset_meta Tabelle und CRUD-Methoden (DEC-031)."""
+
+    @pytest.fixture
+    def sample_meta(self):
+        """Beispiel-DatasetMeta."""
+        return {
+            "dataset_key": "krc5/torque_act_a1_nm/timeseries/overview/2026-02-12_10-00_12-00/60s_avg",
+            "device_id": "krc5",
+            "keys": ["torque_act_a1_nm"],
+            "point_count": 120,
+            "timerange": {"start_human": "12.02.2026 10:00", "end_human": "12.02.2026 12:00"},
+            "retrieval_mode": "overview",
+            "unit": "Nm",
+            "created_at": "2026-02-12T10:00:00",
+            "data_file": "/tmp/telemetry_abc.json",
+            "meta": {"type": "success", "data_mode": "overview", "interval": "60s"},
+        }
+
+    def test_store_dataset_meta(self, store, sample_meta):
+        """Speichert und liest DatasetMeta korrekt."""
+        store.store_dataset_meta(sample_meta)
+
+        result = store.get_dataset_meta(sample_meta["dataset_key"])
+        assert result is not None
+        assert result["dataset_key"] == sample_meta["dataset_key"]
+        assert result["device_id"] == "krc5"
+        assert result["keys"] == ["torque_act_a1_nm"]
+        assert result["point_count"] == 120
+        assert result["timerange"]["start_human"] == "12.02.2026 10:00"
+        assert result["retrieval_mode"] == "overview"
+        assert result["unit"] == "Nm"
+        assert result["created_at"] == "2026-02-12T10:00:00"
+        assert result["data_file"] == "/tmp/telemetry_abc.json"
+        assert result["meta"]["type"] == "success"
+
+    def test_dataset_meta_upsert(self, store, sample_meta):
+        """Überschreibt bei gleichem dataset_key."""
+        store.store_dataset_meta(sample_meta)
+        assert store.get_dataset_meta(sample_meta["dataset_key"])["point_count"] == 120
+
+        # Gleicher Key, neuer point_count
+        updated = {**sample_meta, "point_count": 250}
+        store.store_dataset_meta(updated)
+        result = store.get_dataset_meta(sample_meta["dataset_key"])
+        assert result["point_count"] == 250
+
+        # Nur ein Eintrag (nicht zwei)
+        all_metas = store.get_all_dataset_metas()
+        assert len(all_metas) == 1
+
+    def test_dataset_meta_clear(self, store, sample_meta):
+        """clear() löscht alle Metas."""
+        store.store_dataset_meta(sample_meta)
+        assert len(store.get_all_dataset_metas()) == 1
+
+        store.clear()
+        assert len(store.get_all_dataset_metas()) == 0
+
+    def test_get_dataset_metas_filtered(self, store):
+        """get_dataset_metas gibt nur angeforderte Keys zurück."""
+        metas = [
+            {"dataset_key": "krc5/torque/ts/1", "keys": ["a"], "created_at": "t1"},
+            {"dataset_key": "krc5/torque/ts/2", "keys": ["b"], "created_at": "t2"},
+            {"dataset_key": "krc5/axis/ts/3", "keys": ["c"], "created_at": "t3"},
+        ]
+        for m in metas:
+            store.store_dataset_meta(m)
+
+        # Nur 2 von 3 anfordern
+        result = store.get_dataset_metas(["krc5/torque/ts/1", "krc5/axis/ts/3"])
+        assert len(result) == 2
+        assert "krc5/torque/ts/1" in result
+        assert "krc5/axis/ts/3" in result
+        assert "krc5/torque/ts/2" not in result
+
+    def test_get_all_dataset_metas(self, store):
+        """get_all_dataset_metas gibt alle Einträge zurück."""
+        for i in range(3):
+            store.store_dataset_meta({
+                "dataset_key": f"key/{i}",
+                "keys": [f"signal_{i}"],
+                "created_at": f"t{i}",
+            })
+
+        result = store.get_all_dataset_metas()
+        assert len(result) == 3
+
+    def test_get_dataset_meta_not_found(self, store):
+        """get_dataset_meta gibt None für nicht existierenden Key."""
+        assert store.get_dataset_meta("nonexistent") is None
+
+    def test_get_dataset_metas_empty_keys(self, store, sample_meta):
+        """get_dataset_metas mit leerer Liste gibt leeres Dict."""
+        store.store_dataset_meta(sample_meta)
+        assert store.get_dataset_metas([]) == {}
+
+    def test_clear_dataset_removes_meta(self, store, sample_meta):
+        """clear_dataset entfernt auch das zugehörige Meta."""
+        store.store_dataset_meta(sample_meta)
+        assert store.get_dataset_meta(sample_meta["dataset_key"]) is not None
+
+        store.clear_dataset(sample_meta["dataset_key"])
+        assert store.get_dataset_meta(sample_meta["dataset_key"]) is None
+
+    def test_dataset_meta_json_roundtrip(self, store):
+        """JSON-Felder (keys, timerange, meta) überleben Roundtrip."""
+        meta = {
+            "dataset_key": "test/roundtrip",
+            "keys": ["key_a", "key_b", "key_c"],
+            "timerange": {"start_ts": 1000, "end_ts": 2000, "start_human": "10:00"},
+            "meta": {"nested": {"deep": True}, "list": [1, 2, 3]},
+            "created_at": "2026-01-01T00:00:00",
+        }
+        store.store_dataset_meta(meta)
+        result = store.get_dataset_meta("test/roundtrip")
+
+        assert result["keys"] == ["key_a", "key_b", "key_c"]
+        assert result["timerange"]["start_ts"] == 1000
+        assert result["meta"]["nested"]["deep"] is True
+        assert result["meta"]["list"] == [1, 2, 3]

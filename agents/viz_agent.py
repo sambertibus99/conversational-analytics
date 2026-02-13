@@ -41,7 +41,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from agents.state import AgentState
-from agents.utils import extract_data_from_datasets, get_dataset_meta, get_y_label, get_stats_label, extract_user_query, get_data_from_state
+from agents.utils import extract_data_from_datasets, get_dataset_meta, get_dataset_meta_from_duckdb, get_y_label, get_stats_label, extract_user_query, get_data_from_state
 from config.settings import DEFAULT_MODEL, api_key_rotator, create_anthropic_client, create_cached_system_message
 from prompts.viz_agent_prompt import VIZ_AGENT_SYSTEM_PROMPT
 
@@ -842,7 +842,12 @@ def prepare_viz_context(state: AgentState) -> Tuple[dict, str]:
         return {}, ""
 
     keys = list(data.keys())
-    datasets = state.get("datasets", {})
+
+    # DuckDB-first für Dataset-Meta (DEC-031)
+    session_id = state.get("session_id", "default")
+    active_keys = state.get("active_dataset_keys")
+    datasets = get_dataset_meta_from_duckdb(session_id, active_keys)
+
     meta_info = f"Verfügbare Daten: {len(keys)} Keys ({', '.join(keys[:5])}{'...' if len(keys) > 5 else ''})"
     meta_info += f"\nGeladene Datasets: {', '.join(datasets.keys())}"
 
@@ -907,7 +912,7 @@ async def select_and_execute_tool(
     
     if not response.tool_calls:
         logger.debug("Kein Tool-Call, Fallback zu Line Chart")
-        keys = list(tool_state.get("datasets", {}).keys())
+        keys = list(get_data_from_state(tool_state).keys())
         chart_url = await generate_line_chart_tool.ainvoke({
             "title": f"{', '.join(keys[:2])} - Verlauf",
             "value_label": get_y_label(keys),
@@ -1031,7 +1036,6 @@ async def run_viz_agent(state: AgentState) -> dict[str, Any]:
         user_query = extract_user_query(state["messages"])
 
         tool_state = dict(state)
-        tool_state["datasets"] = state.get("datasets", {})
 
         # DEC-018: LLM-Erstellung und Key-Rotation passiert in execute_viz_with_retry
         chart_url, tool_name = await execute_viz_with_retry(

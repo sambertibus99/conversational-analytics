@@ -10,7 +10,14 @@ DESIGN-ENTSCHEIDUNGEN:
 import numpy as np
 import pandas as pd
 from scipy import stats as scipy_stats
+from datetime import datetime
 from typing import Any
+
+
+def _ms_to_human(ts_ms: int) -> str:
+    """Konvertiert Unix-Millisekunden in lesbares deutsches Datum (lokale Zeitzone)."""
+    dt = datetime.fromtimestamp(ts_ms / 1000).astimezone()
+    return dt.strftime("%d.%m.%Y %H:%M:%S")
 
 
 def calculate_mean(values: list[float]) -> dict[str, Any]:
@@ -60,29 +67,44 @@ def calculate_std(values: list[float]) -> dict[str, Any]:
     }
 
 
-def calculate_min_max(values: list[float]) -> dict[str, Any]:
+def calculate_min_max(
+    values: list[float],
+    timestamps: list[int] | None = None,
+) -> dict[str, Any]:
     """
     Berechnet Minimum, Maximum und Spannweite.
-    
+
     Args:
         values: Liste von Zahlenwerten
-        
+        timestamps: Optionale Timestamps (ms) — wenn gegeben, werden
+                    min_timestamp/max_timestamp zurückgegeben.
+
     Returns:
-        dict mit min, max, range
+        dict mit min, max, range (+ min_timestamp, max_timestamp wenn timestamps gegeben)
     """
     if not values:
         return {"error": "Keine Werte übergeben", "min": None, "max": None}
-    
+
     arr = np.array(values, dtype=float)
-    min_val = float(np.min(arr))
-    max_val = float(np.max(arr))
-    
-    return {
+    min_idx = int(np.argmin(arr))
+    max_idx = int(np.argmax(arr))
+    min_val = float(arr[min_idx])
+    max_val = float(arr[max_idx])
+
+    result = {
         "min": min_val,
         "max": max_val,
         "range": max_val - min_val,
         "count": len(arr),
     }
+
+    if timestamps and len(timestamps) == len(values):
+        result["min_timestamp"] = timestamps[min_idx]
+        result["max_timestamp"] = timestamps[max_idx]
+        result["min_timestamp_human"] = _ms_to_human(timestamps[min_idx])
+        result["max_timestamp_human"] = _ms_to_human(timestamps[max_idx])
+
+    return result
 
 
 def calculate_correlation_timeseries(

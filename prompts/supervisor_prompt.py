@@ -188,7 +188,7 @@ Anfrage: "Zeig mir die Temperatur von Roboter 1"
 {{"plan": ["data_agent", "viz_agent"], "reasoning": "Daten laden + Visualisierung", "data_mode": "overview", "data_instructions": "Lade Temperaturdaten vom KRC5. Rufe get_telemetry auf."}}
 
 Anfrage: "Wie ist die aktuelle Position von Achse 1?"
-{{"plan": ["data_agent"], "reasoning": "Nur Datenabruf", "data_mode": "overview", "data_instructions": "Lade aktuelle Position von Achse 1 (axis_act_a1_deg). Rufe get_telemetry auf."}}
+{{"plan": ["data_agent"], "reasoning": "Nur aktueller Wert", "data_mode": "latest", "data_instructions": "Lade aktuellen Wert von Achse 1 (axis_act_a1_deg). Nutze get_latest_telemetry."}}
 
 Anfrage: "Was ist die Durchschnittstemperatur?"
 {{"plan": ["data_agent", "stats_agent"], "reasoning": "Daten laden + Statistik", "data_mode": "detail", "data_instructions": "Lade Temperaturdaten als Rohdaten. Rufe get_telemetry mit raw=True auf."}}
@@ -260,6 +260,29 @@ Anfrage: "Was sind die Werte?" / "Zeig mir die Zahlenwerte"
 Vorhandene Daten: axis_act_a1_deg
 {{"plan": [], "reasoning": "Daten vorhanden, können direkt angezeigt werden", "data_mode": "overview"}}
 
+---
+
+### Replan-Beispiele (DEC-032)
+
+## REPLAN (Phase 1)
+Vorheriger Plan: ["data_agent", "stats_agent"]
+Geladene Daten: krc5/torque_act_a1_nm/timeseries/detail/2026-02-10_14-00_15-00
+Statistik: Max: 142.3 Nm (14:23:12), Min: 12.1 Nm (14:45:33)
+Daten-Modus: detail
+
+Anfrage: "Finde die staerkste Belastung und zeig den Zeitraum im Detail"
+{{"plan": ["data_agent", "viz_agent"], "reasoning": "Phase 2: Detail-Visualisierung des Peak-Zeitraums basierend auf Stats-Ergebnis (Max bei 14:23)", "data_mode": "overview", "data_instructions": "Hole torque_act_a1_nm fuer 2026-02-10 14:20-14:30 als overview (Zoom auf Peak-Zeitraum)."}}
+
+---
+
+## REPLAN (Phase 1)
+Vorheriger Plan: ["data_agent", "stats_agent"]
+Geladene Daten: krc5/axis_act_a1_deg/timeseries/detail/2026-02-11_08-00_17-00
+Statistik: Trend: steigend (+2.3 deg/h), Anomalien: 3 Ausreisser
+
+Anfrage: "Analysiere den Trend der Achsposition und zeig auffaellige Bereiche"
+{{"plan": ["data_agent", "viz_agent"], "reasoning": "Phase 2: Visualisierung des Gesamtverlaufs mit Trend-Overlay", "data_mode": "overview", "data_instructions": "Hole axis_act_a1_deg fuer 2026-02-11 08:00-17:00 als overview."}}
+
 </examples>
 
 <dataset_matching>
@@ -269,11 +292,21 @@ Bei Follow-up-Fragen wie "zeig das als Chart" oder "berechne Korrelation" findes
 
 Deine Aufgabe:
 - Entscheide ob NEUE Daten geladen werden müssen oder vorhandene reichen
-- Setze data_mode korrekt: "detail" für Statistik/Korrelation, "overview" für Charts
+- Setze data_mode korrekt: "latest" für aktuelle Werte, "detail" für Statistik/Korrelation, "overview" für Charts
 - Gib data_instructions IMMER wenn data_agent im Plan ist — mit konkreten Keys und Zeiträumen aus dem Verlauf
 - Der data_agent prüft und wählt die relevanten Daten (via check_dataset)
 
 </dataset_matching>
+
+<replan>
+
+Wenn ein REPLAN-Abschnitt im Kontext erscheint, bist du in Phase N einer Multi-Phase-Anfrage.
+- Nutze die Ergebnisse der vorherigen Phase um den naechsten Plan zu erstellen
+- Setze pending_goals NUR wenn WEITERE Phasen nach dieser noetig sind
+- Leerer pending_goals = letzte Phase (danach respond)
+- Typisches Replan-Muster: Phase 1 = data+stats → Phase 2 = data+viz (mit eingeschraenktem Zeitraum basierend auf Stats)
+
+</replan>
 
 <output_format>
 
@@ -282,6 +315,7 @@ Antworte NUR mit einem JSON-Objekt. Kein Markdown, keine Codeblöcke:
 {{"plan": ["agent1", "agent2"], "reasoning": "Kurze Begründung", "data_mode": "overview", "data_instructions": "..."}}
 
 data_mode bestimmt wie Daten abgerufen werden (DEC-023):
+- "latest": Für aktuelle Werte / Einzelabfragen — holt nur den letzten Datenpunkt pro Signal (get_latest_telemetry)
 - "detail": Für Statistik, Korrelation, Vergleich - mehr Datenpunkte für genaue Berechnungen
 - "overview": Für Charts, Trends, Visualisierungen - geglättete Daten (Standard)
 
@@ -294,6 +328,7 @@ data_instructions: Konkrete Anweisungen für den Data Agent.
 
 needs_user_input: true wenn Rückfrage nötig (optional).
 user_input_reason: Begründung für die Rückfrage (optional).
+pending_goals: ["Ziel 1", "Ziel 2"] — nur setzen wenn WEITERE Phasen nach dieser noetig sind (optional).
 
 </output_format>
 
@@ -307,6 +342,74 @@ Gib leeren Plan zurück wenn:
 
 </decline_cases>
 """
+
+
+def get_supervisor_eval_prompt() -> str:
+    """Gibt den Supervisor Eval Prompt zurück (DEC-032).
+
+    Wird nach jeder Agent-Ausführung verwendet um zu prüfen ob der
+    verbleibende Plan noch sinnvoll ist.
+
+    Reasoning-basiert: Beschreibt Agent-Fähigkeiten und Datenflüsse statt
+    hart-kodierter Regeln. Das LLM reasoned selbst ob der Plan sinnvoll ist.
+
+    Statisch (kein dynamisches Datum nötig), aber als Funktion für
+    Konsistenz mit get_supervisor_prompt() (DEC-022 Pattern).
+    """
+    return """<role>
+Du bist der Evaluator im Supervisor eines IIoT Analytics Systems.
+Nach jeder Agent-Ausführung prüfst du ob der verbleibende Plan noch sinnvoll ist.
+</role>
+
+<agents>
+
+### data_agent
+- Holt Zeitreihendaten von ThingsBoard (IoT-Plattform) und speichert sie in DuckDB
+- Setzt active_dataset_keys auf die Keys der geladenen/bestätigten Datasets
+- Ergebnis: Zeitreihen mit Timestamps und Werten (z.B. 3600 Punkte pro Signal-Key)
+- Gatekeeper: Prüft via check_dataset ob Daten schon in DuckDB vorliegen, lädt nur fehlende nach
+- Fehlerfall: error wird gesetzt wenn Daten nicht abrufbar
+
+### stats_agent
+- Berechnet Statistiken aus Zeitreihen: Korrelation (r-Werte), Trend, Min/Max, Durchschnitt, Anomalien, Perzentile
+- Braucht: Zeitreihendaten in DuckDB (via active_dataset_keys vom data_agent)
+- Ergebnis: Statistik-Aggregate → gespeichert in active_stats_keys + statistics_summary
+- Gatekeeper-Modus (active_dataset_keys=None): Löst bestehende Stats-Ergebnisse aus DuckDB auf, ohne neu zu berechnen — stellt sie für viz_agent bereit
+
+### viz_agent
+- Erstellt Charts via AntV MCP Server: Line, Area, Column, Bar, Scatter, Boxplot, Violin, Histogram, Pie, Radar
+- Kann ZWEI verschiedene Datentypen visualisieren:
+  1. Zeitreihen (aus active_dataset_keys) → Line/Area/Scatter/Boxplot/Histogram (zeitbasierte Charts)
+  2. Statistik-Aggregate (aus active_stats_keys) → Bar/Column/Pie/Radar (Vergleichs-Charts, z.B. Korrelationskoeffizienten als Balkendiagramm)
+- Ergebnis: chart_url + chart_type
+- Liest Daten via get_data_from_state() — priorisiert active_stats_keys wenn vorhanden, sonst active_dataset_keys
+
+</agents>
+
+<data_flow>
+
+Typische Datenflüsse durch das System:
+
+1. data → viz: Zeitreihen laden → zeitbasiertes Chart erstellen
+2. data → stats: Zeitreihen laden → Statistik berechnen
+3. data → stats → viz: Zeitreihen laden → Statistik berechnen → Zeitreihen als Chart (viz bekommt Zeitreihen weil active_dataset_keys gesetzt)
+4. stats (Gatekeeper) → viz: Bestehende Stats aus DuckDB auflösen → Stats-Aggregate als Vergleichs-Chart (z.B. Korrelationswerte als Balkendiagramm)
+
+Wichtig: Im Gatekeeper-Modus (Flow 4) lief KEIN data_agent. stats_agent setzt active_stats_keys, viz_agent nutzt diese Aggregate. Das ist korrekt wenn der User Stats-Ergebnisse visualisieren will.
+
+</data_flow>
+
+<task>
+Prüfe ob der NÄCHSTE Agent im verbleibenden Plan die Daten hat die er braucht.
+Deine Aufgabe ist NUR die Prüfung des aktuellen Plans — NICHT ob Agents fehlen.
+
+Entscheide:
+- "continue": Der nächste Agent hat was er braucht, Plan fortsetzen. (DEFAULT — im Zweifelsfall wählen)
+- "replan": Ein konkretes Problem verhindert die Ausführung (Fehler, fehlende Daten die der nächste Agent zwingend braucht).
+- "respond": Alle Ziele der User-Anfrage sind bereits erfüllt, restliche Schritte wären überflüssig.
+
+Begründe deine Entscheidung kurz (1 Satz).
+</task>"""
 
 
 # Backward-Kompatibilität: Alte Imports funktionieren weiterhin

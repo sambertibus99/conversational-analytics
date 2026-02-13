@@ -107,6 +107,21 @@ class SessionStore:
                 created_at    BIGINT NOT NULL
             )
         """)
+        # DEC-031: DatasetMeta als Single Source of Truth
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS dataset_meta (
+                dataset_key    TEXT PRIMARY KEY,
+                device_id      TEXT DEFAULT 'krc5',
+                keys           TEXT NOT NULL,
+                point_count    INTEGER DEFAULT 0,
+                timerange      TEXT,
+                retrieval_mode TEXT DEFAULT 'overview',
+                unit           TEXT DEFAULT '',
+                created_at     TEXT NOT NULL,
+                data_file      TEXT,
+                meta           TEXT
+            )
+        """)
 
     # =================================================================
     # LIFECYCLE (Class-Level Registry)
@@ -149,11 +164,13 @@ class SessionStore:
         """Löscht alle Daten, behält Schema und Instanz."""
         self._conn.execute("DELETE FROM telemetry")
         self._conn.execute("DELETE FROM statistics")
+        self._conn.execute("DELETE FROM dataset_meta")
         logger.info(f"SessionStore geleert: {self._session_id}")
 
     def clear_dataset(self, dataset_key: str) -> None:
         """Löscht alle Daten für einen dataset_key."""
         self._conn.execute("DELETE FROM telemetry WHERE dataset_key = ?", [dataset_key])
+        self._conn.execute("DELETE FROM dataset_meta WHERE dataset_key = ?", [dataset_key])
 
     def close(self) -> None:
         """Schließt die DuckDB-Verbindung."""
@@ -518,6 +535,119 @@ class SessionStore:
             {"dataset_key": row[0], "analysis_type": row[1], "created_at": row[2]}
             for row in rows
         ]
+
+    # =================================================================
+    # DATASET-META SCHREIBEN/LESEN (DEC-031)
+    # =================================================================
+
+    def store_dataset_meta(self, meta: dict) -> None:
+        """
+        Speichert DatasetMeta in DuckDB (DEC-031).
+
+        UPSERT: Bei gleichem dataset_key wird der Eintrag ersetzt.
+
+        Args:
+            meta: Dict im DatasetMeta-Format (dataset_key, keys, timerange, ...)
+        """
+        import json as _json
+
+        self._conn.execute(
+            "INSERT OR REPLACE INTO dataset_meta "
+            "(dataset_key, device_id, keys, point_count, timerange, retrieval_mode, unit, created_at, data_file, meta) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                meta["dataset_key"],
+                meta.get("device_id", "krc5"),
+                _json.dumps(meta.get("keys", []), ensure_ascii=False),
+                meta.get("point_count", 0),
+                _json.dumps(meta.get("timerange", {}), ensure_ascii=False) if meta.get("timerange") else None,
+                meta.get("retrieval_mode", "overview"),
+                meta.get("unit", ""),
+                meta.get("created_at", ""),
+                meta.get("data_file"),
+                _json.dumps(meta.get("meta", {}), ensure_ascii=False) if meta.get("meta") else None,
+            ],
+        )
+        logger.debug(f"store_dataset_meta: {meta['dataset_key']}")
+
+    def get_dataset_meta(self, dataset_key: str) -> dict | None:
+        """
+        Liest ein DatasetMeta aus DuckDB (DEC-031).
+
+        Returns:
+            Dict im DatasetMeta-Format oder None wenn nicht gefunden.
+        """
+        import json as _json
+
+        rows = self._conn.execute(
+            "SELECT dataset_key, device_id, keys, point_count, timerange, "
+            "retrieval_mode, unit, created_at, data_file, meta "
+            "FROM dataset_meta WHERE dataset_key = ?",
+            [dataset_key],
+        ).fetchall()
+
+        if not rows:
+            return None
+
+        return self._row_to_dataset_meta(rows[0], _json)
+
+    def get_dataset_metas(self, keys: list[str]) -> dict[str, dict]:
+        """
+        Liest mehrere DatasetMetas aus DuckDB (DEC-031).
+
+        Args:
+            keys: Liste von dataset_keys
+
+        Returns:
+            Dict: dataset_key -> DatasetMeta dict
+        """
+        import json as _json
+
+        if not keys:
+            return {}
+
+        placeholders = ", ".join(["?"] * len(keys))
+        rows = self._conn.execute(
+            f"SELECT dataset_key, device_id, keys, point_count, timerange, "
+            f"retrieval_mode, unit, created_at, data_file, meta "
+            f"FROM dataset_meta WHERE dataset_key IN ({placeholders})",
+            keys,
+        ).fetchall()
+
+        return {row[0]: self._row_to_dataset_meta(row, _json) for row in rows}
+
+    def get_all_dataset_metas(self) -> dict[str, dict]:
+        """
+        Liest alle DatasetMetas aus DuckDB (DEC-031).
+
+        Returns:
+            Dict: dataset_key -> DatasetMeta dict
+        """
+        import json as _json
+
+        rows = self._conn.execute(
+            "SELECT dataset_key, device_id, keys, point_count, timerange, "
+            "retrieval_mode, unit, created_at, data_file, meta "
+            "FROM dataset_meta"
+        ).fetchall()
+
+        return {row[0]: self._row_to_dataset_meta(row, _json) for row in rows}
+
+    @staticmethod
+    def _row_to_dataset_meta(row: tuple, _json) -> dict:
+        """Konvertiert eine DuckDB-Zeile zu einem DatasetMeta-Dict."""
+        return {
+            "dataset_key": row[0],
+            "device_id": row[1],
+            "keys": _json.loads(row[2]) if row[2] else [],
+            "point_count": row[3],
+            "timerange": _json.loads(row[4]) if row[4] else {},
+            "retrieval_mode": row[5],
+            "unit": row[6],
+            "created_at": row[7],
+            "data_file": row[8],
+            "meta": _json.loads(row[9]) if row[9] else {},
+        }
 
     def point_count(self, dataset_key: str | None = None) -> int:
         """Gibt die Anzahl der gespeicherten Datenpunkte zurück."""

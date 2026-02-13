@@ -35,7 +35,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_core.tools import tool
 
 from agents.state import AgentState, DatasetMeta
-from agents.utils import extract_user_query
+from agents.utils import extract_user_query, get_dataset_meta_from_duckdb
 from prompts.data_agent_prompt import get_data_agent_prompt
 from config.settings import DEFAULT_MODEL, PROJECT_ROOT, api_key_rotator, create_anthropic_client, create_cached_system_message
 from config.duckdb_store import SessionStore, generate_dataset_key, determine_signal_type
@@ -704,7 +704,7 @@ def _make_overview_guard_hook(data_mode: str):
     Im detail-Modus wird stattdessen der raw_estimation_hook angewendet.
     """
     def hook(state: dict) -> dict:
-        if data_mode == "detail":
+        if data_mode in ("detail", "latest"):
             return raw_estimation_hook(state)
 
         # overview-Modus: Guard anwenden
@@ -979,7 +979,7 @@ def create_data_agent(tools: list, data_mode: str = "overview"):
 # HAUPTLOGIK - AUFGETEILT (DEC-016)
 # =============================================================================
 
-def prepare_messages(state: AgentState, existing_datasets: dict) -> list:
+def prepare_messages(state: AgentState) -> list:
     """
     Bereitet Messages für den Agent vor (DEC-027 v2).
 
@@ -1182,6 +1182,14 @@ def _store_dataset_in_duckdb(
             "aggregation": settings.get("aggregation", ""),
         },
     )
+
+    # DEC-031: Dual-Write — DatasetMeta auch in DuckDB speichern
+    try:
+        store = SessionStore.get_instance(session_id)
+        store.store_dataset_meta(dict(dataset_meta))
+    except Exception as e:
+        logger.warning(f"DuckDB store_dataset_meta fehlgeschlagen: {e}")
+
     return dataset_key, dataset_meta
 
 
@@ -1201,8 +1209,8 @@ def build_result(
     """
     Baut das Ergebnis-Dictionary zusammen.
 
-    DEC-025: Rohdaten werden in DuckDB SessionStore gespeichert.
-    Im State (datasets) landen nur noch DatasetMeta-Referenzen.
+    DEC-025/031: Rohdaten und DatasetMeta werden in DuckDB gespeichert.
+    Kein datasets-Feld mehr im Return (DEC-031: DuckDB ist Single Source of Truth).
     Speichert ALLE Datasets aus allen Tool-Aufrufen, nicht nur das letzte.
 
     DEC-028: Setzt active_dataset_keys:
@@ -1248,7 +1256,6 @@ def build_result(
 
     return {
         "messages": result.get("messages", []),
-        "datasets": new_datasets,
         "active_dataset_keys": active_keys or None,  # DEC-028
         "needs_user_input": needs_input,
         "user_input_reason": input_reason,
@@ -1381,9 +1388,10 @@ async def run_data_agent(state: AgentState) -> dict[str, Any]:
     try:
         logger.debug("Starte run_data_agent")
 
-        # 1. Vorhandene Datasets aus State
-        existing_datasets = state.get("datasets", {}) or {}
-        logger.debug(f"Vorhandene Datasets: {list(existing_datasets.keys())}")
+        # 1. Vorhandene Datasets aus DuckDB (DEC-031)
+        session_id_pre = state.get("session_id", "default")
+        existing_datasets = get_dataset_meta_from_duckdb(session_id_pre)
+        logger.debug(f"Vorhandene Datasets (DuckDB): {list(existing_datasets.keys())}")
 
         # 2. MCP Tools holen
         tools = await get_mcp_tools()
@@ -1415,7 +1423,7 @@ async def run_data_agent(state: AgentState) -> dict[str, Any]:
         agent = create_data_agent(all_tools, data_mode)
 
         # 5. Messages vorbereiten
-        messages = prepare_messages(state, existing_datasets)
+        messages = prepare_messages(state)
         input_message_count = len(messages)
 
         # Debug: Input-Messages loggen

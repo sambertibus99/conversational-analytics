@@ -24,6 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import asyncio
 import logging
 import threading
+from datetime import datetime
 from typing import Literal, Any
 
 from langchain_anthropic import ChatAnthropic
@@ -38,6 +39,8 @@ from agents.stats_agent import stats_agent_node
 from agents.viz_agent import viz_agent_node
 from prompts.respond_prompt import RESPOND_SYSTEM_PROMPT
 from config.settings import DEFAULT_MODEL, api_key_rotator, create_anthropic_client, create_cached_system_message
+from config.duckdb_store import SessionStore
+from agents.utils import get_dataset_meta_from_duckdb
 
 
 # =============================================================================
@@ -45,6 +48,34 @@ from config.settings import DEFAULT_MODEL, api_key_rotator, create_anthropic_cli
 # =============================================================================
 
 logger = logging.getLogger(__name__)
+
+# Debug-Log: Gleiche Datei wie supervisor für vollständigen Flow
+_FLOW_DEBUG_LOG = PROJECT_ROOT / "logs" / "supervisor_debug.log"
+
+
+def _log_flow_event(event_type: str, details: dict) -> None:
+    """Schreibt ein Graph-Flow-Event in die Debug-Datei.
+
+    Args:
+        event_type: z.B. "AGENT_START", "AGENT_RESULT", "ROUTING", "REPLAN_BRIDGE"
+        details: Key-Value-Paare mit relevanten Infos
+    """
+    _FLOW_DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sep = "-" * 60
+
+    lines = [
+        "",
+        sep,
+        f"  {event_type}  |  {timestamp}",
+        sep,
+    ]
+    for key, value in details.items():
+        lines.append(f"  {key}: {value}")
+    lines.append("")
+
+    with open(_FLOW_DEBUG_LOG, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 # =============================================================================
@@ -58,9 +89,10 @@ AGENT_NODES = ["data_agent", "stats_agent", "viz_agent"]
 ROUTING_MAP = {agent: agent for agent in AGENT_NODES}
 ROUTING_MAP["respond"] = "respond"
 ROUTING_MAP["error_handler"] = "error_handler"
+ROUTING_MAP["replan_bridge"] = "replan_bridge"
 
 # Maximale Schritte bevor Notfall-Exit (Cycle Guard)
-DEFAULT_MAX_STEPS = 10
+DEFAULT_MAX_STEPS = 15
 
 
 # =============================================================================
@@ -80,14 +112,11 @@ def _format_timerange(timerange: dict) -> str:
 
 def _group_datasets_by_timerange(state: AgentState) -> list[dict]:
     """Gruppiert aktive Datasets nach Zeitraum für TurnEntry."""
-    all_datasets = state.get("datasets", {})
     active_keys = state.get("active_dataset_keys")
 
-    # Nur aktive Datasets (dieser Turn)
-    if active_keys:
-        filtered = {k: v for k, v in all_datasets.items() if k in active_keys}
-    else:
-        filtered = all_datasets
+    # DEC-031: DuckDB ist Single Source of Truth
+    session_id = state.get("session_id", "default")
+    filtered = get_dataset_meta_from_duckdb(session_id, active_keys)
 
     # Gruppiere nach timerange-String
     groups: dict[str, list[str]] = {}  # timerange -> signal_keys
@@ -135,9 +164,10 @@ def _determine_result_summary(state: AgentState, result_type: str) -> str:
         return (state.get("reasoning") or "")[:200]
     if result_type == "clarification":
         return (state.get("user_input_reason") or "")[:200]
-    # data: Zusammenfassung aus aktiven DatasetMeta
+    # data: Zusammenfassung aus aktiven DatasetMeta (DEC-031: DuckDB-first)
     active_keys = state.get("active_dataset_keys") or []
-    datasets = state.get("datasets", {})
+    session_id = state.get("session_id", "default")
+    datasets = get_dataset_meta_from_duckdb(session_id, active_keys)
     parts = []
     for k in active_keys[:3]:
         ds = datasets.get(k)
@@ -190,6 +220,33 @@ def _build_turn_entry(state: AgentState) -> dict:
 
 
 # =============================================================================
+# REPLAN BRIDGE (DEC-032)
+# =============================================================================
+
+async def replan_bridge(state: AgentState) -> dict[str, Any]:
+    """Erstellt Snapshot der Phase-Ergebnisse und routet zurück zum Supervisor."""
+    logger.info("=== REPLAN BRIDGE ===")
+    result = {
+        "replan_count": state.get("replan_count", 0) + 1,
+        "replan_context": {
+            "phase": state.get("replan_count", 0) + 1,
+            "plan": state.get("plan", []),
+            "active_dataset_keys": state.get("active_dataset_keys"),
+            "active_stats_keys": state.get("active_stats_keys"),
+            "statistics_summary": state.get("statistics_summary"),
+            "data_retrieval_mode": state.get("data_retrieval_mode"),
+        },
+    }
+
+    _log_flow_event("REPLAN_BRIDGE", {
+        "new_replan_count": result["replan_count"],
+        "snapshot": result["replan_context"],
+    })
+
+    return result
+
+
+# =============================================================================
 # RESPOND NODE
 # =============================================================================
 
@@ -202,11 +259,15 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
     """
     logger.debug("Starte Respond Node")
     
+    # DEC-032: Plan und Step zurücksetzen damit der nächste Turn sauber im PLAN-Modus startet
+    turn_reset = {"plan": None, "current_step": 0}
+
     # State-Validierung
     messages = state.get("messages")
     if not messages:
         logger.warning("Keine Messages im State!")
         return {
+            **turn_reset,
             "messages": [AIMessage(content="Es ist ein Fehler aufgetreten: Keine Anfrage gefunden.")],
             "turn_history": [_build_turn_entry(state)],
         }
@@ -218,9 +279,10 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
         for msg in reversed(messages):
             if isinstance(msg, AIMessage) and isinstance(msg.content, str):
                 logger.debug("Gebe vorherige AI-Message direkt weiter")
-                return {"messages": [msg], "turn_history": [_build_turn_entry(state)]}
+                return {**turn_reset, "messages": [msg], "turn_history": [_build_turn_entry(state)]}
 
         return {
+            **turn_reset,
             "messages": [AIMessage(content="Es ist ein Problem aufgetreten. Bitte versuche es nochmal.")],
             "turn_history": [_build_turn_entry(state)],
         }
@@ -245,14 +307,12 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
     if plan:
         context_parts.append(f"Ausgeführte Agents: {plan}")
     
-    # Datasets Info (DEC-025: DatasetMeta oder Legacy)
+    # Datasets Info (DEC-031: DuckDB-first, Fallback auf State)
     # Nur aktive Datasets dieses Turns anzeigen (nicht akkumulierte aus vorherigen Turns)
-    all_datasets = state.get("datasets", {})
     active_keys = state.get("active_dataset_keys")
-    if active_keys:
-        datasets = {k: v for k, v in all_datasets.items() if k in active_keys}
-    else:
-        datasets = all_datasets
+    session_id = state.get("session_id", "default")
+    datasets = get_dataset_meta_from_duckdb(session_id, active_keys)
+
     if datasets:
         context_parts.append(f"Verfügbare Datasets: {', '.join(datasets.keys())}")
         context_parts.append("\n## DATENWERTE")
@@ -261,51 +321,55 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
             if not isinstance(ds_content, dict):
                 continue
 
-            # DEC-025: DatasetMeta-Format (hat "dataset_key")
-            if "dataset_key" in ds_content:
-                context_parts.append(f"\n### Dataset: {ds_name}")
-                signal_keys = ds_content.get("keys", [])
-                point_count = ds_content.get("point_count", "?")
-                timerange = ds_content.get("timerange", {})
-                context_parts.append(f"- Signals: {', '.join(signal_keys[:6])}")
-                context_parts.append(f"- Punkte: {point_count}")
-                if timerange:
-                    start = timerange.get("start") or timerange.get("start_human", "?")
-                    end = timerange.get("end") or timerange.get("end_human", "?")
-                    context_parts.append(f"- Zeitraum: {start} - {end}")
+            context_parts.append(f"\n### Dataset: {ds_name}")
+            signal_keys = ds_content.get("keys", [])
+            point_count = ds_content.get("point_count", "?")
+            timerange = ds_content.get("timerange", {})
+            context_parts.append(f"- Signals: {', '.join(signal_keys[:6])}")
+            context_parts.append(f"- Punkte: {point_count}")
+            if timerange:
+                start = timerange.get("start") or timerange.get("start_human", "?")
+                end = timerange.get("end") or timerange.get("end_human", "?")
+                context_parts.append(f"- Zeitraum: {start} - {end}")
 
-                # Statistiken aus Meta
-                meta = ds_content.get("meta", {})
-                if isinstance(meta, dict) and meta.get("statistics"):
-                    stats = meta["statistics"]
-                    for sk, sv in list(stats.items())[:3]:
-                        if isinstance(sv, dict):
-                            context_parts.append(
-                                f"- {sk}: min={sv.get('min','?')}, max={sv.get('max','?')}, avg={sv.get('avg','?')}"
-                            )
-            else:
-                # Legacy-Format: hat "data" Key
-                data = ds_content.get("data", {})
-                if not isinstance(data, dict):
-                    continue
+            # Aktuellster Wert pro Signal (jüngster Timestamp)
+            try:
+                if session_id in SessionStore._instances:
+                    store = SessionStore.get_instance(session_id)
+                    rows = store._conn.execute(
+                        """SELECT signal_key, value, unit
+                           FROM telemetry t1
+                           WHERE dataset_key = ?
+                             AND ts = (SELECT MAX(ts) FROM telemetry t2
+                                       WHERE t2.dataset_key = t1.dataset_key
+                                         AND t2.signal_key = t1.signal_key)""",
+                        [ds_name],
+                    ).fetchall()
+                    for sig_key, value, unit in rows:
+                        unit_str = f" {unit}" if unit else ""
+                        context_parts.append(f"- {sig_key} aktuell: {float(value):.4g}{unit_str}")
+            except Exception:
+                pass  # Graceful fallback to metadata-only
 
-                context_parts.append(f"\n### Dataset: {ds_name}")
-
-                for key, values in data.items():
-                    if isinstance(values, list) and len(values) > 0:
-                        if isinstance(values[0], dict) and "value" in values[0]:
-                            first_val = values[0].get("value", "?")
-                            last_val = values[-1].get("value", "?")
-                            context_parts.append(f"- {key}: {len(values)} Punkte, von {first_val} bis {last_val}")
-                        else:
-                            context_parts.append(f"- {key}: {len(values)} Werte")
-                    elif isinstance(values, dict) and "value" in values:
-                        val = values.get("value", "?")
-                        ts = values.get("timestamp", "?")
-                        context_parts.append(f"- {key}: {val} (Zeitstempel: {ts})")
-                    else:
-                        context_parts.append(f"- {key}: {values}")
+            # Statistiken aus Meta
+            meta = ds_content.get("meta", {})
+            if isinstance(meta, dict) and meta.get("statistics"):
+                stats = meta["statistics"]
+                for sk, sv in list(stats.items())[:3]:
+                    if isinstance(sv, dict):
+                        context_parts.append(
+                            f"- {sk}: min={sv.get('min','?')}, max={sv.get('max','?')}, avg={sv.get('avg','?')}"
+                        )
     
+    # DEC-032: Ergebnisse vorheriger Phase (Replan-Kontext)
+    if state.get("replan_context"):
+        rc = state["replan_context"]
+        context_parts.append("\n## ERGEBNISSE VORHERIGER PHASE")
+        if rc.get("statistics_summary"):
+            context_parts.append(f"Statistik: {rc['statistics_summary']}")
+        if rc.get("active_dataset_keys"):
+            context_parts.append(f"Daten: {', '.join(rc['active_dataset_keys'])}")
+
     # Statistiken
     if state.get("statistics"):
         context_parts.append(f"Statistiken: {state['statistics']}")
@@ -345,6 +409,7 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
     logger.debug(f"Response generiert: {response.content[:100]}...")
 
     return {
+        **turn_reset,
         "messages": [AIMessage(content=response.content)],
         "turn_history": [_build_turn_entry(state)],
     }
@@ -402,36 +467,50 @@ def get_next_agent(state: AgentState) -> str:
     
     logger.debug(f"Router: plan={plan}, step={current_step}/{max_steps}")
     
+    def _route_decision(target: str, reason: str) -> str:
+        _log_flow_event("ROUTING", {
+            "decision": target,
+            "reason": reason,
+            "plan": plan,
+            "current_step": current_step,
+            "pending_goals": state.get("pending_goals"),
+            "replan_count": state.get("replan_count", 0),
+        })
+        return target
+
     # 1. Cycle Guard: max_steps überschritten
     if current_step >= max_steps:
         logger.warning(f"max_steps erreicht ({current_step}/{max_steps}) - Notfall-Exit!")
-        return "respond"
-    
+        return _route_decision("respond", f"max_steps erreicht ({current_step}/{max_steps})")
+
     # 2. User-Input benötigt
     if state.get("needs_user_input", False):
-        logger.debug(f"needs_user_input=True → respond")
-        return "respond"
-    
+        logger.debug("needs_user_input=True → respond")
+        return _route_decision("respond", "needs_user_input=True")
+
     # 3. Fehler vorhanden (aber nicht schon behandelt)
     error = state.get("error")
     error_count = state.get("error_count", 0)
     if error and error_count == 0:
         logger.debug(f"Fehler erkannt → error_handler")
-        return "error_handler"
-    
+        return _route_decision("error_handler", f"error={error}")
+
     # 4. Leerer Plan oder Plan fertig
     if not plan:
         logger.debug("Leerer Plan → respond")
-        return "respond"
-    
+        return _route_decision("respond", "Leerer Plan")
+
     if current_step >= len(plan):
+        if state.get("pending_goals") and state.get("replan_count", 0) < 2:
+            logger.debug("Plan fertig, pending_goals vorhanden -> replan_bridge")
+            return _route_decision("replan_bridge", f"pending_goals={state.get('pending_goals')}")
         logger.debug("Plan fertig → respond")
-        return "respond"
+        return _route_decision("respond", "Plan abgeschlossen")
     
     # 5. Nächster Agent
     next_agent = plan[current_step]
     logger.debug(f"Nächster Agent: {next_agent}")
-    return next_agent
+    return _route_decision(next_agent, f"plan[{current_step}]")
 
 
 def route_after_error(state: AgentState) -> str:
@@ -465,19 +544,43 @@ def make_agent_wrapper(agent_func, agent_name: str):
     """
     async def wrapper(state: AgentState) -> dict[str, Any]:
         logger.info(f"=== {agent_name.upper()} ===")
-        
+
+        # Debug-Log: Was der Agent als Input sieht (vom Supervisor)
+        _log_flow_event(f"AGENT_START: {agent_name}", {
+            "step": f"{state.get('current_step', 0)} / plan={state.get('plan', [])}",
+            "data_retrieval_mode": state.get("data_retrieval_mode"),
+            "data_instructions": state.get("data_instructions"),
+            "active_dataset_keys": state.get("active_dataset_keys"),
+            "active_stats_keys": state.get("active_stats_keys"),
+            "statistics_summary": (state.get("statistics_summary") or "")[:200],
+            "chart_url": state.get("chart_url"),
+            "error": state.get("error"),
+        })
+
         try:
             result = await agent_func(state)
             result["current_step"] = state.get("current_step", 0) + 1
-            
+
             # Error-Flag zurücksetzen wenn erfolgreich
             if "error" not in result:
                 result["error"] = None
-            
+
+            # Debug-Log: Was der Agent zurückgibt (an State → Supervisor EVAL)
+            _log_flow_event(f"AGENT_RESULT: {agent_name}", {
+                "active_dataset_keys": result.get("active_dataset_keys"),
+                "active_stats_keys": result.get("active_stats_keys"),
+                "statistics_summary": (result.get("statistics_summary") or "")[:200],
+                "chart_url": result.get("chart_url"),
+                "chart_type": result.get("chart_type"),
+                "error": result.get("error"),
+                "messages_count": len(result.get("messages", [])),
+            })
+
             return result
-            
+
         except Exception as e:
             logger.error(f"{agent_name} Exception: {e}", exc_info=True)
+            _log_flow_event(f"AGENT_ERROR: {agent_name}", {"error": str(e)})
             return {
                 "current_step": state.get("current_step", 0) + 1,
                 "error": str(e),
@@ -505,6 +608,7 @@ def build_graph() -> StateGraph:
     graph.add_node("data_agent", make_agent_wrapper(data_agent_node, "data_agent"))
     graph.add_node("stats_agent", make_agent_wrapper(stats_agent_node, "stats_agent"))
     graph.add_node("viz_agent", make_agent_wrapper(viz_agent_node, "viz_agent"))
+    graph.add_node("replan_bridge", replan_bridge)
     graph.add_node("error_handler", error_handler_node)
     graph.add_node("respond", respond_node)
     
@@ -514,10 +618,13 @@ def build_graph() -> StateGraph:
     # Supervisor → Router
     graph.add_conditional_edges("supervisor", get_next_agent, ROUTING_MAP)
     
-    # Alle Agents → Router (DRY: eine Schleife statt Copy-Paste)
+    # Alle Agents → Supervisor (feste Edge, DEC-032: Eval nach jedem Agent)
     for agent in AGENT_NODES:
-        graph.add_conditional_edges(agent, get_next_agent, ROUTING_MAP)
+        graph.add_edge(agent, "supervisor")
     
+    # Replan Bridge → Supervisor (feste Edge, DEC-032)
+    graph.add_edge("replan_bridge", "supervisor")
+
     # Error Handler → respond oder retry
     graph.add_conditional_edges(
         "error_handler",
@@ -591,7 +698,7 @@ async def run_query(
     graph = get_graph()
 
     # Config mit thread_id für Checkpointer
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 30}
 
     # DEC-025: SessionStore als "in use" markieren (Schutz gegen Destroy bei Page-Refresh)
     effective_session_id = session_id or thread_id

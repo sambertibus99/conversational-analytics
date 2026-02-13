@@ -185,6 +185,8 @@ async def retry_with_backoff(
 class ThingsBoardClient:
     """Async Client für ThingsBoard REST API."""
     
+    MAX_CONCURRENT_REQUESTS = 3  # ThingsBoard verträgt nicht mehr als ~3 parallele Anfragen
+
     def __init__(self):
         self.base_url = THINGSBOARD_URL.rstrip("/")
         self.username = THINGSBOARD_USERNAME
@@ -192,7 +194,8 @@ class ThingsBoardClient:
         self.token: str | None = None
         self.token_expires: datetime | None = None
         self._client: httpx.AsyncClient | None = None
-        
+        self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_REQUESTS)
+
         logger.info(f"ThingsBoardClient initialisiert für {self.base_url}")
     
     async def __aenter__(self):
@@ -289,21 +292,22 @@ class ThingsBoardClient:
             JSON Response
         """
         await self._ensure_token()
-        
+
         url = f"{self.base_url}{endpoint}"
-        
+
         async def _do_request():
-            logger.debug(f"{operation_name}: {method} {endpoint}")
-            
-            response = await self._client.request(
-                method,
-                url,
-                headers=self._headers(),
-                **kwargs
-            )
-            self._handle_response_errors(response, operation_name)
-            return response.json()
-        
+            async with self._semaphore:
+                logger.debug(f"{operation_name}: {method} {endpoint}")
+
+                response = await self._client.request(
+                    method,
+                    url,
+                    headers=self._headers(),
+                    **kwargs
+                )
+                self._handle_response_errors(response, operation_name)
+                return response.json()
+
         try:
             return await retry_with_backoff(_do_request)
         except httpx.ConnectError as e:

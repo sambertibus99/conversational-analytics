@@ -551,14 +551,11 @@ class TestBuildTurnContext:
         # Erste 5 abgeschnitten — Turn 1 zeigt Query 5 (0-indexed)
         assert 'Turn 1: "Query 5"' in result
 
-    def test_fallback_datasets_without_history(self):
-        """Fallback: Datasets ohne History → 'Daten vorhanden'."""
-        datasets = {"krc5/torque/ts": {"dataset_key": "krc5/torque/ts"}}
+    def test_no_history_no_duckdb(self):
+        """DEC-031: Ohne turn_history und ohne DuckDB → leerer String."""
+        result = build_turn_context([])
 
-        result = build_turn_context([], datasets)
-
-        assert "VORHANDENE DATEN" in result
-        assert "Daten vorhanden" in result
+        assert result == ""
 
     def test_datasets_same_timerange(self):
         """Turn mit gleichem Zeitraum → eine 'Daten:'-Zeile."""

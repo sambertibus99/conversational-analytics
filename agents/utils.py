@@ -61,9 +61,8 @@ def get_data_from_state(state: dict) -> dict[str, list]:
     except Exception as e:
         logger.debug(f"DuckDB nicht verfügbar: {e}")
 
-    # Versuch 3: Legacy-Format aus State
-    datasets = state.get("datasets", {})
-    return extract_data_from_datasets(datasets)
+    # DEC-031: Kein Legacy-Fallback mehr — DuckDB ist Single Source of Truth
+    return {}
 
 
 def get_values_for_key(state: dict, signal_key: str) -> list[float]:
@@ -98,10 +97,8 @@ def get_values_for_key(state: dict, signal_key: str) -> list[float]:
     except Exception as e:
         logger.debug(f"DuckDB Lookup fehlgeschlagen: {e}")
 
-    # Versuch 2: Legacy
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-    return extract_values_from_data(data, signal_key)
+    # DEC-031: Kein Legacy-Fallback mehr
+    return []
 
 
 def get_timeseries_for_key(state: dict, signal_key: str) -> tuple[list[int], list[float]]:
@@ -136,10 +133,8 @@ def get_timeseries_for_key(state: dict, signal_key: str) -> tuple[list[int], lis
     except Exception as e:
         logger.debug(f"DuckDB Lookup fehlgeschlagen: {e}")
 
-    # Versuch 2: Legacy
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-    return extract_timestamps_from_data(data, signal_key), extract_values_from_data(data, signal_key)
+    # DEC-031: Kein Legacy-Fallback mehr
+    return [], []
 
 
 def get_available_signal_keys(state: dict) -> list[str]:
@@ -168,10 +163,39 @@ def get_available_signal_keys(state: dict) -> list[str]:
     except Exception as e:
         logger.debug(f"DuckDB Lookup fehlgeschlagen: {e}")
 
-    # Versuch 2: Legacy
-    datasets = state.get("datasets", {})
-    data = extract_data_from_datasets(datasets)
-    return list(data.keys())
+    # DEC-031: Kein Legacy-Fallback mehr
+    return []
+
+
+# =============================================================================
+# DUCKDB DATASET-META ZUGRIFF (DEC-031)
+# =============================================================================
+
+def get_dataset_meta_from_duckdb(
+    session_id: str,
+    dataset_keys: list[str] | None = None,
+) -> dict[str, dict]:
+    """
+    DEC-031: Liest DatasetMeta aus DuckDB.
+
+    Args:
+        session_id: DuckDB Session-ID
+        dataset_keys: Optionale Liste von Keys (None = alle)
+
+    Returns:
+        Dict: dataset_key -> DatasetMeta dict, leeres Dict bei Fehler
+    """
+    try:
+        from config.duckdb_store import SessionStore
+        if session_id not in SessionStore._instances:
+            return {}
+        store = SessionStore.get_instance(session_id)
+        if dataset_keys:
+            return store.get_dataset_metas(dataset_keys)
+        return store.get_all_dataset_metas()
+    except Exception as e:
+        logger.debug(f"get_dataset_meta_from_duckdb fehlgeschlagen: {e}")
+        return {}
 
 
 # =============================================================================

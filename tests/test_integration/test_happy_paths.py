@@ -49,8 +49,8 @@ class TestDataAgentHappyPath:
         assert result.get("error") is None, f"Fehler: {result.get('error')}"
         
         # Daten oder Summary vorhanden
-        has_data = result.get("data") is not None or result.get("datasets")
-        assert has_data, "Weder data noch datasets vorhanden"
+        has_data = result.get("data") is not None or result.get("active_dataset_keys")
+        assert has_data, "Weder data noch active_dataset_keys vorhanden"
     
     async def test_list_telemetry_keys(self):
         """Testet Auflistung der Telemetrie-Keys."""
@@ -87,7 +87,7 @@ class TestDataAgentHappyPath:
         
         # Meta sollte Info über Verfügbarkeit enthalten
         meta = result.get("data_meta", {})
-        has_info = meta.get("type") in ("data_availability", "no_data", "success") or result.get("datasets")
+        has_info = meta.get("type") in ("data_availability", "no_data", "success") or result.get("active_dataset_keys")
         assert has_info, f"Keine Zeitraum-Info. Meta: {meta}"
 
 

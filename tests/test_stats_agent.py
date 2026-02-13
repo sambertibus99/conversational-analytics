@@ -67,6 +67,22 @@ class TestStatsFunctions:
         assert result["min"] == 1
         assert result["max"] == 9
         assert result["range"] == 8
+
+    def test_min_max_with_timestamps(self):
+        """Min/Max mit Timestamps gibt min_timestamp/max_timestamp zurück."""
+        result = calculate_min_max([10, 20, 5, 15], [1000, 2000, 3000, 4000])
+        assert result["min"] == 5
+        assert result["max"] == 20
+        assert result["min_timestamp"] == 3000
+        assert result["max_timestamp"] == 2000
+
+    def test_min_max_without_timestamps(self):
+        """Min/Max ohne Timestamps gibt KEIN min_timestamp/max_timestamp zurück."""
+        result = calculate_min_max([10, 20, 5, 15])
+        assert result["min"] == 5
+        assert result["max"] == 20
+        assert "min_timestamp" not in result
+        assert "max_timestamp" not in result
     
     def test_correlation_positive(self):
         """Positive Korrelation (DEC-024: mit Timestamps)."""
