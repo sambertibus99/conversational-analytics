@@ -31,7 +31,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from agents.state import AgentState
-from agents.utils import extract_user_query
+from agents.utils import extract_user_query, describe_active_data
 from prompts.supervisor_prompt import get_supervisor_prompt, get_supervisor_eval_prompt
 from config.settings import DEFAULT_MODEL, api_key_rotator, create_anthropic_client, create_cached_system_message
 
@@ -128,6 +128,11 @@ class EvalDecision(BaseModel):
         default=None,
         description="Nur bei action='replan': Offene Ziele für die nächste Phase."
     )
+    viz_data_source: Literal["timeseries", "stats"] | None = Field(
+        default=None,
+        description="Nur setzen wenn viz_agent der nächste Schritt ist. "
+                    "'timeseries' = Zeitreihen-Chart, 'stats' = Stats-Aggregate-Chart."
+    )
 
 
 # =============================================================================
@@ -151,6 +156,12 @@ def _build_replan_context(replan_context: dict) -> str:
         parts.append(f"Statistik: {replan_context['statistics_summary']}")
     if replan_context.get("data_retrieval_mode"):
         parts.append(f"Daten-Modus: {replan_context['data_retrieval_mode']}")
+    if replan_context.get("agent_signals"):
+        parts.append("Agent-Signale:")
+        for s in replan_context["agent_signals"]:
+            parts.append(f"  [{s.get('type', '?').upper()}] {s.get('code', '?')}: {s.get('message', '')}")
+            if s.get("suggestion"):
+                parts.append(f"    → {s['suggestion']}")
     return "\n".join(parts)
 
 
@@ -183,16 +194,23 @@ def _get_per_turn_reset(replan_mode: bool = False) -> dict:
                      IMMER resettet, da der Supervisor ihn beim Replan-PLAN
                      bereits verbraucht hat. statistics/statistics_summary
                      werden bei Replan bewahrt (Ergebnisse aus Phase 1 für respond).
+                     active_dataset_keys wird IMMER resettet —
+                     der Supervisor muss data_agent im Replan-Plan einplanen.
+                     active_stats_keys bleibt erhalten (Stats Agent überschreibt wenn er läuft).
     """
     reset = {
         "active_dataset_keys": None,
-        "active_stats_keys": None,
+        # active_stats_keys wird NICHT resettet — bleibt vom vorherigen Turn erhalten
+        # (analog zu DEC-028: Stats Agent überschreibt wenn er läuft, sonst bleibt der Wert)
         "chart_url": None,
         "chart_type": None,
         "error": None,
         "error_count": 0,
         "needs_user_input": False,
         "user_input_reason": None,
+        "viz_data_source": "auto",  # Viz-Datenquelle pro Turn zurücksetzen
+        "stats_findings": None,     # DEC-034: Pro Turn überschrieben
+        "agent_signals": None,      # Agent-Signale pro Turn zurücksetzen
         "pending_goals": None,      # Neu für Phase 6 (Replan-Loop)
         "replan_context": None,     # Immer zurücksetzen (nach Verbrauch durch Supervisor)
     }
@@ -256,6 +274,9 @@ def parse_supervisor_response(response: str) -> dict[str, Any]:
             "reasoning": result.get("reasoning", "Keine Begründung"),
             "data_mode": data_mode,
             "data_instructions": result.get("data_instructions"),
+            "viz_instructions": result.get("viz_instructions"),
+            "viz_data_source": result.get("viz_data_source", "auto"),
+            "stats_instructions": result.get("stats_instructions"),
             "needs_user_input": result.get("needs_user_input", False),
             "user_input_reason": result.get("user_input_reason"),
             "pending_goals": result.get("pending_goals"),  # DEC-032: Replan-Loop
@@ -367,6 +388,41 @@ def build_turn_context(turn_history: list, datasets: dict = None, session_id: st
         stats_keys = turn.get("stats_dataset_keys", [])
         if stats_keys:
             parts.append(f"  Stats-Datasets: {', '.join(stats_keys[:5])}")
+
+        # DEC-034: Strukturierte Erkenntnisse für Cross-Turn-Referenzen
+        key_facts = turn.get("key_facts", [])
+        for fact in key_facts:
+            ftype = fact.get("type", "?")
+            key = fact.get("key", "?")
+            val = fact.get("value")
+            ts = fact.get("timestamp")
+            tr = fact.get("timerange", "")
+            ds_suffix = f" [{tr}]" if tr else ""
+
+            if ftype in ("max", "min"):
+                line = f"  >> {ftype.upper()}: {key} = {val}"
+                if ts:
+                    line += f" (bei {ts})"
+                parts.append(line + ds_suffix)
+            elif ftype == "correlation":
+                parts.append(f"  >> Korrelation: {key} r={val} ({fact.get('interpretation', '')}){ds_suffix}")
+            elif ftype == "trend":
+                parts.append(f"  >> Trend: {key} = {val} (slope={fact.get('slope')}){ds_suffix}")
+            elif ftype == "anomaly":
+                parts.append(f"  >> Anomalien: {key} = {val} Stück ({fact.get('percentage', '?')}%){ds_suffix}")
+            elif ftype == "activity":
+                windows = fact.get("windows", [])
+                win_strs = [f"{w['start']}-{w['end']} ({w['duration_s']}s)" for w in windows]
+                parts.append(f"  >> Aktivität: {key} = {val} Fenster ({fact.get('active_ratio', 0)*100:.0f}% aktiv): {', '.join(win_strs)}{ds_suffix}")
+            elif ftype == "mean":
+                parts.append(f"  >> Durchschnitt: {key} = {val}{ds_suffix}")
+            elif ftype == "std":
+                parts.append(f"  >> Std.Abweichung: {key} = {val}{ds_suffix}")
+            elif ftype == "summary":
+                parts.append(f"  >> Übersicht: {key} mean={fact.get('mean')} min={fact.get('min')} max={fact.get('max')}{ds_suffix}")
+            else:
+                parts.append(f"  >> {ftype}: {key} = {val}{ds_suffix}")
+
         parts.append("")
 
     return "\n".join(parts)
@@ -504,12 +560,26 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
         data_mode = result.get("data_mode", "overview")
 
         data_instructions = result.get("data_instructions")
+        viz_instructions = result.get("viz_instructions")
+        stats_instructions = result.get("stats_instructions")
         needs_input = result.get("needs_user_input", False)
         input_reason = result.get("user_input_reason")
+
+        # viz_data_source extrahieren und validieren
+        viz_data_source = result.get("viz_data_source", "auto")
+        if viz_data_source not in ("timeseries", "stats", "auto"):
+            logger.warning(f"Ungültiger viz_data_source '{viz_data_source}', verwende 'auto'")
+            viz_data_source = "auto"
 
         logger.info(f"Plan erstellt: {final_plan}, data_mode: {data_mode}")
         if data_instructions:
             logger.info(f"Data Instructions: {data_instructions[:80]}...")
+        if viz_instructions:
+            logger.info(f"Viz Instructions: {viz_instructions[:80]}...")
+        if viz_data_source != "auto":
+            logger.info(f"Viz Data Source: {viz_data_source}")
+        if stats_instructions:
+            logger.info(f"Stats Instructions: {stats_instructions[:80]}...")
         if needs_input:
             logger.info(f"Rückfrage nötig: {input_reason}")
 
@@ -525,16 +595,30 @@ async def run_supervisor(state: AgentState) -> dict[str, Any]:
                 "messages": [AIMessage(content=input_reason)],
             }
 
-        return {
+        result_dict = {
             **_get_per_turn_reset(replan_mode=is_replan),
             "plan": final_plan,
             "reasoning": result["reasoning"],
             "current_step": 0,
             "data_retrieval_mode": data_mode,  # DEC-023
             "data_instructions": data_instructions,
+            "viz_instructions": viz_instructions,
+            "viz_data_source": viz_data_source,
+            "stats_instructions": stats_instructions,
             "pending_goals": result.get("pending_goals"),  # DEC-032: Replan-Loop
             "messages": [AIMessage(content=f"Plan erstellt: {final_plan}")],
         }
+
+        # Replan ohne data_agent: active_dataset_keys aus replan_context übernehmen
+        # damit Stats/Viz Agents auf bereits geladene Daten zugreifen können
+        replan_ctx = state.get("replan_context")
+        if is_replan and "data_agent" not in final_plan and replan_ctx:
+            prev_keys = replan_ctx.get("active_dataset_keys")
+            if prev_keys:
+                result_dict["active_dataset_keys"] = prev_keys
+                logger.info(f"Replan: active_dataset_keys aus Phase übernommen: {prev_keys}")
+
+        return result_dict
     
     except Exception as e:
         error_msg = f"Fehler bei der Planung: {str(e)}"
@@ -562,14 +646,53 @@ async def run_supervisor_eval(state: AgentState) -> dict[str, Any]:
     plan = state.get("plan") or []
     current_step = state.get("current_step", 0)
 
-    # Plan fertig → kein LLM-Call nötig, get_next_agent entscheidet
+    # Plan fertig → EVAL trotzdem ausführen um Endergebnis zu prüfen
+    # Der EVAL kann "replan" auslösen wenn das Ergebnis nicht zur User-Frage passt
     if current_step >= len(plan):
-        logger.debug("Supervisor EVAL: Plan fertig, kein LLM-Call")
-        return {}
+        logger.debug("Supervisor EVAL: Plan fertig, prüfe Endergebnis")
 
     try:
         # User-Query extrahieren
         user_query = extract_user_query(state["messages"])
+
+        # Agent Signals aufbereiten
+        signals = state.get("agent_signals") or []
+        if signals:
+            signals_lines = []
+            for s in signals:
+                signals_lines.append(
+                    f"  [{s.get('type', '?').upper()}] {s.get('agent', '?')}/{s.get('code', '?')}: "
+                    f"{s.get('message', '')}"
+                )
+                if s.get("suggestion"):
+                    signals_lines.append(f"    → Vorschlag: {s['suggestion']}")
+            signals_text = "\n".join(signals_lines)
+        else:
+            signals_text = "keine"
+
+        # Letzte Agent-Antwort extrahieren (letztes AIMessage ohne Tool-Calls)
+        last_agent_response = "keine"
+        for msg in reversed(state.get("messages", [])):
+            if isinstance(msg, AIMessage) and not msg.tool_calls:
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                if content.strip():
+                    last_agent_response = content.strip()[:500]
+                    break
+
+        # Verfügbare Daten lesbar beschreiben (statt roher UNS-Keys)
+        session_id = state.get("session_id", "default")
+        dataset_keys = state.get("active_dataset_keys")
+        stats_keys = state.get("active_stats_keys")
+        data_description = describe_active_data(session_id, dataset_keys, stats_keys)
+
+        # Geplante Instruktionen für verbleibende Agents
+        remaining_instructions = []
+        remaining = plan[current_step:]
+        if "stats_agent" in remaining and state.get("stats_instructions"):
+            remaining_instructions.append(f"stats_agent soll: {state['stats_instructions']}")
+        if "viz_agent" in remaining and state.get("viz_instructions"):
+            remaining_instructions.append(f"viz_agent soll: {state['viz_instructions']}")
+        instructions_text = "\n".join(remaining_instructions) if remaining_instructions else "keine"
 
         # Eval-Kontext aus State aufbauen
         eval_context = (
@@ -578,12 +701,14 @@ async def run_supervisor_eval(state: AgentState) -> dict[str, Any]:
             f"Ausgeführt: {plan[:current_step]}\n"
             f"Verbleibend: {plan[current_step:]}\n"
             f"Letzter Agent: {plan[current_step - 1]}\n\n"
+            f"Antwort des letzten Agents:\n{last_agent_response}\n\n"
+            f"Geplante Aufgaben der verbleibenden Agents:\n{instructions_text}\n\n"
             f"Aktueller State:\n"
-            f"- active_dataset_keys: {state.get('active_dataset_keys')}\n"
-            f"- active_stats_keys: {state.get('active_stats_keys')}\n"
+            f"- Verfügbare Daten:\n{data_description}\n"
             f"- statistics_summary: {state.get('statistics_summary', 'keine')}\n"
             f"- chart_url: {state.get('chart_url', 'kein')}\n"
-            f"- error: {state.get('error', 'kein')}"
+            f"- error: {state.get('error', 'kein')}\n"
+            f"- agent_signals:\n{signals_text}"
         )
 
         # LLM mit Structured Output (DEC-021: Prompt Caching)
@@ -597,19 +722,21 @@ async def run_supervisor_eval(state: AgentState) -> dict[str, Any]:
 
         logger.debug(f"Supervisor EVAL: LLM-Call nach {plan[current_step - 1]}")
         decision = await structured_llm.ainvoke(messages)
-        logger.info(f"Supervisor EVAL: {decision.action} — {decision.reasoning}")
+        if decision.viz_data_source:
+            logger.info(f"Supervisor EVAL: {decision.action} — {decision.reasoning} (viz_data_source: {decision.viz_data_source})")
+        else:
+            logger.info(f"Supervisor EVAL: {decision.action} — {decision.reasoning}")
 
         # Debug-Log: Vollständiger EVAL-Aufruf
         _log_supervisor_call(
             mode="EVAL",
             system_prompt=get_supervisor_eval_prompt(),
             user_message=eval_context,
-            response=f"action={decision.action}, reasoning={decision.reasoning}, pending_goals={decision.pending_goals}",
+            response=f"action={decision.action}, reasoning={decision.reasoning}, pending_goals={decision.pending_goals}, viz_data_source={decision.viz_data_source}",
             state_snapshot={
                 "plan": plan,
                 "current_step": current_step,
-                "active_dataset_keys": state.get("active_dataset_keys"),
-                "active_stats_keys": state.get("active_stats_keys"),
+                "data_description": data_description,
                 "statistics_summary": state.get("statistics_summary", "keine"),
                 "chart_url": state.get("chart_url", "kein"),
                 "error": state.get("error", "kein"),
@@ -629,8 +756,11 @@ async def run_supervisor_eval(state: AgentState) -> dict[str, Any]:
                 "pending_goals": None,
             }
 
-        # action == "continue"
-        return {}
+        # action == "continue": viz_data_source weiterreichen wenn gesetzt
+        result = {}
+        if decision.viz_data_source:
+            result["viz_data_source"] = decision.viz_data_source
+        return result
 
     except Exception as e:
         logger.warning(f"Supervisor EVAL: LLM-Fehler, Fallback auf continue — {e}")

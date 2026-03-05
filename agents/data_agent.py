@@ -42,6 +42,7 @@ from config.duckdb_store import SessionStore, generate_dataset_key, determine_si
 from mcp_servers.thingsboard_server import (
     check_raw_datapoint_limit, parse_datetime as parse_dt, RAW_DATAPOINT_THRESHOLD,
     calculate_expected_datapoints, snap_to_interval, INTERVAL_OPTIONS,
+    calculate_auto_interval,
 )
 
 
@@ -571,6 +572,10 @@ MAX_TOTAL_DATAPOINTS = 6000
 # MAX_TOTAL_DATAPOINTS > Server-Limit oder Server-Config sich ändert.
 TS_MAX_INTERVALS = 10000
 
+# Agent-Signal Collector: raw_estimation_hook schreibt Signale hier rein,
+# run_data_agent liest sie am Anfang ab und leert die Liste.
+_pending_signals: list[dict] = []
+
 
 def raw_estimation_hook(state: dict) -> dict:
     """
@@ -618,63 +623,74 @@ def raw_estimation_hook(state: dict) -> dict:
             new_tool_calls.append(tc)
             continue
 
-        # Über Threshold: optimales Intervall für EINEN Key berechnen
+        # Über Threshold: optimales Intervall berechnen
         # Zwei Constraints: Budget (MAX_TOTAL_DATAPOINTS) und ThingsBoard
         # ts_max_intervals Limit (TS_MAX_INTERVALS) — der strengere gewinnt
         duration_ms = (end_dt - start_dt).total_seconds() * 1000
         budget_interval_ms = int(duration_ms / MAX_TOTAL_DATAPOINTS)
         ts_limit_interval_ms = int(duration_ms / TS_MAX_INTERVALS)
-        min_interval_ms = max(budget_interval_ms, ts_limit_interval_ms)
+        auto_interval_ms, _, _ = calculate_auto_interval(start_dt, end_dt)  # Safety Net
+        min_interval_ms = max(budget_interval_ms, ts_limit_interval_ms, auto_interval_ms)
         interval_key, _, interval_human = snap_to_interval(min_interval_ms)
 
         estimated = raw_check.get("estimated_total_points", 0)
         _, pts_per_call = calculate_expected_datapoints(
-            start_dt, end_dt, INTERVAL_OPTIONS[interval_key][0], 1
+            start_dt, end_dt, INTERVAL_OPTIONS[interval_key][0], len(keys)
         )
 
-        # Pro Key einen eigenen Call — maximale Auflösung
-        split_calls = []
-        for i, key in enumerate(keys):
-            split_tc = {
-                "id": f"{tc['id']}_{i}",
-                "name": "get_telemetry",
-                "args": {
-                    **args,
-                    "keys": key,
-                    "raw": False,
-                    "interval": interval_key,
-                    "aggregation": args.get("aggregation") or "AVG",
-                },
-            }
-            new_tool_calls.append(split_tc)
-            split_calls.append(split_tc)
-
-        replaced_ids[tc["id"]] = split_calls
+        # Alle Keys in EINEM Call — TB-API unterstützt komma-separierte Keys
+        # nativ. Splitting in Einzel-Calls war unnötig langsam weil MCP-stdio
+        # Requests sequentiell verarbeitet (6 Keys × 3s = 18s statt 1 × 3s).
+        batch_tc = {
+            "id": tc["id"],
+            "name": "get_telemetry",
+            "args": {
+                **args,
+                "keys": ",".join(keys),
+                "raw": False,
+                "interval": interval_key,
+                "aggregation": args.get("aggregation") or "AVG",
+            },
+        }
+        new_tool_calls.append(batch_tc)
+        replaced_ids[tc["id"]] = [batch_tc]
         modified = True
         logger.info(
-            f"raw_estimation_hook: {estimated:,} Rohdaten → {len(keys)} Einzel-Calls "
-            f"mit {interval_key} ({interval_human}), je ca. {pts_per_call:,} Punkte"
+            f"raw_estimation_hook: {estimated:,} Rohdaten → 1 Batch-Call ({len(keys)} Keys) "
+            f"mit {interval_key} ({interval_human}), ca. {pts_per_call:,} Punkte gesamt"
         )
+        _pending_signals.append({
+            "agent": "data_agent",
+            "type": "warning",
+            "code": "raw_downgraded",
+            "message": (
+                f"Rohdaten-Anfrage automatisch auf {interval_key}-Intervall aggregiert "
+                f"({estimated:,} geschaetzte Punkte). Keys: {', '.join(keys)}"
+            ),
+            "suggestion": (
+                "Fuer Korrelation/Detail-Analyse: Engeren Zeitraum waehlen "
+                "oder weniger Keys laden damit Rohdaten moeglich sind"
+            ),
+        })
 
     if modified:
         last_msg.tool_calls = new_tool_calls
 
-        # Content synchronisieren: tool_use Blöcke müssen zu tool_calls passen,
-        # sonst meldet die Anthropic API "tool_use ids without tool_result"
+        # Content synchronisieren: tool_use Blöcke müssen zu tool_calls passen
         if isinstance(last_msg.content, list):
             new_content = []
             for block in last_msg.content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     original_id = block.get("id")
                     if original_id in replaced_ids:
-                        # Alten tool_use durch gesplittete ersetzen
-                        for new_tc in replaced_ids[original_id]:
-                            new_content.append({
-                                "type": "tool_use",
-                                "id": new_tc["id"],
-                                "name": new_tc["name"],
-                                "input": new_tc["args"],
-                            })
+                        # tool_use mit aktualisierten Args ersetzen
+                        new_tc = replaced_ids[original_id][0]
+                        new_content.append({
+                            "type": "tool_use",
+                            "id": new_tc["id"],
+                            "name": new_tc["name"],
+                            "input": new_tc["args"],
+                        })
                     else:
                         new_content.append(block)
                 else:
@@ -699,10 +715,39 @@ def _make_overview_guard_hook(data_mode: str):
 
     Lösung: Im overview-Modus werden get_telemetry-Calls korrigiert:
     - raw=True → raw=False (erzwingt Aggregation)
-    - explizites interval → entfernt (erzwingt Auto-Intervall)
+    - zu feines interval → entfernt (Auto-Intervall greift)
+    - gröberes interval (z.B. 1h für 24h) → beibehalten (gewollte Aggregation)
+
+    Bei Korrektur wird ein Text-Block an die AIMessage angehängt,
+    damit das LLM im nächsten Step versteht was passiert ist.
 
     Im detail-Modus wird stattdessen der raw_estimation_hook angewendet.
     """
+    # Interval-Lookup (ms) für Vergleich
+    _INTERVAL_MS = {
+        "1s": 1000, "2s": 2000, "3s": 3000, "5s": 5000, "10s": 10000,
+        "30s": 30000, "1m": 60000, "5m": 300000, "10m": 600000,
+        "30m": 1800000, "1h": 3600000, "6h": 21600000, "1d": 86400000,
+    }
+
+    def _get_auto_interval_ms(start_str: str, end_str: str) -> int:
+        """Berechnet Auto-Intervall (ms) für einen Zeitraum (gleiche Logik wie TB-Server)."""
+        try:
+            s = datetime.fromisoformat(str(start_str).replace(" ", "T"))
+            e = datetime.fromisoformat(str(end_str).replace(" ", "T"))
+            hours = (e - s).total_seconds() / 3600
+        except Exception:
+            return 600000  # Fallback: 10m
+
+        if hours <= 1:
+            return 60000       # 1m
+        elif hours <= 24:
+            return 600000      # 10m
+        elif hours <= 336:
+            return 3600000     # 1h
+        else:
+            return 86400000    # 1d
+
     def hook(state: dict) -> dict:
         if data_mode in ("detail", "latest"):
             return raw_estimation_hook(state)
@@ -717,22 +762,51 @@ def _make_overview_guard_hook(data_mode: str):
             return {}
 
         modified = False
+        guard_notes = []
         for tc in last_msg.tool_calls:
             if tc["name"] != "get_telemetry":
                 continue
             args = tc.get("args", {})
+            keys_info = args.get("keys", "?")
 
             # raw=True → raw=False
             if args.get("raw", False):
                 args["raw"] = False
                 modified = True
-                logger.info(f"overview_guard: raw=True → False für {args.get('keys', '?')}")
+                note = f"raw=True → False für {keys_info} (overview-Modus erlaubt kein raw)"
+                guard_notes.append(note)
+                logger.info(f"overview_guard: {note}")
 
-            # Explizites interval entfernen → Auto-Intervall greift
+            # Interval-Check: nur zu feine Intervalle entfernen
             if "interval" in args and args["interval"] is not None:
-                removed_interval = args.pop("interval")
-                modified = True
-                logger.info(f"overview_guard: interval={removed_interval} entfernt für {args.get('keys', '?')}")
+                interval_key = args["interval"].lower().strip()
+                interval_ms = _INTERVAL_MS.get(interval_key)
+
+                if interval_ms:
+                    auto_ms = _get_auto_interval_ms(
+                        args.get("start", ""), args.get("end", "")
+                    )
+                    if interval_ms < auto_ms:
+                        removed = args.pop("interval")
+                        modified = True
+                        note = (
+                            f"interval={removed} entfernt für {keys_info} "
+                            f"(zu fein für overview, Auto-Intervall wird verwendet). "
+                            f"Nicht erneut versuchen."
+                        )
+                        guard_notes.append(note)
+                        logger.info(f"overview_guard: {note}")
+                    else:
+                        logger.info(
+                            f"overview_guard: interval={interval_key} beibehalten "
+                            f"für {keys_info} (gröber als Auto-Intervall)"
+                        )
+                else:
+                    removed = args.pop("interval")
+                    modified = True
+                    note = f"unbekanntes interval={removed} entfernt für {keys_info}"
+                    guard_notes.append(note)
+                    logger.info(f"overview_guard: {note}")
 
         if modified:
             # Content synchronisieren (tool_use Blöcke → args)
@@ -746,6 +820,11 @@ def _make_overview_guard_hook(data_mode: str):
                         )
                         if matching_tc:
                             block["input"] = matching_tc["args"]
+
+                # Feedback-Block anhängen damit das LLM die Korrektur sieht
+                if guard_notes:
+                    feedback = "[overview_guard] " + " | ".join(guard_notes)
+                    last_msg.content.append({"type": "text", "text": feedback})
 
         return {}
 
@@ -1205,6 +1284,7 @@ def build_result(
     data_retrieval_mode: str = "overview",
     all_datasets: Optional[list] = None,
     check_dataset_keys: Optional[list[str]] = None,
+    signals: list[dict] | None = None,
 ) -> dict[str, Any]:
     """
     Baut das Ergebnis-Dictionary zusammen.
@@ -1254,12 +1334,38 @@ def build_result(
                 active_keys.append(ck)
         logger.info(f"active_dataset_keys nach check_dataset merge: {active_keys}")
 
-    return {
+    # Data Response: Wenn keine DuckDB-Daten entstanden, letzte AI-Message als
+    # Text-Antwort speichern (für Attribute, Key-Listings, Geräte-Infos etc.)
+    data_response = None
+    if not active_keys:
+        for msg in reversed(result.get("messages", [])):
+            if not isinstance(msg, AIMessage):
+                continue
+            # Content kann str oder list[dict] sein (Anthropic Content-Blocks)
+            content = msg.content
+            if isinstance(content, list):
+                content = "\n".join(
+                    block.get("text", "") for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            if isinstance(content, str) and len(content) > 20:
+                data_response = content
+                break
+        if data_response:
+            logger.info(f"data_response gesetzt ({len(data_response)} chars, keine DuckDB-Daten)")
+    else:
+        logger.debug(f"data_response übersprungen: active_keys={active_keys}")
+
+    result_dict = {
         "messages": result.get("messages", []),
         "active_dataset_keys": active_keys or None,  # DEC-028
+        "data_response": data_response,
         "needs_user_input": needs_input,
         "user_input_reason": input_reason,
     }
+    if signals:
+        result_dict["agent_signals"] = signals
+    return result_dict
 
 
 def _detect_unit(keys: list[str]) -> str:
@@ -1388,6 +1494,10 @@ async def run_data_agent(state: AgentState) -> dict[str, Any]:
     try:
         logger.debug("Starte run_data_agent")
 
+        # Pending Signals aus vorherigem Turn leeren (Stale-Guard)
+        global _pending_signals
+        _pending_signals.clear()
+
         # 1. Vorhandene Datasets aus DuckDB (DEC-031)
         session_id_pre = state.get("session_id", "default")
         existing_datasets = get_dataset_meta_from_duckdb(session_id_pre)
@@ -1436,6 +1546,12 @@ async def run_data_agent(state: AgentState) -> dict[str, Any]:
         result = await execute_agent_with_retry(agent, messages, all_tools, data_mode=data_mode)
         logger.debug(f"Agent fertig, {len(result.get('messages', []))} Messages")
 
+        # 6b. Pending Signals abholen (raw_estimation_hook schreibt während Agent-Ausführung)
+        collected_signals = list(_pending_signals)
+        _pending_signals.clear()
+        if collected_signals:
+            logger.info(f"Agent Signals: {len(collected_signals)} Signale gesammelt")
+
         # Debug: Neue Messages (Output) loggen
         all_result_msgs = result.get("messages", [])
         new_msgs = all_result_msgs[input_message_count:]
@@ -1478,6 +1594,7 @@ async def run_data_agent(state: AgentState) -> dict[str, Any]:
             build_result,
             result, data, meta, data_file, quality, needs_input, input_reason,
             session_id, data_mode, all_datasets, check_dataset_keys,
+            collected_signals,
         )
         
     except Exception as e:

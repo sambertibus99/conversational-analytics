@@ -46,6 +46,7 @@ class TurnEntry(TypedDict, total=False):
     datasets: list[TurnDataset] # Gruppiert nach Zeitraum
     result_type: str            # "data" | "chart" | "statistics" | "error" | "abstention" | "clarification"
     result_summary: str         # "Korrelation: A1 r=0.012, A2 r=-0.617"
+    key_facts: list[dict]       # DEC-034: Strukturierte Stats-Findings für Cross-Turn-Referenzen
 
 
 def append_turn_history(existing: list | None, new: list | None) -> list:
@@ -120,7 +121,21 @@ class AgentState(MessagesState):
     # === Data Instructions (vom Supervisor an Data Agent) ===
     # Konkrete Anweisungen was der Data Agent laden soll
     data_instructions: str | None = None
-    
+
+    # === Viz Instructions (vom Supervisor an Viz Agent) ===
+    # Konkrete Anweisungen was der Viz Agent visualisieren soll (Chart-Typ, Achsen, Keys)
+    viz_instructions: str | None = None
+
+    # === Viz Data Source (Supervisor → Viz Agent) ===
+    # "timeseries" = Zeitreihen aus telemetry-Tabelle (active_dataset_keys)
+    # "stats" = Statistik-Ergebnisse aus statistics-Tabelle (active_stats_keys)
+    # "auto" = Bisheriges Verhalten (Stats > Timeseries)
+    viz_data_source: str = "auto"
+
+    # === Stats Instructions (vom Supervisor an Stats Agent) ===
+    # Konkrete Anweisungen welche Analysen der Stats Agent durchführen soll
+    stats_instructions: str | None = None
+
     # === Turn History (DEC-029) ===
     # Strukturierte Zusammenfassungen vergangener Turns für Supervisor-Kontext
     turn_history: Annotated[list[dict], append_turn_history] = []
@@ -138,9 +153,24 @@ class AgentState(MessagesState):
     # None = keine Stats-Daten aktiv
     active_stats_keys: list[str] | None = None
 
+    # === Data Agent Text-Antwort (für nicht-DuckDB Ergebnisse) ===
+    # Gesetzt wenn der Data Agent Text-Ergebnisse liefert die nicht in DuckDB landen:
+    # Attribute (get_attributes, list_attribute_keys), Key-Listings, Geräte-Infos etc.
+    data_response: str | None = None
+
     # === Statistiken (vom Stats Agent) ===
     statistics: dict[str, Any] | None = None
     statistics_summary: str | None = None
+
+    # === Stats Findings für Cross-Turn-Referenzen (DEC-034) ===
+    # Strukturierte Erkenntnisse vom Stats Agent mit Datensatz-Kontext.
+    # Wird pro Turn überschrieben, wandert dann in turn_history.
+    stats_findings: list[dict] | None = None
+
+    # === Agent Signals (strukturiertes Feedback für Supervisor EVAL/Replan) ===
+    # Agents schreiben Warnungen/Fehler mit Kontext und Handlungsempfehlung.
+    # Pro Turn überschrieben (kein Reducer — manuelle Akkumulation via read-append).
+    agent_signals: list[dict] | None = None
     
     # === Visualisierung (vom Viz Agent) ===
     chart_url: str | None = None

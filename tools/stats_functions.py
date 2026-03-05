@@ -112,7 +112,7 @@ def calculate_correlation_timeseries(
     x_values: list[float],
     y_timestamps: list[int],
     y_values: list[float],
-    tolerance_ms: int = 1000,
+    tolerance_ms: int = 6000,
 ) -> dict[str, Any]:
     """
     Berechnet Pearson-Korrelation für Zeitreihen mit unterschiedlichen Timestamps.
@@ -126,7 +126,7 @@ def calculate_correlation_timeseries(
         x_values: Werte der ersten Variable
         y_timestamps: Timestamps der zweiten Variable (Millisekunden)
         y_values: Werte der zweiten Variable
-        tolerance_ms: Maximale erlaubte Zeitdifferenz für Match (default: 1000ms)
+        tolerance_ms: Maximale erlaubte Zeitdifferenz für Match (default: 6000ms, 5s-Intervall + 1s Puffer)
 
     Returns:
         dict mit r, p_value, Interpretation und Match-Statistiken
@@ -336,8 +336,102 @@ def calculate_percentiles(
     return result
 
 
+def detect_activity_windows(
+    timestamps: list[int],
+    values: list[float],
+    threshold: float = 5.0,
+    min_duration_ms: int = 10000,
+) -> dict[str, Any]:
+    """
+    Erkennt zusammenhängende Zeiträume in denen Werte über einem Schwellwert liegen.
+
+    Ideal für Fragen wie "wann war der Roboter aktiv?" oder "Betriebszeiten finden".
+
+    Args:
+        timestamps: Unix-Timestamps in Millisekunden
+        values: Messwerte (gleiche Länge wie timestamps)
+        threshold: Ab welchem Wert gilt als "aktiv" (default: 5.0)
+        min_duration_ms: Minimale Fensterdauer in ms um Rauschen zu filtern (default: 10000)
+
+    Returns:
+        dict mit windows-Liste, Zählern und Aktivitätsanteil
+    """
+    if len(timestamps) != len(values):
+        return {"error": f"timestamps ({len(timestamps)}) und values ({len(values)}) unterschiedlich lang", "windows": []}
+
+    if len(values) < 2:
+        return {"error": "Mindestens 2 Werte noetig", "windows": []}
+
+    # Nach Timestamp sortieren
+    pairs = sorted(zip(timestamps, values), key=lambda x: x[0])
+
+    windows = []
+    current_start = None
+    current_vals: list[float] = []
+    prev_ts = pairs[0][0]
+
+    for i, (ts, val) in enumerate(pairs):
+        if val > threshold:
+            if current_start is None:
+                current_start = ts
+                current_vals = [val]
+            else:
+                current_vals.append(val)
+        else:
+            if current_start is not None:
+                # Fenster beenden — letzter aktiver Timestamp war der vorherige
+                end_ts = prev_ts if i > 0 else ts
+                duration_ms = end_ts - current_start
+                if duration_ms >= min_duration_ms:
+                    arr = np.array(current_vals, dtype=float)
+                    windows.append({
+                        "start_ts": current_start,
+                        "start_human": _ms_to_human(current_start),
+                        "end_ts": end_ts,
+                        "end_human": _ms_to_human(end_ts),
+                        "duration_s": round(duration_ms / 1000, 1),
+                        "avg_value": round(float(np.mean(arr)), 2),
+                        "max_value": round(float(np.max(arr)), 2),
+                        "point_count": len(current_vals),
+                    })
+                current_start = None
+                current_vals = []
+        prev_ts = ts
+
+    # Letztes offenes Fenster schließen
+    if current_start is not None:
+        end_ts = pairs[-1][0]
+        duration_ms = end_ts - current_start
+        if duration_ms >= min_duration_ms:
+            arr = np.array(current_vals, dtype=float)
+            windows.append({
+                "start_ts": current_start,
+                "start_human": _ms_to_human(current_start),
+                "end_ts": end_ts,
+                "end_human": _ms_to_human(end_ts),
+                "duration_s": round(duration_ms / 1000, 1),
+                "avg_value": round(float(np.mean(arr)), 2),
+                "max_value": round(float(np.max(arr)), 2),
+                "point_count": len(current_vals),
+            })
+
+    total_active_s = sum(w["duration_s"] for w in windows)
+    total_duration_ms = pairs[-1][0] - pairs[0][0]
+    total_duration_s = round(total_duration_ms / 1000, 1) if total_duration_ms > 0 else 0
+
+    return {
+        "windows": windows,
+        "window_count": len(windows),
+        "total_active_s": round(total_active_s, 1),
+        "total_duration_s": total_duration_s,
+        "active_ratio": round(total_active_s / total_duration_s, 4) if total_duration_s > 0 else 0,
+        "threshold": threshold,
+        "count": len(values),
+    }
+
+
 def detect_anomalies(
-    values: list[float], 
+    values: list[float],
     sigma_threshold: float = 2.0
 ) -> dict[str, Any]:
     """
@@ -518,5 +612,14 @@ if __name__ == "__main__":
     result = calculate_correlation_timeseries(x_ts, x_vals, y_ts, y_vals)
     print(f"   n_x={result.get('n_x')}, n_y={result.get('n_y')}, n_matched={result.get('n_matched')}")
     print(f"   r={result.get('r')}, interpretation: {result.get('interpretation')}")
+
+    print("\n9. Activity Windows:")
+    # Idle-Aktiv-Idle Muster: 5 idle, 5 aktiv, 5 idle
+    act_ts = list(range(0, 150000, 10000))  # 0, 10s, 20s, ..., 140s
+    act_vals = [1.0]*5 + [20.0, 25.0, 30.0, 15.0, 10.0] + [1.0]*5
+    act_result = detect_activity_windows(act_ts, act_vals, threshold=5.0, min_duration_ms=10000)
+    print(f"   windows={act_result['window_count']}, active_ratio={act_result.get('active_ratio')}")
+    for w in act_result.get("windows", []):
+        print(f"   {w['start_human']} - {w['end_human']} ({w['duration_s']}s, avg={w['avg_value']})")
 
     print("\n✅ Alle Tests abgeschlossen!")

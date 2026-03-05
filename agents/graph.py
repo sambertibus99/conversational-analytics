@@ -149,6 +149,8 @@ def _determine_result_type(state: AgentState) -> str:
     plan = state.get("plan")
     if plan == []:
         return "abstention"
+    if state.get("data_response"):
+        return "info"
     return "data"
 
 
@@ -164,6 +166,8 @@ def _determine_result_summary(state: AgentState, result_type: str) -> str:
         return (state.get("reasoning") or "")[:200]
     if result_type == "clarification":
         return (state.get("user_input_reason") or "")[:200]
+    if result_type == "info":
+        return (state.get("data_response") or "")[:200]
     # data: Zusammenfassung aus aktiven DatasetMeta (DEC-031: DuckDB-first)
     active_keys = state.get("active_dataset_keys") or []
     session_id = state.get("session_id", "default")
@@ -175,7 +179,13 @@ def _determine_result_summary(state: AgentState, result_type: str) -> str:
             keys = ds.get("keys", [])
             pts = ds.get("point_count", "?")
             parts.append(f"{', '.join(keys[:2])}: {pts} Punkte")
-    return "; ".join(parts)[:200] if parts else ""
+    if parts:
+        return "; ".join(parts)[:200]
+    # Fallback: data_response (Attribute, Key-Listings etc.)
+    data_response = state.get("data_response")
+    if data_response:
+        return data_response[:200]
+    return ""
 
 
 def _build_turn_entry(state: AgentState) -> dict:
@@ -216,6 +226,11 @@ def _build_turn_entry(state: AgentState) -> dict:
     if active_stats:
         entry["stats_dataset_keys"] = active_stats
 
+    # DEC-034: Stats-Findings für Cross-Turn-Referenzen
+    stats_findings = state.get("stats_findings")
+    if stats_findings:
+        entry["key_facts"] = stats_findings
+
     return entry
 
 
@@ -235,6 +250,7 @@ async def replan_bridge(state: AgentState) -> dict[str, Any]:
             "active_stats_keys": state.get("active_stats_keys"),
             "statistics_summary": state.get("statistics_summary"),
             "data_retrieval_mode": state.get("data_retrieval_mode"),
+            "agent_signals": state.get("agent_signals"),
         },
     }
 
@@ -361,6 +377,11 @@ async def respond_node(state: AgentState) -> dict[str, Any]:
                             f"- {sk}: min={sv.get('min','?')}, max={sv.get('max','?')}, avg={sv.get('avg','?')}"
                         )
     
+    # Data Response: Text-Antwort des Data Agents (Attribute, Key-Listings, Geräte-Infos)
+    data_response = state.get("data_response")
+    if data_response:
+        context_parts.append(f"\n## DATEN-ERGEBNIS\n{data_response}")
+
     # DEC-032: Ergebnisse vorheriger Phase (Replan-Kontext)
     if state.get("replan_context"):
         rc = state["replan_context"]
@@ -573,6 +594,7 @@ def make_agent_wrapper(agent_func, agent_name: str):
                 "chart_url": result.get("chart_url"),
                 "chart_type": result.get("chart_type"),
                 "error": result.get("error"),
+                "agent_signals": result.get("agent_signals"),
                 "messages_count": len(result.get("messages", [])),
             })
 
@@ -679,6 +701,53 @@ def get_graph():
 # PUBLIC API
 # =============================================================================
 
+async def stream_query(
+    query: str,
+    thread_id: str = "default",
+    session_id: str | None = None,
+):
+    """
+    Streamt Graph-Events für Live-UI-Updates.
+
+    Yields (mode, chunk) Tuples:
+    - ("updates", {node_name: state_dict}) nach jeder Node-Ausführung
+    - ("messages", (msg_chunk, metadata)) für LLM-Tokens während der Ausführung
+
+    Args:
+        query: Die Frage des Users
+        thread_id: Eindeutige ID für die Konversation
+        session_id: DuckDB SessionStore ID (default: thread_id)
+    """
+    graph = get_graph()
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 30}
+
+    effective_session_id = session_id or thread_id
+    try:
+        store = SessionStore.get_instance(effective_session_id)
+        store.acquire()
+    except Exception:
+        pass
+
+    input_state = {
+        "messages": [HumanMessage(content=query)],
+        "max_steps": DEFAULT_MAX_STEPS,
+        "session_id": effective_session_id,
+    }
+
+    logger.info(f"Stream starten: '{query[:50]}...' (thread: {thread_id})")
+    try:
+        async for event in graph.astream(
+            input_state, config, stream_mode=["updates", "messages"]
+        ):
+            yield event
+    finally:
+        try:
+            store = SessionStore.get_instance(effective_session_id)
+            store.release()
+        except Exception:
+            pass
+
+
 async def run_query(
     query: str,
     thread_id: str = "default",
@@ -726,7 +795,13 @@ async def run_query(
         except Exception:
             pass
 
-    logger.info(f"Query fertig. Plan war: {result.get('plan')}")
+    # Plan aus turn_history extrahieren (respond_node setzt plan=None für Multi-Turn)
+    plan = result.get("plan") or []
+    if not plan:
+        turn_history = result.get("turn_history") or []
+        if turn_history:
+            plan = turn_history[-1].get("plan") or []
+    logger.info(f"Query fertig. Plan war: {plan}")
 
     # Finale Response extrahieren
     final_response = ""
@@ -737,13 +812,14 @@ async def run_query(
 
     return {
         "response": final_response,
-        "plan": result.get("plan", []),
+        "plan": plan,
         "reasoning": result.get("reasoning"),
         "statistics": result.get("statistics"),
         "statistics_summary": result.get("statistics_summary"),
         "chart_url": result.get("chart_url"),
         "chart_type": result.get("chart_type"),
         "error": result.get("error"),
+        "messages": result.get("messages", []),
     }
 
 

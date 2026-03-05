@@ -214,7 +214,7 @@ def transform_for_line_chart(data: dict[str, list], multi_key: bool = False) -> 
                 except (ValueError, TypeError):
                     continue
 
-                entry = {"time": timestamp_to_time_string(ts, include_date), "value": val}
+                entry = {"time": timestamp_to_time_string(ts, include_date), "value": val, "_ts": ts}
 
                 if multi_key:
                     entry["group"] = shorten_key_name(key)
@@ -224,23 +224,61 @@ def transform_for_line_chart(data: dict[str, list], multi_key: bool = False) -> 
         if not multi_key:
             break
 
-    result.sort(key=lambda x: (x["time"], x.get("group", "")))
+    # Nach Timestamp sortieren (nicht nach formatiertem String, da DD.MM. nicht alphabetisch korrekt sortiert)
+    result.sort(key=lambda x: (x["_ts"], x.get("group", "")))
+    # Hilfs-Feld entfernen bevor Daten an Chart-API gehen
+    for entry in result:
+        del entry["_ts"]
     return sample_data(result)
 
 
-def transform_for_category_chart(data: dict[str, list]) -> list[dict]:
-    """Transformiert Daten für Column/Bar/Pie Chart: [{category, value}]"""
+def transform_for_category_chart(data: dict[str, list], per_datapoint: bool = False) -> list[dict]:
+    """Transformiert Daten für Column/Bar/Pie Chart: [{category, value}].
+
+    Args:
+        data: Daten aus DuckDB via get_data_from_state
+        per_datapoint: True → jeder Datenpunkt wird ein Balken (Timestamp als Kategorie).
+                       False → Durchschnitt pro Key als Balken (default).
+    """
     result = []
-    
+
+    if per_datapoint:
+        # Jeder Datenpunkt als eigene Kategorie (z.B. stündliche Balken)
+        all_timestamps = []
+        for values in data.values():
+            if isinstance(values, list):
+                all_timestamps.extend(
+                    p["timestamp"] for p in values
+                    if isinstance(p, dict) and "timestamp" in p
+                )
+        span_hours = 0
+        if len(all_timestamps) >= 2:
+            span_hours = (max(all_timestamps) - min(all_timestamps)) / (1000 * 3600)
+        include_date = span_hours > 24
+
+        for key, values in data.items():
+            if not isinstance(values, list):
+                continue
+            for point in values:
+                if isinstance(point, dict) and "timestamp" in point:
+                    try:
+                        val = float(point.get("value", 0))
+                    except (ValueError, TypeError):
+                        continue
+                    label = timestamp_to_time_string(point["timestamp"], include_date)
+                    result.append({"category": label, "value": round(val, 2)})
+        return result
+
+    # Default: Durchschnitt pro Key
     for key, values in data.items():
         if not isinstance(values, list) or not values:
             continue
-        
+
         nums = extract_numeric_values(values)
         if nums:
             avg = sum(nums) / len(nums)
             result.append({"category": shorten_key_name(key), "value": round(avg, 2)})
-    
+
     return result
 
 
@@ -444,6 +482,7 @@ async def generate_column_chart_tool(
     value_label: str,
     category_label: str,
     state: Annotated[dict, InjectedState],
+    per_datapoint: bool = False,
 ) -> str:
     """
     Erstellt ein vertikales Säulendiagramm zum Vergleich.
@@ -456,15 +495,16 @@ async def generate_column_chart_tool(
         title: Beschreibender Titel
         value_label: Wert-Achsenbeschriftung, z.B. "Drehmoment (Nm)"
         category_label: Kategorie-Achsenbeschriftung, z.B. "Achse" oder "Signal"
+        per_datapoint: True → ein Balken PRO Datenpunkt (z.B. stündliche Werte). False → Durchschnitt pro Signal.
     """
-    logger.debug(f"generate_column_chart_tool: title={title}, value_label={value_label}, category_label={category_label}")
+    logger.debug(f"generate_column_chart_tool: title={title}, value_label={value_label}, category_label={category_label}, per_datapoint={per_datapoint}")
 
     data = get_data_from_state(state)
 
     if not data:
         return "Fehler: Keine Daten im State"
 
-    transformed = transform_for_category_chart(data)
+    transformed = transform_for_category_chart(data, per_datapoint=per_datapoint)
 
     if not transformed:
         return "Fehler: Keine gültigen Datenpunkte"
@@ -491,6 +531,7 @@ async def generate_bar_chart_tool(
     value_label: str,
     category_label: str,
     state: Annotated[dict, InjectedState],
+    per_datapoint: bool = False,
 ) -> str:
     """
     Erstellt ein horizontales Balkendiagramm zum Vergleich.
@@ -504,15 +545,16 @@ async def generate_bar_chart_tool(
         title: Beschreibender Titel
         value_label: Wert-Achsenbeschriftung, z.B. "Korrelationskoeffizient (r)"
         category_label: Kategorie-Achsenbeschriftung, z.B. "Achsen-Moment" oder "Signal"
+        per_datapoint: True → ein Balken PRO Datenpunkt (z.B. stündliche Werte). False → Durchschnitt pro Signal.
     """
-    logger.debug(f"generate_bar_chart_tool: title={title}, value_label={value_label}, category_label={category_label}")
+    logger.debug(f"generate_bar_chart_tool: title={title}, value_label={value_label}, category_label={category_label}, per_datapoint={per_datapoint}")
 
     data = get_data_from_state(state)
 
     if not data:
         return "Fehler: Keine Daten im State"
 
-    transformed = transform_for_category_chart(data)
+    transformed = transform_for_category_chart(data, per_datapoint=per_datapoint)
 
     if not transformed:
         return "Fehler: Keine gültigen Datenpunkte"
@@ -861,13 +903,40 @@ def prepare_viz_context(state: AgentState) -> Tuple[dict, str]:
             tr = dataset_meta["timerange"]
             meta_info += f"\nZeitraum: {tr.get('weekday', '')} {tr.get('start', '')} - {tr.get('end', '')}"
 
-    # Stats-Label hinzufügen wenn Stats-Daten aktiv sind (Stats-Viz-Flow)
+    # Daten-Typ abhängig von viz_data_source
+    viz_data_source = state.get("viz_data_source", "auto")
     active_stats = state.get("active_stats_keys")
-    if active_stats:
+
+    if viz_data_source == "timeseries":
+        # Supervisor hat explizit Zeitreihen angefordert
+        point_counts = [len(v) for v in data.values() if isinstance(v, list)]
+        avg_points = sum(point_counts) // max(len(point_counts), 1)
+        meta_info += f"\nDaten-Typ: Zeitreihen-Rohdaten (~{avg_points} Punkte pro Signal)"
+        # Y-Label aus Signal-Keys ableiten
+        y_label = get_y_label(keys)
+        if y_label != "Wert":
+            meta_info += f"\nEmpfohlene Y-Achse: {y_label}"
+    elif viz_data_source == "stats" and active_stats:
         label = get_stats_label(active_stats)
         if label:
             meta_info += f"\nDaten-Typ: Statistik-Ergebnisse ({label})"
             meta_info += f"\nEmpfohlene Y-Achse: {label}"
+    elif active_stats:
+        # "auto" mit Stats-Daten aktiv → bisheriges Verhalten
+        label = get_stats_label(active_stats)
+        if label:
+            meta_info += f"\nDaten-Typ: Statistik-Ergebnisse ({label})"
+            meta_info += f"\nEmpfohlene Y-Achse: {label}"
+
+    # Statistik-Zusammenfassung weitergeben (z.B. nach Replan: Stats aus Phase 1)
+    stats_summary = state.get("statistics_summary")
+    if stats_summary:
+        meta_info += f"\nStatistik-Ergebnisse: {stats_summary}"
+
+    # Supervisor-Anweisungen für Visualisierung (analog zu data_instructions für Data Agent)
+    viz_instructions = state.get("viz_instructions")
+    if viz_instructions:
+        meta_info += f"\nSupervisor-Anweisung: {viz_instructions}"
 
     return data, meta_info
 
@@ -1024,18 +1093,29 @@ async def run_viz_agent(state: AgentState) -> dict[str, Any]:
     """Führt den Viz Agent aus."""
     try:
         logger.debug("Starte Viz Agent")
-        
-        data, meta_info = prepare_viz_context(state)
-        
+
+        # viz_data_source Filterung: Steuert welche Datenquelle der Viz Agent sieht
+        viz_data_source = state.get("viz_data_source", "auto")
+        filtered_state = dict(state)
+        if viz_data_source == "timeseries":
+            filtered_state["active_stats_keys"] = None
+            logger.debug("viz_data_source=timeseries: Stats-Keys gefiltert")
+        elif viz_data_source == "stats":
+            filtered_state["active_dataset_keys"] = None
+            logger.debug("viz_data_source=stats: Telemetrie-Keys gefiltert")
+        # "auto": beide Keys bleiben, bisherige Priorität (Stats > Timeseries) greift
+
+        data, meta_info = prepare_viz_context(filtered_state)
+
         if not data:
             return {
                 "messages": [AIMessage(content="Keine Daten zum Visualisieren.")],
                 "error": "no_data",
             }
-        
+
         user_query = extract_user_query(state["messages"])
 
-        tool_state = dict(state)
+        tool_state = dict(filtered_state)
 
         # DEC-018: LLM-Erstellung und Key-Rotation passiert in execute_viz_with_retry
         chart_url, tool_name = await execute_viz_with_retry(

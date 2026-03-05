@@ -212,16 +212,16 @@ class SessionStore:
                         ts = point.get("ts") or point.get("timestamp", 0)
                         val = _parse_numeric_value(point["value"])
                         if val is not None:
-                            rows.append((dataset_key, signal_key, int(ts), val, unit))
+                            rows.append((dataset_key, signal_key, int(ts), round(val, 2), unit))
                     elif isinstance(point, (int, float)) and _is_finite(point):
-                        rows.append((dataset_key, signal_key, 0, float(point), unit))
+                        rows.append((dataset_key, signal_key, 0, round(float(point), 2), unit))
 
             elif isinstance(values, dict) and "value" in values:
                 # Latest-Telemetry: einzelner Wert
                 ts = values.get("ts") or values.get("timestamp", 0)
                 val = _parse_numeric_value(values["value"])
                 if val is not None:
-                    rows.append((dataset_key, signal_key, int(ts), val, unit))
+                    rows.append((dataset_key, signal_key, int(ts), round(val, 2), unit))
 
         if not rows:
             logger.warning(f"Keine gültigen Daten für dataset_key={dataset_key}")
@@ -495,6 +495,25 @@ class SessionStore:
             return {key: [{"value": str(result["mean"]), "timestamp": 0}]}
         if "std" in result:
             return {key: [{"value": str(result["std"]), "timestamp": 0}]}
+        # Perzentile VOR min_max prüfen (Perzentile enthalten auch min/max!)
+        if "p25" in result or "p50" in result:
+            # Zeitraum aus dataset_key extrahieren für Multi-Window-Unterscheidung
+            # z.B. "krc5/stats/percentiles/utilization_current/2026-02-13_14-15_15-15"
+            time_prefix = ""
+            parts = dataset_key.split("/")
+            if len(parts) >= 5:
+                tr = parts[-1]  # z.B. "2026-02-13_14-15_15-15"
+                # Kompakt: nur HH:MM-HH:MM
+                tr_parts = tr.split("_")
+                if len(tr_parts) >= 3:
+                    start_h = tr_parts[1].replace("-", ":")
+                    end_h = tr_parts[2].replace("-", ":")
+                    time_prefix = f"{start_h}-{end_h} "
+            return {
+                f"{time_prefix}P25": [{"value": str(result.get("p25", 0)), "timestamp": 0}],
+                f"{time_prefix}P50": [{"value": str(result.get("p50", 0)), "timestamp": 0}],
+                f"{time_prefix}P75": [{"value": str(result.get("p75", 0)), "timestamp": 0}],
+            }
         if "min" in result and "max" in result:
             return {
                 f"{key}_min": [{"value": str(result["min"]), "timestamp": 0}],
